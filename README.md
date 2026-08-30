@@ -77,11 +77,10 @@ against the reference `everything` server.
             :handler (fn [ctx args] (fetch-alerts (get args "state")))}]}))
 ```
 
-See `examples/anthropic/`, `examples/openai/` and `examples/mcp/` for
-complete, runnable ports of real usage shapes from each vendor SDK and from
-the MCP reference servers — see each doc's Usage section for the full list.
-(`tools.agents.gemini` has no `examples/` directory yet — see docs/gemini.md's
-Usage section for the same shape inline.)
+See `examples/anthropic/`, `examples/openai/`, `examples/gemini/` and
+`examples/mcp/` for complete, runnable ports of real usage shapes from each
+vendor SDK and from the MCP reference servers — see each doc's Usage section
+for the full list.
 
 ## Testing
 

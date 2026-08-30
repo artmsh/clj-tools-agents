@@ -50,9 +50,11 @@ Retries). The `request` map is passed through to JSON almost verbatim —
 `tools`, `cachedContent`, etc. all pass straight through untouched, with no
 kebab↔snake/camelCase conversion (see the parity table below).
 
-There is no `examples/gemini/` directory yet — the snippet above and the
-mock-server tests in `test/tools/agents/gemini/live_test.cljc` are the
-canonical usage references until one is added.
+See `examples/gemini/` for three complete, runnable-against-a-mock-server
+ports of real python-genai usage shapes: `basic_chat.clj` (the README
+quickstart's `systemInstruction` + `generationConfig`), `count_tokens.clj`
+(the `count_tokens` quickstart), and `custom_gateway.clj` (a `:base-url`
+override plus a JSON-mode `generationConfig`).
 
 ### The model is in the URL, not the request body
 
@@ -301,12 +303,13 @@ retries exhausted into a status error, a non-retryable 400 not retried,
 connection errors retried then typed — all with `g/*sleep-fn*` bound to a
 no-op so they cost no measurable wall-clock, since — unlike
 `tools.agents.openai`'s live-test — there is no `retry-after-ms` header
-trick available to shrink the real ~1s-per-retry floor).
+trick available to shrink the real ~1s-per-retry floor). All three
+`examples/gemini/*.clj` ports run end-to-end against the mock server too.
 
 Mock server per runtime: same three leaves (clz `clojure.http/server` +
 `handle` + `serve-once`, Babashka `org.httpkit.server`, JVM Clojure
 `com.sun.net.httpserver.HttpServer`) as the two siblings' live-test
-namespaces. Mock ports are `18980`–`18994`, chosen not to collide with
+namespaces. Mock ports are `18980`–`18997`, chosen not to collide with
 `tools.agents.anthropic`'s `18930`–`18946` or `tools.agents.openai`'s
 `18950`–`18971` (`./script/test-all.sh`'s `clz test` invocation runs each
 suite's mock servers in its own process per suite, but ports are kept

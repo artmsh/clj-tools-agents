@@ -17,6 +17,9 @@
   (:require [clojure.test :refer [deftest is]]
             [clojure.string :as str]
             [tools.agents.gemini :as g]
+            [examples.gemini.basic-chat :as ex-basic]
+            [examples.gemini.count-tokens :as ex-count]
+            [examples.gemini.custom-gateway :as ex-gateway]
             #?@(:bb  [[org.httpkit.server :as hk]]
                 :clj []
                 :clz [])))
@@ -330,3 +333,44 @@
        (is (some? e))
        (is (= :tools.agents.gemini/api-connection-error (:type (ex-data e))))
        (is (str/starts-with? (str (ex-message e)) "tools.agents.gemini/generate-content: ")))))
+
+;; ---------------------------------------------------------------------------
+;; examples/*.clj wired end-to-end against the mock server
+;; ---------------------------------------------------------------------------
+
+(deftest example-a-basic-chat-runs-against-mock-server
+  (let [captured (atom nil)
+        {:keys [port stop!]} (start-server! 18995 "/v1beta/models/gemini-2.5-flash:generateContent"
+                                (fn [req] (reset! captured req) {:status 200 :body (canned-response)}))]
+    (try
+      (let [client (g/client {:api-key "test-key" :base-url (base-url port)})]
+        (is (= "hello back" (ex-basic/run-example client)))
+        (is (str/includes? (:body @captured) "\"systemInstruction\":{\"parts\":[{\"text\":\"I say high, you say low\"}]}"))
+        (is (str/includes? (:body @captured) "\"maxOutputTokens\":3"))
+        (is (str/includes? (:body @captured) "\"temperature\":0.3")))
+      (finally (stop!)))))
+
+(deftest example-b-count-tokens-runs-against-mock-server
+  (let [captured (atom nil)
+        {:keys [port stop!]} (start-server! 18996 "/v1beta/models/gemini-2.5-flash:countTokens"
+                                (fn [req] (reset! captured req) {:status 200 :body "{\"totalTokens\":6}"}))]
+    (try
+      (let [client (g/client {:api-key "test-key" :base-url (base-url port)})]
+        (is (= 6 (get (ex-count/run-example client) "totalTokens")))
+        (is (str/includes? (:body @captured) "why is the sky blue?")))
+      (finally (stop!)))))
+
+(deftest example-c-custom-gateway-runs-against-mock-server
+  (let [captured (atom nil)
+        {:keys [port stop!]} (start-server! 18997 "/v1beta/models/gemini-2.5-flash:generateContent"
+                                (fn [req] (reset! captured req)
+                                  {:status 200
+                                   :body (str "{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"{}\"}]}}]}")}))]
+    (try
+      (let [client (g/client {:api-key "gw-key" :base-url (base-url port)})
+            result (ex-gateway/run-example client)]
+        (is (= "{}" result))
+        (is (= "gw-key" (get (:headers @captured) "x-goog-api-key")))
+        (is (str/includes? (:body @captured) "\"maxOutputTokens\":1024"))
+        (is (str/includes? (:body @captured) "\"responseMimeType\":\"application/json\"")))
+      (finally (stop!)))))
