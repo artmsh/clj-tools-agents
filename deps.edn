@@ -1,0 +1,7 @@
+{:paths ["src"]
+ :deps  {org.clojure/clojure {:mvn/version "1.12.0"}}
+ :aliases
+ {:test-anthropic {:extra-paths ["test" "."]
+                   :main-opts   ["-m" "tools.agents.anthropic.test-runner"]}
+  :test-openai    {:extra-paths ["test" "."]
+                   :main-opts   ["-m" "tools.agents.openai.test-runner"]}}}
