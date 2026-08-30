@@ -158,6 +158,113 @@
   (is (= "" (with-out-str (stdio/log! "a diagnostic line")))))
 
 ;; ---------------------------------------------------------------------------
+;; Legacy-handshake compatibility (handle-line-legacy!, serve!'s
+;; :legacy-handshake? true)
+;; ---------------------------------------------------------------------------
+
+(defn a-classic-initialize [id]
+  (mcp/write-json {"jsonrpc" mcp/jsonrpc-version "id" id "method" "initialize"
+                   "params" {"protocolVersion" "2025-06-18"
+                             "capabilities" {}
+                             "clientInfo" {"name" "legacy-client" "version" "0"}}}))
+
+(deftest legacy-initialize-is-answered-locally-not-by-server-handle
+  ;; server/handle has no "initialize" method at all under 2026-07-28 — a
+  ;; classic client's first message would 32602 there. handle-line-legacy!
+  ;; answers it without ever reaching server/handle.
+  (let [[written conn] (capturing-connection)]
+    (stdio/handle-line-legacy! conn (a-classic-initialize 1))
+    (is (= 1 (count @written)))
+    (let [resp (mcp/read-json (first @written))]
+      (is (= 1 (get resp "id")))
+      (is (= "2025-06-18" (get-in resp ["result" "protocolVersion"]))
+          "echoes the client's requested version back")
+      (is (= {"tools" {}} (get-in resp ["result" "capabilities"])))
+      (is (= {"name" "stdio-demo" "version" "0.1"} (get-in resp ["result" "serverInfo"]))))))
+
+(deftest legacy-initialize-falls-back-to-latest-version-when-the-client-omits-one
+  (let [[written conn] (capturing-connection)]
+    (stdio/handle-line-legacy! conn (mcp/write-json {"jsonrpc" mcp/jsonrpc-version "id" 1
+                                                      "method" "initialize" "params" {}}))
+    (is (= mcp/latest-protocol-version (get-in (mcp/read-json (first @written)) ["result" "protocolVersion"])))))
+
+(deftest legacy-notifications-initialized-produces-no-output
+  (let [[written conn] (capturing-connection)]
+    (stdio/handle-line-legacy! conn (mcp/write-json {"jsonrpc" mcp/jsonrpc-version
+                                                      "method" "notifications/initialized"}))
+    (is (= [] @written))))
+
+(deftest legacy-ping-gets-an-empty-result
+  ;; server/handle has no "ping" method — a legacy client's keepalive MUST
+  ;; get a prompt response or it may drop the connection mid-session.
+  (let [[written conn] (capturing-connection)]
+    (stdio/handle-line-legacy! conn (mcp/write-json {"jsonrpc" mcp/jsonrpc-version "id" 9 "method" "ping"}))
+    (is (= {"jsonrpc" mcp/jsonrpc-version "id" 9 "result" {}} (mcp/read-json (first @written))))))
+
+(deftest legacy-tools-call-with-no-_meta-at-all-still-reaches-the-tool
+  ;; Exactly the shape a classic client's tools/call takes: no _meta
+  ;; whatsoever. handle-line! (not -legacy!) would 32602 this.
+  (let [[written conn] (capturing-connection)]
+    (stdio/handle-line-legacy!
+     conn (mcp/write-json {"jsonrpc" mcp/jsonrpc-version "id" 2 "method" "tools/call"
+                           "params" {"name" "echo" "arguments" {"m" "hi"}}}))
+    (is (= "hi" (mcp/output-text (get (mcp/read-json (first @written)) "result"))))))
+
+(deftest legacy-stamp-meta-repairs-per-field-rather-than-replacing-a-partial-_meta
+  ;; A real classic client's tools/call DOES carry its own _meta — a
+  ;; progressToken — while never sending protocolVersion/clientCapabilities.
+  ;; Repair, not "stamp only if _meta is entirely absent", or progressToken
+  ;; (and the progress notifications it drives) is silently lost.
+  (let [[written conn] (capturing-connection)]
+    (stdio/handle-line-legacy!
+     conn (mcp/write-json {"jsonrpc" mcp/jsonrpc-version "id" 3 "method" "tools/call"
+                           "params" {"name" "noisy" "arguments" {}
+                                     "_meta" {"progressToken" "p"}}}))
+    (is (= ["notifications/progress" nil]
+           (mapv #(get (mcp/read-json %) "method") @written))
+        "the progressToken survived the repair, so the progress notification was delivered")))
+
+(deftest legacy-stamp-meta-leaves-a-well-formed-_meta-untouched
+  (is (= {"_meta" {mcp/meta-protocol-version mcp/latest-protocol-version mcp/meta-client-caps {}}}
+         (get (stdio/legacy-stamp-meta
+               {"params" {"_meta" {mcp/meta-protocol-version mcp/latest-protocol-version
+                                   mcp/meta-client-caps {}}}})
+              "params"))))
+
+(deftest a-legacy-bad-line-is-still-a-parse-error-with-a-null-id
+  (let [[written conn] (capturing-connection)
+        res (stdio/handle-line-legacy! conn "{not json")]
+    (is (some? (:parse-error res)))
+    (is (= -32700 (get-in (mcp/read-json (first @written)) ["error" "code"])))))
+
+#?(:clz nil
+   :default
+   (deftest serve!-with-legacy-handshake?-completes-a-full-classic-session
+     ;; The exact sequence a classic client sends: initialize,
+     ;; notifications/initialized (no id, no response), a ping, then a
+     ;; tools/call carrying only a progressToken _meta — none of which
+     ;; plain serve! (legacy-handshake? false, the default) can answer.
+     (let [written (atom [])
+           conn (stdio/connection (a-server) {:write-fn (fn [s] (swap! written conj s))})]
+       (with-in-str (str (a-classic-initialize 1) "\n"
+                         (mcp/write-json {"jsonrpc" mcp/jsonrpc-version "method" "notifications/initialized"}) "\n"
+                         (mcp/write-json {"jsonrpc" mcp/jsonrpc-version "id" 2 "method" "ping"}) "\n"
+                         (mcp/write-json {"jsonrpc" mcp/jsonrpc-version "id" 3 "method" "tools/call"
+                                         "params" {"name" "echo" "arguments" {"m" "hi"}
+                                                   "_meta" {"progressToken" "p"}}}) "\n")
+         (stdio/serve! (a-server) {:conn conn :legacy-handshake? true}))
+       (is (= 3 (count @written))
+           "initialize + ping + tools/call answered; notifications/initialized produced nothing")
+       (is (= ["initialize-result" "ping-result" "tools/call-result"]
+              (mapv (fn [s] (let [r (mcp/read-json s)]
+                             (cond
+                               (get-in r ["result" "protocolVersion"]) "initialize-result"
+                               (= {} (get r "result")) "ping-result"
+                               :else "tools/call-result")))
+                    @written)))
+       (is (= "hi" (mcp/output-text (get (mcp/read-json (last @written)) "result")))))))
+
+;; ---------------------------------------------------------------------------
 ;; serve! — the read loop
 ;; ---------------------------------------------------------------------------
 

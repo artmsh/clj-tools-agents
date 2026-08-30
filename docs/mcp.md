@@ -324,6 +324,62 @@ and, where the schema fixes one, `:data`.
 `derive`, and a hierarchy that only works on two of three runtimes is worse
 than none.
 
+### Legacy-client compatibility
+
+`server/handle` implements only revision 2026-07-28 (SEP-2575), which
+removed the `initialize` handshake and protocol-level sessions entirely — by
+design, per its own docstring. A client still speaking an earlier revision's
+classic handshake gets a flat `-32602` from `server/handle` on its very
+first message, because that revision's `initialize` request carries no
+`_meta` at all. This is not hypothetical: as of this writing, every
+general-purpose MCP client this library has been run against in practice
+(Claude Code's own) still sends the classic handshake.
+
+`tools.agents.mcp.stdio/serve!` takes `:legacy-handshake? true` to bridge
+this without touching `server/handle` itself:
+
+```clojure
+(stdio/serve! srv {:legacy-handshake? true})
+```
+
+What it does, all in the transport layer, none of it in the protocol core:
+
+- Answers `initialize` locally with a classic `InitializeResult`, echoing
+  back whatever `protocolVersion` the client asked for and taking
+  `serverInfo` from `(:info srv)` — the same map `server/handle` itself
+  advertises. `server/handle` never sees this request.
+- Swallows `notifications/initialized` (a notification; no response is
+  correct either way, but a legacy client sends it unprompted).
+- Answers `ping` with an empty result. `server/handle` has no `"ping"`
+  method — the stateless revision has no session to keep alive — but a
+  legacy client's keepalive MUST get a prompt response or it may drop the
+  connection mid-session. That failure mode is invisible to a startup-time
+  smoke test: it only shows up minutes into a real session.
+- Repairs (not replaces) every other request's `_meta`: fills in
+  `io.modelcontextprotocol/protocolVersion` and
+  `.../clientCapabilities` only if missing, leaving any `_meta` the client
+  did send — a legacy `tools/call` typically carries its own `_meta` (a
+  `progressToken`), just never those two required fields. An
+  all-or-nothing "stamp only if `_meta` is entirely absent" guard would
+  therefore stamp nothing on exactly the requests that need it; clobbering
+  the whole map instead would silently drop `progressToken`, which
+  `server/handle` correlates progress notifications by.
+
+The four pieces are individually public — `legacy-initialize-response`,
+`legacy-stamp-meta`, and the line-level dispatcher `handle-line-legacy!` —
+for a caller building its own loop instead of using `serve!` directly (e.g.
+one layering additional interception, the way a private deployment's TLS
+setup might sit beside this in the same process). `handle-line-legacy!` is
+to `handle-line!` exactly as `:legacy-handshake? true` is to the default:
+same signature, same return shape, three extra method interceptions and a
+`_meta` repair in front of `handle-message!`.
+
+This is opt-in and additive — plain `serve!` (the default,
+`:legacy-handshake?` unset) is unchanged, and `server/handle` gained no new
+surface at all. Leave it off for a revision-2026-07-28-native client, or a
+test harness driving the server directly through JSON that already carries
+`_meta`.
+
 ### Verification against the build-server tutorial
 
 `examples/mcp/weather.cljc` is the tutorial's server, function for function —
@@ -508,7 +564,14 @@ this repo's own weather server.
   ordering, listen/notify/cancel/close, `log!` writing nothing to stdout, and
   a real subprocess round trip against the weather server. The `serve!` loop
   test is JVM/bb only (clz has no `with-in-str`); a clz-only test asserts
-  `connect!` refuses cleanly.
+  `connect!` refuses cleanly. Legacy-handshake compatibility: `initialize`
+  answered without reaching `server/handle` (and its version-omitted
+  fallback), `notifications/initialized` and `ping` handled,
+  `legacy-stamp-meta` repairing a partial `_meta` without losing
+  `progressToken` (asserted by checking the progress notification it still
+  drives) versus leaving a well-formed one untouched, the parse-error path
+  unchanged, and a full classic session end to end through `serve!
+  {:legacy-handshake? true}` (JVM/bb only, same `with-in-str` constraint).
 - **`examples_test.cljc`** — both example servers, including every divergence
   claimed above: `resources-paginate-but-tools-do-not`,
   `static-documents-are-served-in-a-stable-order`,
