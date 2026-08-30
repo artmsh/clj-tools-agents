@@ -661,13 +661,14 @@
 
 (defn- decode-or-throw!
   "Shared response handling for messages-create/count-tokens: 2xx decodes the
-   body, anything else throws a typed ex-info with :status/:body/:headers in
+   body and attaches resp's :headers as metadata (see request-id below),
+   anything else throws a typed ex-info with :status/:body/:headers in
    ex-data (:headers feeds request-with-retries!'s Retry-After handling)."
   [caller-name resp]
   (let [status    (:status resp)
         resp-body (:body resp)]
     (if (and status (>= status 200) (< status 300))
-      (read-json resp-body)
+      (with-meta (read-json resp-body) {::headers (:headers resp)})
       (let [err-msg (extract-error-message resp-body)
             detail  (cond err-msg err-msg (seq resp-body) resp-body :else nil)]
         (throw (ex-info (str caller-name ": HTTP " status (when detail (str " " detail)))
@@ -689,7 +690,9 @@
    max_tokens, messages, system, temperature, stop_sequences, thinking, tools,
    etc. pass straight through untouched, matching the original builtin's
    data-transparency contract) to POST /v1/messages against client's
-   base-url. Returns the decoded response map (string keys).
+   base-url. Returns the decoded response map (string keys), with the raw
+   response headers attached as metadata — see `request-id` below for the
+   Python SDK's `message._request_id` equivalent.
 
    :stream true throws immediately — see the ns docstring's STREAMING note.
 
@@ -734,6 +737,29 @@
         body-str    (write-json request)]
     (request-with-retries! (or (:max-retries client) default-max-retries)
                             #(attempt-request! caller-name url headers body-str))))
+
+(defn request-id
+  "The `request-id` response header for a successful messages-create/
+   count-tokens response — Python SDK equivalent: `message._request_id`.
+   Returns nil if response carries no such metadata (e.g. a map built by
+   hand rather than returned by this library, or a header genuinely absent
+   from the response).
+
+   The Python SDK exposes this via a hidden attribute on the response
+   object; this library has no object to hang it off of — messages-create
+   returns the decoded body as a plain map, verbatim, per its
+   data-transparency contract (see README). So the header is carried as
+   Clojure metadata on that same map instead, out of the way of equality,
+   printing, and JSON re-encoding, rather than as a wire-format map key.
+   Use this accessor rather than reading `(meta response)` directly, since
+   the metadata key is a private implementation detail.
+
+   For most logging/correlation purposes, prefer the response body's own
+   \"id\" field (e.g. \"msg_...\") — it needs no accessor and, unlike this
+   header, is also present on every retried request's final response."
+  [response]
+  (let [headers (::headers (meta response))]
+    (or (get headers "request-id") (get headers "Request-Id"))))
 
 (defn output-text
   "Concatenate the \"text\" fields of response's top-level \"content\" array

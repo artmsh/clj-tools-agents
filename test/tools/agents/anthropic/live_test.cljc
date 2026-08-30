@@ -124,6 +124,22 @@
           (is (not (str/includes? (:body req) "api-key")))))
       (finally (stop!)))))
 
+(deftest messages-create-carries-request-id-header-as-metadata
+  (let [{:keys [port stop!]} (start-server! 18947
+                                (fn [_] {:status 200 :headers {"request-id" "req_abc123"}
+                                         :body (canned-response)}))]
+    (try
+      (let [client (a/client {:api-key "test-key" :base-url (str "http://127.0.0.1:" port)})
+            resp   (a/messages-create client {"model" "m" "max_tokens" 1 "messages" []})]
+        (is (= "req_abc123" (a/request-id resp)))
+        ;; the header rides as metadata, not a wire-format map key — the
+        ;; decoded body itself must stay exactly what the server sent.
+        (is (= "msg_1" (get resp "id"))))
+      (finally (stop!)))))
+
+(deftest request-id-returns-nil-for-a-hand-built-map
+  (is (nil? (a/request-id {"id" "msg_1"}))))
+
 (deftest auth-token-sends-bearer-and-oauth-beta-header
   (let [captured (atom nil)
         {:keys [port stop!]} (start-server! 18931
