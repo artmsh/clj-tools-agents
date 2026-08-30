@@ -32,7 +32,17 @@
        returns at that point, and a script that called it then ends.
      - Notifications for a `subscriptions/listen` stream share the one
        channel with everything else, so each carries
-       `io.modelcontextprotocol/subscriptionId`; `notify!` tags them."
+       `io.modelcontextprotocol/subscriptionId`; `notify!` tags them.
+
+   LEGACY-CLIENT COMPATIBILITY, opt-in via `serve!`'s `:legacy-handshake?`:
+   `server/handle` implements only revision 2026-07-28 (SEP-2575), which
+   removed the `initialize` handshake and protocol-level sessions entirely.
+   A client still speaking an earlier revision's classic handshake gets a
+   flat 32602 from `server/handle` on its very first message, since that
+   revision's `initialize` request has no `_meta` at all. See
+   `handle-line-legacy!` for what this mode adds, and its docstring for
+   which real client this was found against."
+
   (:require [clojure.string :as str]
             [tools.agents.mcp :as mcp]
             [tools.agents.mcp.server :as server]))
@@ -144,6 +154,99 @@
       (handle-message! conn (second parsed)))))
 
 ;; ---------------------------------------------------------------------------
+;; Legacy-handshake compatibility (opt-in)
+;; ---------------------------------------------------------------------------
+
+(defn legacy-initialize-response
+  "A classic (pre-2026-07-28) InitializeResult for `srv`, answering `parsed`
+   (an already-`mcp/read-json`'d `initialize` request). Echoes back whatever
+   `protocolVersion` the client asked for — a conforming legacy client
+   accepts whatever the server names here, and this function never actually
+   negotiates one, so echoing avoids a spurious version-mismatch on either
+   side. `serverInfo` comes straight from `(:info srv)`, the same map
+   `server/handle` itself advertises."
+  [srv id parsed]
+  {"jsonrpc" mcp/jsonrpc-version
+   "id" id
+   "result" {"protocolVersion" (or (get-in parsed ["params" "protocolVersion"])
+                                    mcp/latest-protocol-version)
+             "capabilities" {"tools" {}}
+             "serverInfo" (:info srv)}})
+
+(defn legacy-stamp-meta
+  "Fill in the two `_meta` fields `server/handle` requires (mcp.cljc's
+   `request-meta`, minimal form: `io.modelcontextprotocol/protocolVersion`
+   and `io.modelcontextprotocol/clientCapabilities`) on an already-parsed
+   request, leaving every other `_meta` key untouched.
+
+   Repairs per-field rather than replacing the whole `_meta` wholesale: a
+   legacy client's `tools/call` typically DOES carry its own `_meta` (a
+   `progressToken`) while never sending either field this revision
+   requires, so an all-or-nothing 'stamp only if `_meta` is entirely
+   absent' guard would stamp nothing on exactly the requests that need it —
+   and clobbering the whole map instead would silently drop
+   `progressToken`, which `server/handle` correlates progress
+   notifications by."
+  [parsed]
+  (update parsed "params"
+          (fn [params]
+            (let [params (or params {})
+                  m (get params "_meta" {})]
+              (assoc params "_meta"
+                     (cond-> m
+                       (not (string? (get m mcp/meta-protocol-version)))
+                       (assoc mcp/meta-protocol-version mcp/latest-protocol-version)
+
+                       (not (map? (get m mcp/meta-client-caps)))
+                       (assoc mcp/meta-client-caps {})))))))
+
+(defn handle-line-legacy!
+  "`handle-line!`, plus the three things a classic (pre-2026-07-28) client
+   needs that revision 2026-07-28 removed:
+
+     - `initialize` is answered locally with `legacy-initialize-response`
+       rather than reaching `server/handle`, which has no method for it at
+       all (SEP-2575 removed the handshake outright).
+     - `notifications/initialized` is swallowed: it is a notification (no
+       `id`), so no response is correct either way, but a legacy client
+       sends it unprompted and it would otherwise fall through to
+       `server/handle` and 32601.
+     - `ping` gets an empty result. `server/handle` has no `\"ping\"`
+       method — the stateless revision has no session to keep alive — but a
+       legacy client's keepalive MUST get a prompt response or it may drop
+       the connection mid-session; that failure mode is invisible to a
+       startup-time smoke test since it only shows up minutes into a real
+       session.
+
+   Every other request is stamped with `legacy-stamp-meta` (the required
+   `_meta` a legacy client never sends) and handed to `handle-message!`
+   exactly as `handle-line!` would."
+  [conn line]
+  (let [srv (:server conn)
+        parsed (try [::ok (mcp/read-json line)] (catch Exception e [::bad e]))]
+    (cond
+      (= ::bad (first parsed))
+      (do ((:send! conn) (mcp/error-response nil mcp/parse-error
+                                             (str "Parse error: " (ex-message (second parsed)))))
+          {:response nil :notifications [] :parse-error (second parsed)})
+
+      (= "initialize" (get (second parsed) "method"))
+      (let [resp (legacy-initialize-response srv (get (second parsed) "id") (second parsed))]
+        ((:send! conn) resp)
+        {:response resp :notifications []})
+
+      (= "notifications/initialized" (get (second parsed) "method"))
+      {:response nil :notifications []}
+
+      (= "ping" (get (second parsed) "method"))
+      (let [resp {"jsonrpc" mcp/jsonrpc-version "id" (get (second parsed) "id") "result" {}}]
+        ((:send! conn) resp)
+        {:response resp :notifications []})
+
+      :else
+      (handle-message! conn (legacy-stamp-meta (second parsed))))))
+
+;; ---------------------------------------------------------------------------
 ;; Server loop
 ;; ---------------------------------------------------------------------------
 
@@ -157,10 +260,22 @@
 
    Blank lines are skipped rather than answered with a parse error: they are
    framing noise, not messages, and answering one would put a response on
-   the wire that no request asked for."
+   the wire that no request asked for.
+
+   `:legacy-handshake?` (default false) routes each line through
+   `handle-line-legacy!` instead of `handle-line!` — opt into this when the
+   client on the other end still speaks the pre-2026-07-28 `initialize`
+   handshake, which this library's `server/handle` does not implement at
+   all (see `handle-line-legacy!`'s docstring). Concretely: as of this
+   writing, every general-purpose MCP client this library has been tested
+   against (Claude Code's own) still needs this — `server/handle` alone
+   32602s such a client's very first message. Leave it off for a
+   revision-2026-07-28-native client, or a test harness driving the server
+   directly through JSON that already carries `_meta`."
   ([srv] (serve! srv nil))
-  ([srv {:keys [on-start on-stop conn]}]
-   (let [conn (or conn (connection srv))]
+  ([srv {:keys [on-start on-stop conn legacy-handshake?]}]
+   (let [conn (or conn (connection srv))
+         handle-line! (if legacy-handshake? handle-line-legacy! handle-line!)]
      (when on-start (on-start conn))
      (loop []
        (let [line (read-line)]
