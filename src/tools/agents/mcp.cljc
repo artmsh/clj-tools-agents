@@ -268,9 +268,25 @@
                 (= esc "u")
                 (do
                   (when (> (+ j 6) n) (json-parse-error! "unterminated unicode escape"))
-                  (let [hex (subs s (+ j 2) (+ j 6))
-                        code (Integer/parseInt hex 16)]
-                    (recur (+ j 6) (conj pieces (str (char code))))))
+                  (let [code (Integer/parseInt (subs s (+ j 2) (+ j 6)) 16)
+                        ;; A code point above the BMP is ALWAYS written as a
+                        ;; surrogate pair in JSON, so the pair has to be
+                        ;; recognised here rather than decoded one half at a
+                        ;; time: clz strings hold code points, not UTF-16
+                        ;; units, and `(char 0xD83C)` alone is not half of
+                        ;; anything there.
+                        low (when (and (<= 0xD800 code 0xDBFF)
+                                       (<= (+ j 12) n)
+                                       (= "\\u" (subs s (+ j 6) (+ j 8))))
+                              (let [l (Integer/parseInt (subs s (+ j 8) (+ j 12)) 16)]
+                                (when (<= 0xDC00 l 0xDFFF) l)))]
+                    (if low
+                      (let [cp (+ 0x10000 (* 0x400 (- code 0xD800)) (- low 0xDC00))]
+                        (recur (+ j 12)
+                               (conj pieces #?(:clz (str (char cp))
+                                               :bb (str (char code) (char low))
+                                               :clj (str (char code) (char low))))))
+                      (recur (+ j 6) (conj pieces (str (char code)))))))
                 :else (json-parse-error! (str "invalid escape at position " j)))))
 
           ;; Literal run: take it to the next quote or backslash in ONE piece.

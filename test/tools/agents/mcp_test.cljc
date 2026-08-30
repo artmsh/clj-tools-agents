@@ -90,13 +90,19 @@
       (is (not (str/includes? line "\r"))))))
 
 (deftest read-json-round-trips
-  (doseq [v [nil true false 42 -7 "hi" "a\nb" [] [1 "two" nil] {} {"a" 1 "b" [true nil]}]]
+  (doseq [v [nil true false 42 -7 "hi" "a\nb" "äöü" "日本語" "🎉" []
+             [1 "two" nil] {} {"a" 1 "b" [true nil]}]]
     (is (= v (mcp/read-json (mcp/write-json v))) (pr-str v))))
 
 (deftest read-json-decodes-unicode-escapes
   (is (= "a\nb" (mcp/read-json "\"a\\u000ab\"")))
   (is (= "ä" (mcp/read-json "\"\\u00e4\"")))
-  (is (= "ä" (mcp/read-json "\"ä\""))))
+  (is (= "ä" (mcp/read-json "\"ä\"")))
+  (testing "a code point above the BMP arrives as a surrogate PAIR of escapes"
+    ;; The two halves must be decoded together: on clz a string is a sequence
+    ;; of code points, so half a pair is not half of anything.
+    (is (= "🎉" (mcp/read-json "\"\\ud83c\\udf89\"")))
+    (is (= "a🎉b" (mcp/read-json "\"a\\ud83c\\udf89b\"")))))
 
 (deftest read-json-rejects-garbage
   (is (thrown? Exception (mcp/read-json "{")))

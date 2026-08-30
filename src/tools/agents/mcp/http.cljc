@@ -40,6 +40,17 @@
 ;; UTF-8 + Base64, hand-rolled for portability
 ;; ---------------------------------------------------------------------------
 
+(defn- chars->str
+  "Join a seq of characters into a string.
+
+   `(str/join chars)` is WRONG on clz: it stringifies a character as its
+   reader form, so [\\a \\b] joins to \"\\\\a\\\\b\" rather than to \"ab\". `(str c)`
+   is correct everywhere, so each element is stringified first. `(apply str
+   chars)` is also correct but StackOverflows on clz once the sequence passes
+   ~1000 elements, which a Base64'd header value easily does."
+  [cs]
+  (str/join (map str cs)))
+
 (def ^:private b64-alphabet "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
 
 (def ^:private b64-index
@@ -48,8 +59,9 @@
 (defn utf8-bytes
   "UTF-8 code units of a string, as a vector of integers 0-255. Written from
    code points rather than `(.getBytes s \"UTF-8\")` so it is identical on
-   clz, which has no Java interop. Surrogate pairs are recombined into the
-   single code point they encode."
+   clz, which has no Java interop. A surrogate pair is recombined into the
+   single code point it encodes — which is a no-op on clz, where a string is
+   already a sequence of code points and there are no surrogates to pair."
   [s]
   (loop [cs (seq s) out []]
     (if-not cs
@@ -74,13 +86,14 @@
                              (bit-or 0x80 (bit-and cp 0x3F)))))))))
 
 (defn bytes->utf8
-  "Inverse of `utf8-bytes`. Code points above the BMP come back as the
-   surrogate pair that represents them, which is what every runtime here
-   stores a string as."
+  "Inverse of `utf8-bytes`. A code point above the BMP comes back as the
+   surrogate pair that represents it on JVM Clojure and Babashka, and as a
+   single character on clz, whose strings are sequences of code points rather
+   than of UTF-16 units. Either way `(bytes->utf8 (utf8-bytes s))` is `s`."
   [bs]
   (loop [bs (seq bs) out []]
     (if-not bs
-      (str/join out)
+      (chars->str out)
       (let [b (first bs)
             [cp rest-bs]
             (cond
@@ -99,15 +112,24 @@
                      (nthnext bs 4)])]
         (recur rest-bs
                (if (> cp 0xFFFF)
-                 (let [v (- cp 0x10000)]
-                   (conj out (char (+ 0xD800 (bit-shift-right v 10)))
-                         (char (+ 0xDC00 (bit-and v 0x3FF)))))
+                 ;; The two runtimes disagree about what a string IS. JVM
+                 ;; Clojure and Babashka store UTF-16, so a code point above
+                 ;; the BMP is two chars and `(char cp)` throws; clz stores
+                 ;; code points, so `(char cp)` is right and a surrogate pair
+                 ;; would come back out as two replacement characters.
+                 #?(:clz (conj out (char cp))
+                    :bb (let [v (- cp 0x10000)]
+                          (conj out (char (+ 0xD800 (bit-shift-right v 10)))
+                                (char (+ 0xDC00 (bit-and v 0x3FF)))))
+                    :clj (let [v (- cp 0x10000)]
+                           (conj out (char (+ 0xD800 (bit-shift-right v 10)))
+                                 (char (+ 0xDC00 (bit-and v 0x3FF))))))
                  (conj out (char cp))))))))
 
 (defn base64-encode
   "Standard Base64 (RFC 4648) of a string's UTF-8 bytes, with padding."
   [s]
-  (str/join
+  (chars->str
    (mapcat (fn [group]
              (let [[a b c] group
                    n (count group)
