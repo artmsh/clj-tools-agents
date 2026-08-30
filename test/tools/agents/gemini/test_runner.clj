@@ -1,0 +1,14 @@
+(ns tools.agents.gemini.test-runner
+  "Entry point for `clojure -M:test` and `bb test`. clz runs the same files
+   through its own `clz test` runner, so there are no per-runtime test shims."
+  (:require [clojure.test :as t]
+            tools.agents.gemini-test
+            tools.agents.gemini.live-test))
+
+(def suites
+  ['tools.agents.gemini-test
+   'tools.agents.gemini.live-test])
+
+(defn -main [& _]
+  (let [{:keys [fail error]} (apply t/run-tests suites)]
+    (System/exit (if (pos? (+ fail error)) 1 0))))

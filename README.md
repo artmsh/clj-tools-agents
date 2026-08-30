@@ -1,13 +1,13 @@
 # clj-tools-agents
 
-Pure-Clojure libraries for talking to LLMs — two provider API clients and one
-Model Context Protocol implementation — under one shared base namespace
+Pure-Clojure libraries for talking to LLMs — three provider API clients and
+one Model Context Protocol implementation — under one shared base namespace
 `tools.agents`. Each is ergonomically modeled on that vendor's own official
 Python SDK (`client` config map standing in for the SDK's constructor,
 resource methods matching its `create(**params)` calls, a typed `ex-info`
 error hierarchy matching its exception classes) and runs unmodified on **JVM
 Clojure**, **Babashka**, and **[clz](https://forgejo.lan/art/clz)** (v44 or
-newer — v44 changed `clojure.http/request`'s arity, and all three libraries'
+newer — v44 changed `clojure.http/request`'s arity, and all four libraries'
 clz HTTP leaf now passes its `tls?` flag).
 
 Merged from the formerly separate `corevector-anthropic` and
@@ -20,6 +20,7 @@ one `tools.agents.*` namespace root instead of two `corevector.*` ones.
 |---|---|---|
 | Anthropic Messages API | `tools.agents.anthropic` (+ `.visualize`, `.spec`) | [docs/anthropic.md](docs/anthropic.md) |
 | OpenAI Responses & Chat Completions APIs | `tools.agents.openai` | [docs/openai.md](docs/openai.md) |
+| Gemini Developer API | `tools.agents.gemini` | [docs/gemini.md](docs/gemini.md) |
 | Model Context Protocol, revision 2026-07-28 — server, client, stdio & Streamable HTTP | `tools.agents.mcp` (+ `.server`, `.client`, `.stdio`, `.http`) | [docs/mcp.md](docs/mcp.md) |
 
 Each doc covers that library's usage, full API parity table against its
@@ -53,6 +54,15 @@ against the reference `everything` server.
 ```
 
 ```clojure
+(require '[tools.agents.gemini :as gemini])
+
+(def client (gemini/client {:api-key (System/getenv "GEMINI_API_KEY")}))
+(-> (gemini/generate-content client "gemini-2.5-flash"
+      {"contents" [{"role" "user" "parts" [{"text" "Say hello in one short sentence."}]}]})
+    (gemini/output-text))
+```
+
+```clojure
 (require '[tools.agents.mcp.server :as server]
          '[tools.agents.mcp.stdio :as stdio])
 
@@ -70,6 +80,8 @@ against the reference `everything` server.
 See `examples/anthropic/`, `examples/openai/` and `examples/mcp/` for
 complete, runnable ports of real usage shapes from each vendor SDK and from
 the MCP reference servers — see each doc's Usage section for the full list.
+(`tools.agents.gemini` has no `examples/` directory yet — see docs/gemini.md's
+Usage section for the same shape inline.)
 
 ## Testing
 
@@ -77,15 +89,15 @@ the MCP reference servers — see each doc's Usage section for the full list.
 ./script/test-all.sh
 ```
 
-Runs all three suites (anthropic + openai + mcp) on JVM Clojure (`clojure
--M:test-anthropic` / `-M:test-openai` / `-M:test-mcp`), Babashka (`bb test`),
-and clz (one `clz test` per suite), and fails loudly if any of the three
-runtimes is red for any suite. Hermetic — mock servers and in-process
-loopbacks only, no outbound network. See each doc's Testing section for what
-each suite covers.
+Runs all four suites (anthropic + openai + gemini + mcp) on JVM Clojure
+(`clojure -M:test-anthropic` / `-M:test-openai` / `-M:test-gemini` /
+`-M:test-mcp`), Babashka (`bb test`), and clz (one `clz test` per suite), and
+fails loudly if any of the three runtimes is red for any suite. Hermetic —
+mock servers and in-process loopbacks only, no outbound network. See each
+doc's Testing section for what each suite covers.
 
 The clz stage runs one `clz test` invocation per suite rather than one for all
-eleven files, under a 15-minute `timeout` each. Two reasons, both learned the
+thirteen files, under a 15-minute `timeout` each. Two reasons, both learned the
 hard way while every clz mock-server test was failing on the pre-v44 arity:
 a suite that parks at exit takes the results of every suite after it on the
 same command line down with it, and a suite left parked keeps its fixed mock

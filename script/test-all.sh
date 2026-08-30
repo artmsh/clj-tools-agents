@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run all three suites (anthropic + openai + mcp) on every supported runtime.
+# Run all four suites (anthropic + openai + gemini + mcp) on every supported runtime.
 # Any failure fails the script.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -11,6 +11,7 @@ echo "── JVM Clojure ──────────────────�
 # with "My terminal reports width=0" when there is no TTY — i.e. under CI.
 clojure -M:test-anthropic || fail=1
 clojure -M:test-openai    || fail=1
+clojure -M:test-gemini    || fail=1
 clojure -M:test-mcp       || fail=1
 
 echo
@@ -94,6 +95,12 @@ clz_suite openai \
   test/tools/agents/openai/live_test.cljc \
   -- tools.agents.openai-test \
      tools.agents.openai.live-test
+
+clz_suite gemini \
+  test/tools/agents/gemini_test.cljc \
+  test/tools/agents/gemini/live_test.cljc \
+  -- tools.agents.gemini-test \
+     tools.agents.gemini.live-test
 
 clz_suite mcp \
   test/tools/agents/mcp_test.cljc \
