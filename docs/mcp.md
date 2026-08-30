@@ -488,15 +488,21 @@ this repo's own weather server.
   listen streams).
 
   Not covered: `http/serve!` and `http/connect!`, the two adapters that put
-  this logic on a real socket. Both are thin — one binds
-  `com.sun.net.httpserver` and delegates every request to `handle-http`, the
-  other is `HttpURLConnection` plus `parse-sse` — and testing either means
-  binding a port, which this repo's other suites have already shown to be the
-  one thing that makes a run non-hermetic. The logic underneath both is
-  tested; the socket wiring is not — and that gap is exactly what let clz
-  v44's `clojure.http/request` arity change sit undetected in `connect!`'s
-  clz branch until the anthropic and openai suites, which do exercise their
-  own identical leaf, went red on it.
+  this logic on a real socket. Both are thin — `serve!` binds
+  `com.sun.net.httpserver` and delegates every request to `handle-http`;
+  `connect!` is the private `http-post!` leaf (`java.net.http.HttpClient` on
+  JVM, `babashka.http-client` on bb, `clojure.http/request` on clz) plus
+  `parse-sse` — and testing either means binding a port, which this repo's
+  other suites have already shown to be the one thing that makes a run
+  non-hermetic. The logic underneath both is tested; the socket
+  wiring is not — and that gap is exactly what let clz v44's
+  `clojure.http/request` arity change sit undetected in `connect!`'s clz
+  branch until the anthropic and openai suites, which do exercise their own
+  identical leaf, went red on it. The fix there was therefore checked out of
+  band rather than by a test: `connect!` against a closed port on clz raises
+  `clojure.http/request: ConnectionRefused` for both `http://` and `https://`,
+  i.e. the call now reaches the network on either scheme instead of dying in
+  argument dispatch.
 - **`stdio_test.cljc`** — framing (one message per line; tool output that
   contains newlines cannot break it), `-32700` with a null id, notification
   ordering, listen/notify/cancel/close, `log!` writing nothing to stdout, and

@@ -310,7 +310,7 @@ the cookbook's own before/after comparison) and
 threading, `"caller"`-based routing, and the one rule that matters most:
 never send a `tool_result` for the `code_execution` server tool itself —
 proven end-to-end against a mock server, no beta access required. Running
-`examples.ptc-demo/-main` for real needs an Anthropic account with PTC beta
+`examples.anthropic.ptc-demo/-main` for real needs an Anthropic account with PTC beta
 access, since `advanced-tool-use-2025-11-20` is opt-in.
 
 ### Message content-block DSL
