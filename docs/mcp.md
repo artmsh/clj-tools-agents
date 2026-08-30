@@ -318,7 +318,7 @@ and, where the schema fixes one, `:data`.
 | `::error/mrtr-exhausted` / `::error/mrtr-unsupported-method` | The client's MRTR loop hit `:max-rounds`, or the server asked for MRTR on a method that may not use it |
 | `::error/undeclared-input-request` / `::error/no-input-handler` | The server asked for a capability the client never declared, or one it declared without wiring a handler |
 | `::error/transport` | The transport failed underneath a request |
-| `::error/unsupported-runtime` / `::error/tls-port-unsupported` | See Platform limitations |
+| `::error/unsupported-runtime` | See Platform limitations |
 
 `:type` values are flat keywords, not a `derive` hierarchy: clz has no
 `derive`, and a hierarchy that only works on two of three runtimes is worse
@@ -405,6 +405,16 @@ the message: host `http/handle-http` in whatever server that runtime has, or
 use stdio. `connect!` on clz throws the same, noting that a clz program can
 still *be* an MCP server.
 
+HTTP `connect!` on clz requires **clz v44 or newer**. v44 added a seventh
+`tls?` argument to `clojure.http/request`; on older clz every request throws
+`clojure.http/request: ArityMismatch`. That argument is also what lets an
+`https://` endpoint sit on a non-443 port — clz used to infer TLS from the
+port alone, so this leaf refused that case outright rather than send an
+`Authorization` header in plaintext. Verified against clz v44: port 443 with
+`true` and port 80 with `false` both complete, port 80 with `true` fails in
+the TLS handshake. The same change applies to `tools.agents.anthropic` and
+`tools.agents.openai`; see [docs/anthropic.md](anthropic.md).
+
 #### clz divergences that are correctness hazards, not style
 
 Each of these silently produced a *wrong value* rather than an error, and
@@ -420,9 +430,10 @@ obvious form is wrong:
 - **`(sort a-map)` returns `nil`.** Every ordered traversal of a map in this
   repo goes through its keys instead.
 - **`(str/join chars)` stringifies a character as its reader form** — `[\a
-  \b]` joins to `"\\a\\b"`. `http/chars->str` maps `str` over the sequence
-  first. `(apply str chars)` is also correct but StackOverflows past ~1000
-  arguments, which a Base64'd header value reaches easily.
+  \b]` joins to `"\\a\\b"`. The Base64 codec in `tools.agents.mcp.http`
+  maps `str` over the sequence first. `(apply str chars)` is also correct but
+  StackOverflows past ~1000 arguments, which a Base64'd header value reaches
+  easily.
 - **Strings hold code points, not UTF-16 units.** `(count "🎉")` is 1 and
   `(char 128169)` works, both unlike the JVM. So `http/bytes->utf8` and the
   JSON `\uXXXX` decoder each need a reader conditional: JSON always writes an
@@ -433,10 +444,19 @@ obvious form is wrong:
 ## Testing
 
 ```
-clojure -M:test-mcp     # JVM Clojure
-bb test-mcp             # Babashka
-./script/test-all.sh    # all three runtimes, all three libraries
+clojure -M:test-mcp                             # JVM Clojure
+bb test-mcp                                     # Babashka
+clz -L src -L test test test/tools/agents/mcp_test.cljc \
+    test/tools/agents/mcp/{conformance,client,http,stdio,examples}_test.cljc
+./script/test-all.sh                            # every runtime, every library
 ```
+
+The MCP suite is green on all three: JVM 177 tests / 683 assertions, Babashka
+the same, clz 664 tests (the count differs because the reader conditionals
+that gate `with-in-str` and the subprocess tests take different branches).
+So is the rest of `test-all.sh` — anthropic 165/421 and openai 84/304 on JVM
+and Babashka, 351 and 307 on clz. `test-all.sh` runs one clz invocation per
+suite; see the README's Testing section for why.
 
 Six suites, hermetic — no network, no fixed ports, and the only subprocess is
 this repo's own weather server.
@@ -466,6 +486,17 @@ this repo's own weather server.
   mirroring, every `-32020` case, code→status mapping, SSE framing and
   parsing, and `handle-http` end to end (JSON, 405, 403, `-32700`, 202, SSE,
   listen streams).
+
+  Not covered: `http/serve!` and `http/connect!`, the two adapters that put
+  this logic on a real socket. Both are thin — one binds
+  `com.sun.net.httpserver` and delegates every request to `handle-http`, the
+  other is `HttpURLConnection` plus `parse-sse` — and testing either means
+  binding a port, which this repo's other suites have already shown to be the
+  one thing that makes a run non-hermetic. The logic underneath both is
+  tested; the socket wiring is not — and that gap is exactly what let clz
+  v44's `clojure.http/request` arity change sit undetected in `connect!`'s
+  clz branch until the anthropic and openai suites, which do exercise their
+  own identical leaf, went red on it.
 - **`stdio_test.cljc`** — framing (one message per line; tool output that
   contains newlines cannot break it), `-32700` with a null id, notification
   ordering, listen/notify/cancel/close, `log!` writing nothing to stdout, and

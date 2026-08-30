@@ -6,7 +6,9 @@ Model Context Protocol implementation — under one shared base namespace
 Python SDK (`client` config map standing in for the SDK's constructor,
 resource methods matching its `create(**params)` calls, a typed `ex-info`
 error hierarchy matching its exception classes) and runs unmodified on **JVM
-Clojure**, **Babashka**, and **[clz](https://forgejo.lan/art/clz)**.
+Clojure**, **Babashka**, and **[clz](https://forgejo.lan/art/clz)** (v44 or
+newer — v44 changed `clojure.http/request`'s arity, and all three libraries'
+clz HTTP leaf now passes its `tls?` flag).
 
 Merged from the formerly separate `corevector-anthropic` and
 `corevector-openai` repos — same architecture in both (single leaf for
@@ -77,9 +79,19 @@ the MCP reference servers — see each doc's Usage section for the full list.
 
 Runs all three suites (anthropic + openai + mcp) on JVM Clojure (`clojure
 -M:test-anthropic` / `-M:test-openai` / `-M:test-mcp`), Babashka (`bb test`),
-and clz (`clz test`), and fails loudly if any of the three runtimes is red
-for any suite. Hermetic — mock servers and in-process loopbacks only, no
-outbound network. See each doc's Testing section for what each suite covers.
+and clz (one `clz test` per suite), and fails loudly if any of the three
+runtimes is red for any suite. Hermetic — mock servers and in-process
+loopbacks only, no outbound network. See each doc's Testing section for what
+each suite covers.
+
+The clz stage runs one `clz test` invocation per suite rather than one for all
+eleven files, under a 15-minute `timeout` each. Two reasons, both learned the
+hard way while every clz mock-server test was failing on the pre-v44 arity:
+a suite that parks at exit takes the results of every suite after it on the
+same command line down with it, and a suite left parked keeps its fixed mock
+ports bound into the next run, where Babashka then fails with "Address already
+in use". Nothing parks today — all three clz suites exit 0 — but the isolation
+is what makes that observable rather than inferred.
 
 `script/live-check.sh` is OpenAI's manual, non-CI live smoke check against a
 real endpoint — see docs/openai.md's Live smoke check section.

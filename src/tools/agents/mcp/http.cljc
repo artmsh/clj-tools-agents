@@ -473,8 +473,7 @@
 (defn- http-post!
   "POST body to url with headers. Returns {:status int :headers map :body
    string} on ANY HTTP response. Throws only on a genuine transport failure.
-   Same shape, and the same clz TLS-port refusal, as
-   tools.agents.anthropic's own leaf."
+   Same shape as tools.agents.anthropic's own leaf."
   [url headers body]
   #?(:clz
      (let [parsed (clz.url/parse url)
@@ -483,16 +482,15 @@
            port   (or (:port parsed) (if (= proto "https") 443 80))
            base   (or (:path parsed) "/")
            path   (if (:query parsed) (str base "?" (:query parsed)) base)]
-       ;; clz's clojure.http/request decides TLS purely by `port == 443` — it
-       ;; has no URL-scheme parameter — so an https:// endpoint on any other
-       ;; port would be sent in PLAINTEXT, leaking any Authorization header
-       ;; and the whole body. Refuse before any bytes go out.
-       (when (and (= proto "https") (not= port 443))
-         (throw (ex-info (str "tools.agents.mcp.http: refusing to send to https:// port " port
-                              " under clz — clz's clojure.http/request only negotiates TLS on "
-                              "port 443, so this request would be sent in PLAINTEXT.")
-                         {:type :tools.agents.mcp.error/tls-port-unsupported})))
-       (clojure.http/request "POST" host port path headers body))
+       ;; The 7th argument is clz v44's explicit tls? flag. Earlier clz took
+       ;; six arguments and inferred TLS from `port == 443` alone, which meant
+       ;; an https:// endpoint on any other port was sent in PLAINTEXT — this
+       ;; leaf used to refuse that case outright rather than leak an
+       ;; Authorization header. The flag makes the scheme, not the port,
+       ;; decide, so the refusal is gone. Verified against clz v44 directly:
+       ;; port 443 + true and port 80 + false both complete, and port 80 +
+       ;; true fails in the TLS handshake — i.e. the flag drives TLS.
+       (clojure.http/request "POST" host port path headers body (= proto "https")))
 
      :bb
      (let [resp (bb-http/post url {:headers headers :body body :throw false})]

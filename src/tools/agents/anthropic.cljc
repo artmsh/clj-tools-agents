@@ -311,22 +311,18 @@
            port   (or (:port parsed) (if (= proto "https") 443 80))
            base   (or (:path parsed) "/")
            path   (if (:query parsed) (str base "?" (:query parsed)) base)]
-       ;; clz's clojure.http/request (src/net/http_builtins.zig) decides TLS
-       ;; purely by `port == 443` — it has no URL-scheme parameter at all.
-       ;; An https:// base-url on any non-443 port (an entirely ordinary
-       ;; gateway/proxy/load-balancer setup) would otherwise fall straight
-       ;; through to a *plaintext* TCP send below, leaking x-api-key /
-       ;; Authorization and the full JSON body on the wire. Refuse loudly,
-       ;; before any bytes go out, rather than ever letting that happen.
-       (when (and (= proto "https") (not= port 443))
-         (throw (ex-info (str "tools.agents.anthropic/messages-create: refusing to send to https:// "
-                               "port " port " under clz — clz's clojure.http/request only negotiates "
-                               "TLS on port 443 (it has no URL-scheme awareness), so this request "
-                               "would otherwise be sent in PLAINTEXT, leaking credentials. Use a "
-                               ":base-url on port 443, or run this client on JVM Clojure/Babashka "
-                               "against this base-url instead.")
-                          {:type :tools.agents.anthropic.error/tls-port-unsupported})))
-       (clojure.http/request "POST" host port path headers body))
+       ;; The 7th argument is clz v44's explicit tls? flag
+       ;; (src/net/http_builtins.zig). Before v44 the builtin took six
+       ;; arguments and inferred TLS from `port == 443` alone, with no
+       ;; URL-scheme awareness — so an https:// base-url on any other port (an
+       ;; entirely ordinary gateway/proxy/load-balancer setup) fell through to
+       ;; a *plaintext* TCP send, leaking credentials and the full JSON body.
+       ;; This leaf refused that case outright rather than let it happen. The
+       ;; flag makes the scheme, not the port, decide, so the refusal is gone.
+       ;; Verified against clz v44 directly: port 443 + true and port 80 +
+       ;; false both complete, and port 80 + true fails in the TLS handshake —
+       ;; i.e. the flag drives TLS.
+       (clojure.http/request "POST" host port path headers body (= proto "https")))
 
      :bb
      (let [resp (http/post url {:headers headers :body body :throw false})]
@@ -552,10 +548,23 @@
         (* base (- 1.0 (* 0.25 (rand)))))))
 
 ;; Rebindable so tests can replace real sleeping with a no-op and assert on
-;; retry *count* instead of eating multi-second delays. Left bound to real
-;; `Thread/sleep` in production — same pattern as resolve-credentials'
-;; injected getenv-fn (a testability seam, not a runtime-specific leaf).
-(def ^:dynamic *sleep-fn* (fn [seconds] (Thread/sleep (long (* seconds 1000)))))
+;; retry *count* instead of eating multi-second delays. Left bound to a real
+;; sleep in production — same pattern as resolve-credentials' injected
+;; getenv-fn (a testability seam, not a runtime-specific leaf).
+;;
+;; The sleep itself IS runtime-specific: clz registers `sleep` as a bare
+;; global builtin (src/stdlib/time_builtins.zig) and has no Thread class,
+;; while JVM/bb have no bare `sleep`. Written as a reader conditional inside
+;; the fn body rather than a third leaf function, to keep this file's "the
+;; only two runtime-specific functions" boundary honest.
+(def ^:dynamic *sleep-fn*
+  (fn [seconds]
+    (let [ms (long (* seconds 1000))]
+      (when (pos? ms)
+        #?(:clz (sleep ms)
+           :bb (Thread/sleep ms)
+           :clj (Thread/sleep ms))
+        nil))))
 
 (defn request-with-retries!
   "Calls (attempt-fn) up to (inc max-retries) times total. attempt-fn performs
@@ -564,7 +573,7 @@
    :tools.agents.anthropic.error/api-connection and on retryable-status? HTTP
    statuses, honoring a Retry-After header (ex-data :headers) when present.
    Any other error — including the permanent refusals like
-   :streaming-unsupported / :tls-port-unsupported / :missing-credentials —
+   :streaming-unsupported / :missing-credentials —
    propagates on the first attempt, consuming no retry and no sleep.
 
    Public (unlike this file's other private helpers) for the same reason
@@ -687,7 +696,7 @@
    Retries client's :max-retries times (default 2, see `client`) on
    408/409/429/5xx and connection failures, with exponential backoff honoring
    a Retry-After header — see request-with-retries!. Permanent refusals
-   (:streaming-unsupported, :tls-port-unsupported, 4xx other than 408/409/429)
+   (:streaming-unsupported, 4xx other than 408/409/429)
    are never retried.
 
    Throws ex-info on any failure, message prefixed

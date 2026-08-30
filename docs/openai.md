@@ -138,7 +138,6 @@ Non-status error types:
 | malformed request/response JSON | `:tools.agents.openai/json-encode-error` / `:tools.agents.openai/json-parse-error` |
 | missing credentials (client construction or a hand-built client map) | `:tools.agents.openai/missing-credentials` |
 | `:stream true` requested | `:tools.agents.openai/streaming-unsupported` |
-| `https://` `:base-url` on a non-443 port, under clz | `:tools.agents.openai/tls-port-unsupported` |
 | response has no `"output"` / `"choices"` array, or an empty `"choices"` | `:tools.agents.openai/invalid-response` |
 | structurally wrong content (non-array `"content"`, non-string `"text"`, non-string non-null `"content"`) | `:tools.agents.openai/invalid-content-shape` |
 
@@ -166,9 +165,9 @@ tuning, on by default with `:max-retries` 2.
   longer than two minutes vetoes the retry entirely.
 - **What is not retried.** 4xx other than 408/409/429; a malformed JSON body
   on an otherwise-successful 2xx (the SDK decodes after its retry loop has
-  already broken out); and this library's own typed refusals — the clz
-  TLS-on-non-443-port guard and the `:stream true` rejection — mirroring the
-  SDK re-raising `OpenAIError` out of the send path without retrying.
+  already broken out); and this library's own typed refusal, the `:stream true`
+  rejection — mirroring the SDK re-raising `OpenAIError` out of the send path
+  without retrying.
 - **How long it waits.** A `Retry-After` / `retry-after-ms` inside
   `(0, 2 minutes]` is honored verbatim. Otherwise exponential backoff from
   `INITIAL_RETRY_DELAY` 0.5s, doubling per attempt, capped at
@@ -237,8 +236,10 @@ or hanging. This is a genuine platform gap, not an oversight:
 - clz's only HTTPS-capable HTTP request builtin, `clojure.http/request`, does
   not stream — it returns a single buffered `{:status :headers :body}` map.
 - clz's streaming builtin, `clojure.http/request-stream`, explicitly does
-  **not** support TLS (`error.TlsNotSupported` at port 443 — see
+  **not** support TLS (`error.TlsNotSupported` — see
   `src/net/http_builtins.zig`'s `request-stream` implementation in clz).
+  Re-verified empirically on clz v44, 2026-08-30: it takes v44's seventh
+  `tls?` argument like `request` does, and throws `TlsNotSupported` anyway.
 - `api.openai.com` is HTTPS-only.
 
 Put together: true SSE streaming against the real OpenAI API cannot be
@@ -247,23 +248,30 @@ that silently degrades to a hard error on clz, this library rejects
 `:stream true` uniformly on all three runtimes — the same contract everywhere
 is more valuable than partial platform-specific streaming support here.
 
-### Platform limitation: `https://` on a non-standard port, under clz
+### Resolved on clz v44: `https://` on a non-standard port
 
-clz's `clojure.http/request` builtin (the only TLS-capable HTTP client
-available to clz) decides whether to negotiate TLS purely by checking
-`port == 443` — it has no awareness of the URL scheme at all. That means an
-`https://` `:base-url` on any port *other* than 443 (an entirely ordinary
-setup for a gateway, reverse proxy, or load balancer) would, if sent as-is,
-silently fall through to a **plaintext** TCP connection — leaking the
-`Authorization: Bearer` header and the full request body on the wire, with no
-error or observable difference from a genuinely encrypted request.
+Until clz v44, `clojure.http/request` — the only TLS-capable HTTP client
+available to clz — decided whether to negotiate TLS purely by checking
+`port == 443`, with no awareness of the URL scheme. An `https://` `:base-url`
+on any other port (an entirely ordinary setup for a gateway, reverse proxy, or
+load balancer) would have fallen through to a **plaintext** TCP connection,
+leaking the `Authorization: Bearer` header and the full request body on the
+wire with no error and no observable difference from a genuinely encrypted
+request. This library refused such requests outright, before any bytes were
+sent, with `{:type :tools.agents.openai/tls-port-unsupported}`.
 
-Rather than ever let that happen, the request path refuses such requests up
-front on clz with `{:type :tools.agents.openai/tls-port-unsupported}`, before
-any bytes are sent. On JVM Clojure and Babashka the same `:base-url` is
-handled correctly (TLS is chosen from the URL scheme, not the port), so this
-is a clz-only restriction: point `:base-url` at port 443, or run this client
-on JVM Clojure/Babashka against that gateway instead.
+clz v44 gives the builtin a seventh argument, an explicit `tls?` boolean, so
+the scheme decides and the port no longer does. The leaf now passes
+`(= proto "https")` and the refusal — along with the error type — is gone.
+Verified directly against clz v44 on 2026-08-30: port 443 with `true` and
+port 80 with `false` both complete, and port 80 with `true` fails inside the
+TLS handshake, which is what proves the flag rather than the port drives TLS.
+An `https://` `:base-url` on a non-443 port is now handled the same way on all
+three runtimes.
+
+Note the arity change is not backward compatible: on clz older than v44 this
+leaf throws `clojure.http/request: ArityMismatch` on every request. Six-arity
+clz is no longer supported.
 
 ### Platform quirk: `clz test`'s namespace resolution for `examples/`
 

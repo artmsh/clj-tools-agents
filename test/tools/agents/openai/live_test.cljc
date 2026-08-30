@@ -432,20 +432,22 @@
     (is (some? e))
     (is (= :tools.agents.openai/missing-credentials (:type (ex-data e))))))
 
-;; clz-only: clojure.http/request decides TLS purely by `port == 443`, so an
-;; https:// base-url on any other port would otherwise be sent in plaintext.
-;; No server is started at this port at all — if a network call were ever
-;; attempted (i.e. the guard were missing), this would hang/error with a
-;; connection failure instead of the expected refusal, and on a real port
-;; it would have silently leaked the credentials below over plaintext TCP.
+;; clz-only: this used to assert a REFUSAL. clz's clojure.http/request once
+;; inferred TLS from `port == 443` alone, so an https:// base-url on any other
+;; port would have gone out in plaintext with the credentials in it, and this
+;; leaf refused rather than let that happen. clz v44 takes an explicit tls?
+;; flag, so the scheme decides and the refusal is gone — what must now be true
+;; is that the call reaches the network and fails there. No server is started
+;; at this port, so a connect() failure is the whole expected outcome; anything
+;; still throwing :tls-port-unsupported would mean a dead guard survived.
 #?(:clz
-   (deftest https-on-non-443-port-refused-before-any-network-activity
+   (deftest https-on-non-443-port-now-attempts-tls-instead-of-refusing
      (let [client (oai/client {:api-key "should-never-leave-process"
                                :base-url "https://127.0.0.1:18999/v1"})
            e (try (oai/responses-create client {"model" "m" "input" "hi"})
                   nil (catch Exception e e))]
        (is (some? e))
-       (is (= :tools.agents.openai/tls-port-unsupported (:type (ex-data e))))
+       (is (= :tools.agents.openai/api-connection-error (:type (ex-data e))))
        (is (str/starts-with? (str (ex-message e)) "tools.agents.openai/responses-create: ")))))
 
 ;; ---------------------------------------------------------------------------

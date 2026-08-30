@@ -339,12 +339,8 @@
   "POST body to url with headers. Returns {:status int :headers map :body
    string} on ANY HTTP response (2xx or not) — callers classify status
    themselves. Throws only on a genuine transport failure (DNS, connection
-   refused, TLS handshake failure, timeout — no response at all).
-
-   fn-name is the caller's public fn (\"responses-create\" etc.), used only to
-   prefix the clz TLS-refusal message so every ex-message this library throws
-   names the resource method the caller actually called."
-  [fn-name url headers body]
+   refused, TLS handshake failure, timeout — no response at all)."
+  [url headers body]
   #?(:clz
      (let [parsed (clz.url/parse url)
            proto  (:protocol parsed)
@@ -352,22 +348,18 @@
            port   (or (:port parsed) (if (= proto "https") 443 80))
            base   (or (:path parsed) "/")
            path   (if (:query parsed) (str base "?" (:query parsed)) base)]
-       ;; clz's clojure.http/request (src/net/http_builtins.zig) decides TLS
-       ;; purely by `port == 443` — it has no URL-scheme parameter at all.
-       ;; An https:// base-url on any non-443 port (an entirely ordinary
-       ;; gateway/proxy/load-balancer setup) would otherwise fall straight
-       ;; through to a *plaintext* TCP send below, leaking the Authorization
-       ;; header and the full JSON body on the wire. Refuse loudly, before
-       ;; any bytes go out, rather than ever letting that happen.
-       (when (and (= proto "https") (not= port 443))
-         (throw (ex-info (str "tools.agents.openai/" fn-name ": refusing to send to https:// "
-                               "port " port " under clz — clz's clojure.http/request only negotiates "
-                               "TLS on port 443 (it has no URL-scheme awareness), so this request "
-                               "would otherwise be sent in PLAINTEXT, leaking credentials. Use a "
-                               ":base-url on port 443, or run this client on JVM Clojure/Babashka "
-                               "against this base-url instead.")
-                          {:type :tools.agents.openai/tls-port-unsupported})))
-       (clojure.http/request "POST" host port path headers body))
+       ;; The 7th argument is clz v44's explicit tls? flag
+       ;; (src/net/http_builtins.zig). Before v44 the builtin took six
+       ;; arguments and inferred TLS from `port == 443` alone, with no
+       ;; URL-scheme awareness — so an https:// base-url on any other port (an
+       ;; entirely ordinary gateway/proxy/load-balancer setup) fell through to
+       ;; a *plaintext* TCP send, leaking credentials and the full JSON body.
+       ;; This leaf refused that case outright rather than let it happen. The
+       ;; flag makes the scheme, not the port, decide, so the refusal is gone.
+       ;; Verified against clz v44 directly: port 443 + true and port 80 +
+       ;; false both complete, and port 80 + true fails in the TLS handshake —
+       ;; i.e. the flag drives TLS.
+       (clojure.http/request "POST" host port path headers body (= proto "https")))
 
      :bb
      ;; :version :http1.1 for the same reason as the :clj leaf below —
@@ -719,7 +711,7 @@
         max-retries (resolve-max-retries client)]
     (loop [retries-taken 0]
       (let [outcome (try
-                      {:resp (http-post! fn-name url headers body-str)}
+                      {:resp (http-post! url headers body-str)}
                       (catch Exception e
                         (if (own-error? e) (throw e) {:error e})))]
         (if (:error outcome)

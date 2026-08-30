@@ -66,7 +66,7 @@ Programmatic Tool Calling below.
 | `anthropic.APIError` / `.APIStatusError` / `.RateLimitError` / etc. | `ex-info` with `:type` in `ex-data` | See the error-hierarchy table below — one exception constructor, discriminated by `:type`, rather than a Python-style class hierarchy (there is no `class` in Clojure/clz to mirror it with). |
 | `client.with_options(...)` | *(not implemented)* | Per-request override without mutating the client. Out of scope for this port; `client` is a plain map, so callers can just `(assoc client :base-url ...)` themselves. |
 | `max_retries` / automatic backoff | `:max-retries` client opt, default 2 | **Resolved, implemented.** See Retries below. |
-| `client.messages.stream(...)` / `stream=True` | **rejected outright** | Not resolved — this is a genuine, re-verified platform blocker, not an open TODO. clz's streaming HTTP builtin (`clojure.http/request-stream`) still refuses TLS on port 443 as of clz v43 (re-checked directly against `src/net/http_builtins.zig:834`, 2026-08-05) — see Streaming below for why that rules out true SSE streaming on clz today, and why this library rejects `:stream true` uniformly on all three runtimes rather than build a JVM/Babashka-only path. |
+| `client.messages.stream(...)` / `stream=True` | **rejected outright** | Not resolved — this is a genuine, re-verified platform blocker, not an open TODO. clz's streaming HTTP builtin (`clojure.http/request-stream`) still refuses TLS as of clz v44 (re-checked empirically 2026-08-30: it takes v44's `tls?` flag and throws `TlsNotSupported` anyway) — see Streaming below for why that rules out true SSE streaming on clz today, and why this library rejects `:stream true` uniformly on all three runtimes rather than build a JVM/Babashka-only path. |
 | `client.messages.count_tokens(...)` | `(count-tokens client request)` | **Resolved, implemented** — same request shape as `messages-create` minus `max_tokens`, same retry policy and error hierarchy, POSTs to `/v1/messages/count_tokens`. |
 | `.batches.*` | *(not implemented)* | Kept out of scope — a whole separate resource family (create/retrieve/list/cancel/JSONL results), unlike `count_tokens`'s single endpoint; only `messages-create` was in the original Zig builtin's contract. |
 | Workload Identity Federation / `ant auth login` OAuth profile / `ANTHROPIC_PROFILE` | *(not implemented)* | The credential chain here is explicit-arg → `ANTHROPIC_API_KEY` → `ANTHROPIC_AUTH_TOKEN` → throw. The Python SDK's fuller chain (OAuth profile, WIF env vars, default disk profile) has no clz-portable equivalent (no local OAuth token store, no cloud SDKs) and is out of scope. |
@@ -137,7 +137,7 @@ response (a real occurrence behind a proxy/gateway that duplicates or folds
 a singleton header) — the first element is used in that case, rather than
 silently failing to parse and falling back to the shorter computed backoff.
 
-Permanent failures — `:streaming-unsupported`, `:tls-port-unsupported`, and
+Permanent failures — `:streaming-unsupported` and
 any other non-retryable 4xx (400/401/403/404/422) — are never retried and
 never sleep, regardless of `:max-retries`.
 
@@ -193,7 +193,6 @@ for those functions' own failures) and `ex-data` `{:type <keyword> :status
 | missing credentials (client construction) | `:tools.agents.anthropic.error/missing-credentials` |
 | `:max-retries` is not a non-negative integer (client construction) | `:tools.agents.anthropic.error/invalid-max-retries` |
 | `:stream true` requested | `:tools.agents.anthropic.error/streaming-unsupported` |
-| `https://` `:base-url` on a non-443 port, under clz | `:tools.agents.anthropic.error/tls-port-unsupported` |
 | response has no `"content"` array | `:tools.agents.anthropic.error/invalid-response` |
 | no `"text"` blocks in `"content"` | `:tools.agents.anthropic.error/no-text-content` |
 | `"text"` content block has a non-string `"text"` value | `:tools.agents.anthropic.error/invalid-content-shape` |
@@ -580,8 +579,9 @@ or hanging. This is a genuine platform gap, not an oversight:
 - clz's streaming builtin, `clojure.http/request-stream`, explicitly does
   **not** support TLS (`error.TlsNotSupported` at port 443 —
   see `src/net/http_builtins.zig`'s `request-stream` implementation in clz).
-  Re-verified directly against `src/net/http_builtins.zig:834` on clz v43,
-  2026-08-05 — still `if (port == 443) return httpThrow(..., error.TlsNotSupported)`.
+  Re-verified empirically on clz v44, 2026-08-30: `request-stream` gained the
+  same seventh `tls?` argument as `request`, and calling it with `tls? true`
+  still throws `TlsNotSupported`. The flag reached the buffered builtin only.
   This is a live, re-checked blocker, not a stale TODO.
 - `api.anthropic.com` is HTTPS-only.
 
@@ -593,23 +593,30 @@ valuable than partial platform-specific streaming support here. A future
 `messages-stream` could be added once clz's HTTP stack supports TLS on the
 streaming builtin.
 
-### Platform limitation: `https://` on a non-standard port, under clz
+### Resolved on clz v44: `https://` on a non-standard port
 
-clz's `clojure.http/request` builtin (the only TLS-capable HTTP client
-available to clz) decides whether to negotiate TLS purely by checking
-`port == 443` — it has no awareness of the URL scheme at all. That means an
-`https://` `:base-url` on any port *other* than 443 (an entirely ordinary
-setup for a gateway, reverse proxy, or load balancer) would, if sent as-is,
-silently fall through to a **plaintext** TCP connection — leaking
-`x-api-key` / `Authorization` and the full request body on the wire, with no
-error or observable difference from a genuinely encrypted request.
+Until clz v44, `clojure.http/request` — the only TLS-capable HTTP client
+available to clz — decided whether to negotiate TLS purely by checking
+`port == 443`, with no awareness of the URL scheme. An `https://` `:base-url`
+on any other port (an entirely ordinary setup for a gateway, reverse proxy, or
+load balancer) would have fallen through to a **plaintext** TCP connection,
+leaking `x-api-key` / `Authorization` and the full request body on the wire
+with no error and no observable difference from a genuinely encrypted request.
+This library refused such requests outright, before any bytes were sent, with
+`{:type :tools.agents.anthropic.error/tls-port-unsupported}`.
 
-Rather than ever let that happen, `messages-create` refuses such requests
-up front on clz with `{:type :tools.agents.anthropic.error/tls-port-unsupported}`,
-before any bytes are sent. On JVM Clojure and Babashka the same `:base-url`
-is handled correctly (TLS is chosen from the URL scheme, not the port), so
-this is a clz-only restriction: point `:base-url` at port 443, or run this
-client on JVM Clojure/Babashka against that gateway instead.
+clz v44 gives the builtin a seventh argument, an explicit `tls?` boolean, so
+the scheme decides and the port no longer does. The leaf now passes
+`(= proto "https")` and the refusal — along with the error type — is gone.
+Verified directly against clz v44 on 2026-08-30: port 443 with `true` and
+port 80 with `false` both complete, and port 80 with `true` fails inside the
+TLS handshake, which is what proves the flag rather than the port drives TLS.
+An `https://` `:base-url` on a non-443 port is now handled the same way on all
+three runtimes.
+
+Note the arity change is not backward compatible: on clz older than v44 this
+leaf throws `clojure.http/request: ArityMismatch` on every request. Six-arity
+clz is no longer supported.
 
 ### Platform quirk: `clz test`'s namespace resolution for `examples/`
 

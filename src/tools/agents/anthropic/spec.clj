@@ -133,7 +133,6 @@
     :tools.agents.anthropic.error/missing-credentials
     :tools.agents.anthropic.error/invalid-max-retries
     :tools.agents.anthropic.error/streaming-unsupported
-    :tools.agents.anthropic.error/tls-port-unsupported
     :tools.agents.anthropic.error/invalid-response
     :tools.agents.anthropic.error/no-text-content
     :tools.agents.anthropic.error/invalid-content-shape

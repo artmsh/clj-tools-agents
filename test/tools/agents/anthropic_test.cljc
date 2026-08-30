@@ -407,7 +407,6 @@
 
 (deftest does-not-retry-permanent-errors
   (doseq [[type status] [[:tools.agents.anthropic.error/streaming-unsupported nil]
-                          [:tools.agents.anthropic.error/tls-port-unsupported nil]
                           [:tools.agents.anthropic.error/bad-request 400]
                           [:tools.agents.anthropic.error/not-found 404]]]
     (testing type
