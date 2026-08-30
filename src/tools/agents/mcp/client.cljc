@@ -280,11 +280,18 @@
 (defn resource-ref [uri-template] {"type" "ref/resource" "uri" uri-template})
 
 (defn listen!
-  "subscriptions/listen — opens a long-lived notification stream. This
-   returns only the request to send; the stream itself is the transport's
-   business, so tools.agents.mcp.stdio/listen! is what a caller normally
-   uses. `notifications` is the SubscriptionFilter: any of
-   \"toolsListChanged\", \"promptsListChanged\", \"resourcesListChanged\",
+  "subscriptions/listen — builds the request for a long-lived notification
+   stream. It only BUILDS it: the stream itself is the transport's business.
+
+   Over `tools.agents.mcp.stdio/connect!`, sending it with `(:send! c)`
+   blocks for the life of the subscription — every notification on the
+   stream goes to that transport's `:on-notification`, and the call returns
+   only when the server closes the stream gracefully. So a caller who also
+   wants to issue ordinary requests dedicates a thread (or a second
+   connection) to the subscription.
+
+   `notifications` is the SubscriptionFilter: any of \"toolsListChanged\",
+   \"promptsListChanged\", \"resourcesListChanged\",
    \"resourceSubscriptions\"."
   [c notifications]
   (request c "subscriptions/listen" {"notifications" notifications}))

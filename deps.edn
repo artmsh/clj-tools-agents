@@ -4,4 +4,6 @@
  {:test-anthropic {:extra-paths ["test" "."]
                    :main-opts   ["-m" "tools.agents.anthropic.test-runner"]}
   :test-openai    {:extra-paths ["test" "."]
-                   :main-opts   ["-m" "tools.agents.openai.test-runner"]}}}
+                   :main-opts   ["-m" "tools.agents.openai.test-runner"]}
+  :test-mcp       {:extra-paths ["test" "."]
+                   :main-opts   ["-m" "tools.agents.mcp.test-runner"]}}}

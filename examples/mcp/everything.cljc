@@ -36,12 +36,17 @@
        mints an explicit id, returns it, and the client passes it back as an
        ordinary argument — the pattern SEP-2567 prescribes in place of
        connection state.
-     - The four MCP Tasks tools are NOT ported. Tasks left the core protocol
-       in this revision and became the `io.modelcontextprotocol/tasks`
-       extension; `server/server`'s `:methods` option is the seam an
-       extension would be built on.
+     - The three MCP Tasks tools — simulate-research-query,
+       trigger-sampling-request-async and trigger-elicitation-request-async —
+       are NOT ported. Tasks left the core protocol in this revision and
+       became the `io.modelcontextprotocol/tasks` extension; `server/server`'s
+       `:methods` option is the seam an extension would be built on.
      - gzip-file-as-resource is not ported: it fetches an arbitrary URL and
        gzips it, neither of which this dependency-free library provides.
+     - The static documents keep the reference server's URIs and filenames but
+       are held in source rather than read off disk, and a hundred numbered
+       resources are ADDED to the list so that `resources/list` pagination is
+       reachable — the reference server lists nothing pageable.
 
    Run it: `clojure -M -m examples.mcp.everything` (or under bb / clz)
    speaks stdio. `--http` serves Streamable HTTP on JVM Clojure."
@@ -121,15 +126,42 @@
 ;; Static documents — demo://resource/static/document/<name>
 ;; ---------------------------------------------------------------------------
 
+(def instructions-text
+  (str "This server exists to exercise a client. Every core capability of "
+       "protocol revision 2026-07-28 is reachable from it: tools with output "
+       "schemas and annotations, static and templated resources, prompts with "
+       "completions, per-request progress and logging, subscriptions/listen "
+       "fan-out, and the multi round-trip request pattern (elicitation, URL "
+       "elicitation, sampling, roots). Tools that need a client capability are "
+       "listed unconditionally and fail with -32021 naming what was missing."))
+
 (def static-documents
-  {"features" (str "The everything server exercises tools, resources, resource templates, "
-                   "prompts, completions, progress, logging, subscriptions and the "
-                   "multi round-trip request pattern.")
-   "architecture" (str "One pure function, tools.agents.mcp.server/handle, sits under both "
+  ;; The reference server serves the seven markdown files in
+  ;; src/everything/docs/ from disk. The names are kept; the prose is this
+  ;; port's own, because it describes this port. Held in source rather than
+  ;; read from disk: this library wraps no filesystem, and a server that
+  ;; needs its own working directory to answer resources/read is a worse
+  ;; demonstration than one that does not.
+  {"architecture" (str "One pure function, tools.agents.mcp.server/handle, sits under both "
                        "transports. The stdio transport adds framing; the Streamable HTTP "
-                       "transport adds header mirroring and SSE.")
-   "migration" (str "This port targets protocol revision 2026-07-28: no initialize handshake, "
-                    "no sessions, no server-initiated requests, no resources/subscribe.")})
+                       "transport adds header mirroring and SSE. Neither holds protocol state, "
+                       "because after SEP-2567 there is none to hold.")
+   "extension" (str "Methods outside the core protocol — io.modelcontextprotocol/tasks and "
+                    "anything like it — are registered through server/server's :methods "
+                    "option, which takes a map of method name to (fn [ctx request] result).")
+   "features" (str "This server exercises tools, resources, resource templates, prompts, "
+                   "completions, progress, logging, subscriptions/listen fan-out and the "
+                   "multi round-trip request pattern.")
+   "how-it-works" (str "Every request carries its own protocol version, client capabilities "
+                       "and client info in _meta. The server answers from that alone: there "
+                       "is no handshake to have missed and no session to look up.")
+   "instructions" instructions-text
+   "startup" (str "`-main` builds the server once and hands it to a transport. stdio by "
+                  "default; --http serves Streamable HTTP on JVM Clojure.")
+   "structure" (str "Tool, prompt and resource constructors are plain functions returning "
+                    "plain maps, assembled by everything-server. Every impure input — the "
+                    "clock, the sleep, the notification sink, the handle store — is passed "
+                    "in, so the whole server is a pure function under test.")})
 
 ;; ---------------------------------------------------------------------------
 ;; Tools
@@ -636,10 +668,13 @@
   100)
 
 (defn numbered-resources
-  "Ports ALL_RESOURCES: 100 entries, odd ids plaintext and even ids base64
-   blob, listed ten to a page. The URIs are the very ones the two templates
-   below match, so `resources/list` and `resources/templates/list` describe
-   one set of resources rather than two."
+  "NOT in the reference server, which reaches its dynamic resources only
+   through the two templates and therefore lists nothing pageable. These
+   hundred entries — odd ids plaintext, even ids base64 blob — exist so that
+   `resources/list` pagination is reachable at all, which no other primitive
+   here exercises. Their URIs are the very ones the templates match, so
+   `resources/list` and `resources/templates/list` describe one set of
+   resources rather than two."
   [timestamp-fn]
   (mapv (fn [i]
           (let [text? (odd? i)
@@ -716,15 +751,6 @@
 ;; The server
 ;; ---------------------------------------------------------------------------
 
-(def instructions
-  (str "This server exists to exercise a client. Every core capability of "
-       "protocol revision 2026-07-28 is reachable from it: tools with output "
-       "schemas and annotations, static and templated resources, prompts with "
-       "completions, per-request progress and logging, subscriptions/listen "
-       "fan-out, and the multi round-trip request pattern (elicitation, URL "
-       "elicitation, sampling, roots). Tools that need a client capability are "
-       "listed unconditionally and fail with -32021 naming what was missing."))
-
 (defn- default-timestamp
   "Milliseconds since the epoch, as a string. The reference server stamps an
    ISO-8601 date; a monotonic integer is the portable equivalent here, and
@@ -773,7 +799,7 @@
        :version "1.0.0"
        :title "Everything Example Server"
        :description "Exercises every capability of MCP revision 2026-07-28."
-       :instructions instructions
+       :instructions instructions-text
        :tools [(echo-tool)
                (get-sum-tool)
                (get-tiny-image-tool)

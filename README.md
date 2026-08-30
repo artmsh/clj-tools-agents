@@ -1,11 +1,12 @@
 # clj-tools-agents
 
-Pure-Clojure clients for LLM provider APIs, under one shared base namespace
-`tools.agents`. Each provider is ergonomically modeled on that vendor's own
-official Python SDK (`client` config map standing in for the SDK's
-constructor, resource methods matching its `create(**params)` calls, a typed
-`ex-info` error hierarchy matching its exception classes) and runs unmodified
-on **JVM Clojure**, **Babashka**, and **[clz](https://forgejo.lan/art/clz)**.
+Pure-Clojure libraries for talking to LLMs — two provider API clients and one
+Model Context Protocol implementation — under one shared base namespace
+`tools.agents`. Each is ergonomically modeled on that vendor's own official
+Python SDK (`client` config map standing in for the SDK's constructor,
+resource methods matching its `create(**params)` calls, a typed `ex-info`
+error hierarchy matching its exception classes) and runs unmodified on **JVM
+Clojure**, **Babashka**, and **[clz](https://forgejo.lan/art/clz)**.
 
 Merged from the formerly separate `corevector-anthropic` and
 `corevector-openai` repos — same architecture in both (single leaf for
@@ -17,13 +18,16 @@ one `tools.agents.*` namespace root instead of two `corevector.*` ones.
 |---|---|---|
 | Anthropic Messages API | `tools.agents.anthropic` (+ `.visualize`, `.spec`) | [docs/anthropic.md](docs/anthropic.md) |
 | OpenAI Responses & Chat Completions APIs | `tools.agents.openai` | [docs/openai.md](docs/openai.md) |
+| Model Context Protocol, revision 2026-07-28 — server, client, stdio & Streamable HTTP | `tools.agents.mcp` (+ `.server`, `.client`, `.stdio`, `.http`) | [docs/mcp.md](docs/mcp.md) |
 
 Each doc covers that library's usage, full API parity table against its
 vendor SDK, error hierarchy, retries, and platform notes (streaming,
 non-standard-port TLS under clz, `clz test`'s `examples/` namespace
 resolution). "Divergences from tools.agents.anthropic" in docs/openai.md
 covers the handful of places the two deliberately behave differently —
-each follows its own vendor SDK rather than the other.
+each follows its own vendor SDK rather than the other. docs/mcp.md's
+"The everything server, row by row" does the same for the MCP library
+against the reference `everything` server.
 
 ## Usage
 
@@ -46,9 +50,24 @@ each follows its own vendor SDK rather than the other.
     (oai/output-text))
 ```
 
-See `examples/anthropic/` and `examples/openai/` for complete,
-runnable-against-a-mock-server ports of real usage shapes from each vendor
-SDK — see each doc's Usage section for the full list.
+```clojure
+(require '[tools.agents.mcp.server :as server]
+         '[tools.agents.mcp.stdio :as stdio])
+
+(stdio/serve!
+ (server/server
+  {:name "weather" :version "1.0.0"
+   :tools [{:name "get_alerts"
+            :description "Get weather alerts for a US state."
+            :input-schema {"type" "object"
+                           "properties" {"state" {"type" "string"}}
+                           "required" ["state"]}
+            :handler (fn [ctx args] (fetch-alerts (get args "state")))}]}))
+```
+
+See `examples/anthropic/`, `examples/openai/` and `examples/mcp/` for
+complete, runnable ports of real usage shapes from each vendor SDK and from
+the MCP reference servers — see each doc's Usage section for the full list.
 
 ## Testing
 
@@ -56,11 +75,11 @@ SDK — see each doc's Usage section for the full list.
 ./script/test-all.sh
 ```
 
-Runs both suites (anthropic + openai) on JVM Clojure (`clojure -M:test-anthropic`
-/ `-M:test-openai`), Babashka (`bb test`), and clz (`clz test`), and fails
-loudly if any of the three is red for either suite. Hermetic — mock servers
-only, no outbound network. See each doc's Testing section for what each suite
-covers.
+Runs all three suites (anthropic + openai + mcp) on JVM Clojure (`clojure
+-M:test-anthropic` / `-M:test-openai` / `-M:test-mcp`), Babashka (`bb test`),
+and clz (`clz test`), and fails loudly if any of the three runtimes is red
+for any suite. Hermetic — mock servers and in-process loopbacks only, no
+outbound network. See each doc's Testing section for what each suite covers.
 
 `script/live-check.sh` is OpenAI's manual, non-CI live smoke check against a
 real endpoint — see docs/openai.md's Live smoke check section.

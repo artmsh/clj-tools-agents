@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Run both suites (anthropic + openai) on every supported runtime. Any
-# failure fails the script.
+# Run all three suites (anthropic + openai + mcp) on every supported runtime.
+# Any failure fails the script.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -11,6 +11,7 @@ echo "── JVM Clojure ──────────────────�
 # with "My terminal reports width=0" when there is no TTY — i.e. under CI.
 clojure -M:test-anthropic || fail=1
 clojure -M:test-openai    || fail=1
+clojure -M:test-mcp       || fail=1
 
 echo
 echo "── Babashka ───────────────────────────────"
@@ -29,7 +30,13 @@ clz_out=$(clz -L src -L test test \
                 test/tools/agents/anthropic/live_test.cljc \
                 test/tools/agents/anthropic/visualize_test.cljc \
                 test/tools/agents/openai_test.cljc \
-                test/tools/agents/openai/live_test.cljc 2>&1) || fail=1
+                test/tools/agents/openai/live_test.cljc \
+                test/tools/agents/mcp_test.cljc \
+                test/tools/agents/mcp/conformance_test.cljc \
+                test/tools/agents/mcp/client_test.cljc \
+                test/tools/agents/mcp/http_test.cljc \
+                test/tools/agents/mcp/stdio_test.cljc \
+                test/tools/agents/mcp/examples_test.cljc 2>&1) || fail=1
 echo "$clz_out" | tail -6
 # Belt-and-braces: clz test silently drops a file's tests (while still
 # reporting "0 failures, 0 errors" for the rest) if it hits a compile error
@@ -43,6 +50,12 @@ if ! echo "$clz_out" | grep -Eq '^Ran [1-9][0-9]* tests\.$' ||
    ! echo "$clz_out" | grep -q 'Testing tools.agents.anthropic.visualize-test' ||
    ! echo "$clz_out" | grep -q 'Testing tools.agents.openai-test' ||
    ! echo "$clz_out" | grep -q 'Testing tools.agents.openai.live-test' ||
+   ! echo "$clz_out" | grep -q 'Testing tools.agents.mcp-test' ||
+   ! echo "$clz_out" | grep -q 'Testing tools.agents.mcp.conformance-test' ||
+   ! echo "$clz_out" | grep -q 'Testing tools.agents.mcp.client-test' ||
+   ! echo "$clz_out" | grep -q 'Testing tools.agents.mcp.http-test' ||
+   ! echo "$clz_out" | grep -q 'Testing tools.agents.mcp.stdio-test' ||
+   ! echo "$clz_out" | grep -q 'Testing tools.agents.mcp.examples-test' ||
    echo "$clz_out" | grep -qi 'compile error\|unhandled exception'; then
   fail=1
 fi

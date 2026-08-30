@@ -1,12 +1,16 @@
 {:paths ["src" "test" "."]
  :tasks
- {test {:doc "Run both suites (anthropic + openai) on Babashka — each in its own bb
-             subprocess, since -main calls System/exit unconditionally and would
-             otherwise kill the process before the second suite ran"
+ {test {:doc "Run all three suites (anthropic + openai + mcp) on Babashka — each
+             in its own bb subprocess, since -main calls System/exit
+             unconditionally and would otherwise kill the process before the
+             next suite ran"
         :task (let [a (shell {:continue true} "bb" "test-anthropic")
-                    o (shell {:continue true} "bb" "test-openai")]
-                (System/exit (if (and (zero? (:exit a)) (zero? (:exit o))) 0 1)))}
+                    o (shell {:continue true} "bb" "test-openai")
+                    m (shell {:continue true} "bb" "test-mcp")]
+                (System/exit (if (every? zero? [(:exit a) (:exit o) (:exit m)]) 0 1)))}
   test-anthropic {:doc  "Run the anthropic suite on Babashka"
                   :task (exec 'tools.agents.anthropic.test-runner/-main)}
   test-openai    {:doc  "Run the openai suite on Babashka"
-                  :task (exec 'tools.agents.openai.test-runner/-main)}}}
+                  :task (exec 'tools.agents.openai.test-runner/-main)}
+  test-mcp       {:doc  "Run the mcp suite on Babashka"
+                  :task (exec 'tools.agents.mcp.test-runner/-main)}}}

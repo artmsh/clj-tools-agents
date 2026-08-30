@@ -210,10 +210,15 @@
            r (java.io.BufferedReader. (java.io.InputStreamReader. (.getInputStream proc) "UTF-8"))
            e (java.io.BufferedReader. (java.io.InputStreamReader. (.getErrorStream proc) "UTF-8"))
            lock (Object.)]
-       (future (loop []
-                 (when-let [l (.readLine e)]
-                   (when on-stderr (on-stderr l))
-                   (recur))))
+       ;; A DAEMON thread, not `future`: clojure.core/future runs on the agent
+       ;; send-off pool, whose non-daemon threads keep a JVM alive for a full
+       ;; minute after main returns. A transport must not hold its host open.
+       (doto (Thread. ^Runnable (fn [] (loop []
+                                         (when-let [l (.readLine e)]
+                                           (when on-stderr (on-stderr l))
+                                           (recur)))))
+         (.setDaemon true)
+         (.start))
        {:process proc
         :reader r
         :writer w
@@ -251,10 +256,15 @@
            r (java.io.BufferedReader. (java.io.InputStreamReader. (.getInputStream proc) "UTF-8"))
            e (java.io.BufferedReader. (java.io.InputStreamReader. (.getErrorStream proc) "UTF-8"))
            lock (Object.)]
-       (future (loop []
-                 (when-let [l (.readLine e)]
-                   (when on-stderr (on-stderr l))
-                   (recur))))
+       ;; A DAEMON thread, not `future`: clojure.core/future runs on the agent
+       ;; send-off pool, whose non-daemon threads keep a JVM alive for a full
+       ;; minute after main returns. A transport must not hold its host open.
+       (doto (Thread. ^Runnable (fn [] (loop []
+                                         (when-let [l (.readLine e)]
+                                           (when on-stderr (on-stderr l))
+                                           (recur)))))
+         (.setDaemon true)
+         (.start))
        {:process proc
         :reader r
         :writer w
