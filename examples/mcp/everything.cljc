@@ -756,7 +756,11 @@
                     attached has nowhere to send one.
      :timestamp-fn  (fn [] -> string) stamped into generated resources
      :sleep-fn      (fn [millis]) used by trigger-long-running-operation
-     :page-size     list page size, 10 as in the reference server"
+     :page-size     resource list page size, 10 as in the reference server.
+                    Scoped to resources on purpose: the reference server's
+                    PAGE_SIZE covers its hundred resources and nothing else,
+                    and a server whose whole job is to be explored should not
+                    hide six of its sixteen tools behind a cursor."
   ([] (everything-server nil))
   ([{:keys [store notify! timestamp-fn sleep-fn page-size]
      :or {page-size 10}}]
@@ -797,7 +801,8 @@
        :resources-list-changed? true
        :resources-subscribe? true
        :logging? true
-       :page-size page-size
+       ;; Resources only — see :page-size above.
+       :page-size {:resources page-size}
        ;; Generated resources carry a timestamp, so nothing here is cacheable
        ;; beyond the request that produced it; `ttlMs` 0 says exactly that.
        :cache {:ttl-ms 0 :cache-scope "private"}}))))

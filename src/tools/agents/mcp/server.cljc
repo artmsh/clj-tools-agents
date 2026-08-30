@@ -133,7 +133,11 @@
                     resources/read in this revision (SEP-2549). The defaults
                     are the conservative ones: stale immediately, never shared
                     across authorization contexts.
-     :page-size     when set, list results paginate with an opaque cursor
+     :page-size     when set, list results paginate with an opaque cursor.
+                    Either a number (every list) or a map keyed by list kind,
+                    {:tools n :resources n :resource-templates n :prompts n},
+                    so paging a hundred resources need not also page a
+                    dozen tools.
      :advertise-server-info?  default true
      :experimental / :extensions  merged into the advertised capabilities"
   [{:keys [name version title description website-url icons instructions
@@ -215,12 +219,21 @@
       (mcp/invalid-params! (str "Invalid cursor: " (pr-str cursor))))
     (mcp/read-json (subs cursor 1))))
 
+(defn- page-size-for
+  "`:page-size` is either one number for every list, or a map keyed by list
+   kind — :tools :resources :resource-templates :prompts — so a server can
+   page its hundred resources without also hiding half its tools behind a
+   cursor."
+  [srv kind]
+  (let [ps (:page-size srv)]
+    (if (map? ps) (get ps kind) ps)))
+
 (defn- paginate
-  "Split `items` at :page-size, returning [page next-cursor]. The cursor is
-   opaque to the client by contract; that it happens to be an offset is this
-   server's business alone."
-  [srv items cursor]
-  (let [size (:page-size srv)
+  "Split `items` at the page size for `kind`, returning [page next-cursor].
+   The cursor is opaque to the client by contract; that it happens to be an
+   offset is this server's business alone."
+  [srv kind items cursor]
+  (let [size (page-size-for srv kind)
         start (or (parse-cursor cursor) 0)]
     (if-not size
       [(vec (drop start items)) nil]
@@ -401,7 +414,7 @@
                                "instructions" (:instructions srv)}))))
 
 (defn- handle-tools-list [srv _ctx params]
-  (let [[page next-cursor] (paginate srv (:tools srv) (get params "cursor"))]
+  (let [[page next-cursor] (paginate srv :tools (:tools srv) (get params "cursor"))]
     (cacheable srv (into {"tools" (mapv tool->wire page)}
                          (when next-cursor {"nextCursor" next-cursor})))))
 
@@ -452,12 +465,12 @@
          (check-input-request-capabilities! ctx))))
 
 (defn- handle-resources-list [srv _ctx params]
-  (let [[page next-cursor] (paginate srv (:resources srv) (get params "cursor"))]
+  (let [[page next-cursor] (paginate srv :resources (:resources srv) (get params "cursor"))]
     (cacheable srv (into {"resources" (mapv resource->wire page)}
                          (when next-cursor {"nextCursor" next-cursor})))))
 
 (defn- handle-resource-templates-list [srv _ctx params]
-  (let [[page next-cursor] (paginate srv (:resource-templates srv) (get params "cursor"))]
+  (let [[page next-cursor] (paginate srv :resource-templates (:resource-templates srv) (get params "cursor"))]
     (cacheable srv (into {"resourceTemplates" (mapv resource-template->wire page)}
                          (when next-cursor {"nextCursor" next-cursor})))))
 
@@ -492,7 +505,7 @@
             (cacheable srv {"contents" norm})))))))
 
 (defn- handle-prompts-list [srv _ctx params]
-  (let [[page next-cursor] (paginate srv (:prompts srv) (get params "cursor"))]
+  (let [[page next-cursor] (paginate srv :prompts (:prompts srv) (get params "cursor"))]
     (cacheable srv (into {"prompts" (mapv prompt->wire page)}
                          (when next-cursor {"nextCursor" next-cursor})))))
 
