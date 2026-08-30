@@ -1,0 +1,285 @@
+(ns tools.agents.mcp.stdio
+  "The stdio transport: one newline-delimited JSON-RPC message per line over
+   a process's standard streams.
+
+   THE SERVER HALF IS PORTABLE WITH NO LEAF AT ALL. It needs `read-line`,
+   `println`, `*err*` and `flush`, every one of which is plain clojure.core
+   on JVM Clojure, Babashka and clz alike — so unlike tools.agents.anthropic
+   and tools.agents.openai, which each isolate an HTTP leaf behind a reader
+   conditional, this namespace's server path has nothing runtime-specific in
+   it beyond a write lock that only a multi-threaded runtime needs.
+
+   THE CLIENT HALF LAUNCHES A SUBPROCESS and is therefore JVM Clojure and
+   Babashka only; clz has no process-spawning builtin, and `connect!` says so
+   rather than failing obscurely. Nothing else in this library is affected:
+   a clz program can still BE an MCP server, and can still be an MCP client
+   over `tools.agents.mcp.http`.
+
+   FRAMING RULES THIS ENFORCES (specification/2026-07-28/basic/transports/stdio):
+
+     - One message per line, and messages MUST NOT contain embedded newlines.
+       `mcp/write-json` escapes every control character below 0x20, so no
+       tool output can break the framing.
+     - The server MUST NOT write anything to stdout that is not a valid MCP
+       message. `log!` below is the sanctioned way to print — it writes to
+       stderr, which the spec explicitly permits and which the client SHOULD
+       NOT read as an error signal. This is the Clojure equivalent of the
+       Python tutorial's 'never call print() in a STDIO server'.
+     - The server MUST NOT write JSON-RPC *requests* to stdout. It cannot:
+       nothing in tools.agents.mcp.server constructs one. Server-to-client
+       interactions leave as InputRequiredResult replies.
+     - The server SHOULD exit promptly when stdin reaches EOF. `serve!`
+       returns at that point, and a script that called it then ends.
+     - Notifications for a `subscriptions/listen` stream share the one
+       channel with everything else, so each carries
+       `io.modelcontextprotocol/subscriptionId`; `notify!` tags them."
+  (:require [clojure.string :as str]
+            [tools.agents.mcp :as mcp]
+            [tools.agents.mcp.server :as server]))
+
+;; ---------------------------------------------------------------------------
+;; Output
+;; ---------------------------------------------------------------------------
+
+(defn log!
+  "Write a line to stderr. THE ONLY safe way for a stdio server to print.
+   Anything on stdout that is not an MCP message corrupts the stream."
+  [& parts]
+  (binding [*out* *err*]
+    (println (apply str parts))
+    (flush)))
+
+(defn- new-lock []
+  #?(:clz nil
+     :bb (Object.)
+     :clj (Object.)))
+
+(defn- write-line!
+  "Write one framed message. Serialized against concurrent writers, because a
+   `subscriptions/listen` stream is pushed from another thread while request
+   handling writes from this one, and two interleaved half-lines are two
+   corrupt messages."
+  [lock s]
+  #?(:clz (do (println s) (flush))
+     :bb (locking lock (println s) (flush))
+     :clj (locking lock (println s) (flush))))
+
+;; ---------------------------------------------------------------------------
+;; Connection
+;; ---------------------------------------------------------------------------
+
+(defn connection
+  "A stdio connection. Holds no protocol state — the protocol is stateless —
+   only the bookkeeping the TRANSPORT genuinely owns: which
+   `subscriptions/listen` streams are currently open on this process's
+   stdout, and the lock that keeps concurrent writes from interleaving."
+  ([srv] (connection srv nil))
+  ([srv {:keys [write-fn]}]
+   (let [lock (new-lock)
+         write! (or write-fn (fn [s] (write-line! lock s)))]
+     {:server srv
+      :subscriptions (atom {})
+      :write! write!
+      :send! (fn [msg] (write! (mcp/write-json msg)))})))
+
+(defn notify!
+  "Push a change notification to every open subscription that opted into its
+   type. Returns how many streams it went to.
+
+   This is what a server calls from its own thread when something actually
+   changes — a tool list edit, a resource update. It is deliberately the only
+   way notifications reach a listen stream: `notifications/progress` and
+   `notifications/message` are request-scoped and the spec forbids delivering
+   them here, so they never pass through this function."
+  [conn notification]
+  (let [subs (vals @(:subscriptions conn))
+        tagged (keep (fn [sub] (server/subscription-notification sub notification)) subs)]
+    (doseq [n tagged] ((:send! conn) n))
+    (count tagged)))
+
+(defn close-subscriptions!
+  "End every open subscription gracefully — the server SHOULD answer the
+   original `subscriptions/listen` request before the stream goes away, so
+   the client can tell a clean close from a dropped transport."
+  [conn]
+  (doseq [[id _] @(:subscriptions conn)]
+    ((:send! conn) (server/close-subscription id)))
+  (reset! (:subscriptions conn) {}))
+
+(defn handle-message!
+  "Dispatch one already-parsed message and write everything it produced.
+   Returns the `handle` result map, so a caller can inspect it in a test
+   without going anywhere near a real process."
+  [conn message]
+  (let [srv (:server conn)
+        send! (:send! conn)
+        ;; :emit! flushes each notification as it is produced rather than
+        ;; after the handler returns, which is what makes progress reporting
+        ;; on a long-running tool actually progressive.
+        res (server/handle srv message {:emit! send!})]
+    (when-let [sub (:subscription res)]
+      (swap! (:subscriptions conn) assoc (:id sub) sub))
+    (when-let [cancelled (:cancelled res)]
+      ;; On stdio, notifications/cancelled is also how a client closes a
+      ;; subscription stream: it references the listen request's id.
+      (let [rid (:request-id cancelled)]
+        (when (contains? @(:subscriptions conn) rid)
+          (swap! (:subscriptions conn) dissoc rid))))
+    (when-let [r (:response res)]
+      (send! r))
+    res))
+
+(defn handle-line!
+  "Parse one line of the framing and dispatch it. A line that is not valid
+   JSON gets a -32700 response with a null id, which is the only case in
+   which a JSON-RPC error response may omit the id."
+  [conn line]
+  (let [parsed (try
+                 [::ok (mcp/read-json line)]
+                 (catch Exception e [::bad e]))]
+    (if (= ::bad (first parsed))
+      (do ((:send! conn) (mcp/error-response nil mcp/parse-error
+                                             (str "Parse error: " (ex-message (second parsed)))))
+          {:response nil :notifications [] :parse-error (second parsed)})
+      (handle-message! conn (second parsed)))))
+
+;; ---------------------------------------------------------------------------
+;; Server loop
+;; ---------------------------------------------------------------------------
+
+(defn serve!
+  "Run the server on stdin/stdout until EOF. Blocks.
+
+   `:on-start` is called once with the connection before the loop begins —
+   that is where a server spawns whatever thread pushes `notify!` updates.
+   `:on-stop` is called after EOF, before the graceful close of any open
+   subscription.
+
+   Blank lines are skipped rather than answered with a parse error: they are
+   framing noise, not messages, and answering one would put a response on
+   the wire that no request asked for."
+  ([srv] (serve! srv nil))
+  ([srv {:keys [on-start on-stop conn]}]
+   (let [conn (or conn (connection srv))]
+     (when on-start (on-start conn))
+     (loop []
+       (let [line (read-line)]
+         (cond
+           (nil? line) nil                       ;; EOF — exit promptly
+           (= "" (str/trim line)) (recur)
+           :else (do (handle-line! conn line) (recur)))))
+     (when on-stop (on-stop conn))
+     (close-subscriptions! conn)
+     conn)))
+
+;; ---------------------------------------------------------------------------
+;; Client side — launches the server as a subprocess (JVM Clojure / Babashka)
+;; ---------------------------------------------------------------------------
+
+(defn connect!
+  "Launch `command` (a vector of program + args) as an MCP server subprocess
+   and return a transport map:
+
+     {:send! f  :process p  :close! f}
+
+   `:send!` goes straight into `tools.agents.mcp.client/client`. It writes
+   the request, then reads lines until the one whose `id` matches — handing
+   every other line (notifications, and responses to other in-flight
+   requests) to `:on-notification`. A notification is not an error and never
+   terminates the wait.
+
+   The server's stderr is drained on its own thread into `:on-stderr`
+   (default: discard). The spec says a client SHOULD NOT treat stderr output
+   as indicating an error.
+
+   Not available on clz, which has no process-spawning builtin."
+  [command {:keys [on-notification on-stderr env]
+            :or {on-notification (fn [_])}}]
+  #?(:clz
+     (throw (ex-info (str "tools.agents.mcp.stdio/connect!: clz cannot spawn a subprocess, "
+                          "so it cannot drive a stdio MCP server. A clz program can still BE "
+                          "a stdio server (serve! is fully portable), and can be a client over "
+                          "tools.agents.mcp.http.")
+                     {:type :tools.agents.mcp.error/unsupported-runtime :command command}))
+     :bb (let [pb (java.lang.ProcessBuilder. ^java.util.List (vec command))
+           _ (when (seq env)
+               (let [m (.environment pb)]
+                 (doseq [[k v] env] (.put m (str (if (keyword? k) (name k) k)) (str v)))))
+           proc (.start pb)
+           w (java.io.BufferedWriter. (java.io.OutputStreamWriter. (.getOutputStream proc) "UTF-8"))
+           r (java.io.BufferedReader. (java.io.InputStreamReader. (.getInputStream proc) "UTF-8"))
+           e (java.io.BufferedReader. (java.io.InputStreamReader. (.getErrorStream proc) "UTF-8"))
+           lock (Object.)]
+       (future (loop []
+                 (when-let [l (.readLine e)]
+                   (when on-stderr (on-stderr l))
+                   (recur))))
+       {:process proc
+        :reader r
+        :writer w
+        ;; Shutdown as the spec defines it: close the child's stdin and wait.
+        ;; A conforming server exits on EOF, so no signal is needed.
+        :close! (fn [] (.close w) (.waitFor proc))
+        :send!
+        (fn [msg]
+          ;; Write and read under one lock: this transport is synchronous
+          ;; request/response. A `subscriptions/listen` stream never produces
+          ;; the response this would wait for, so drive one off :reader
+          ;; directly rather than through :send!.
+          (locking lock
+            (.write w (mcp/write-json msg))
+            (.newLine w)
+            (.flush w)
+            (when (mcp/request? msg)
+              (loop []
+                (let [line (.readLine r)]
+                  (when (nil? line)
+                    (throw (ex-info "tools.agents.mcp.stdio: server closed its output stream before responding"
+                                    {:type :tools.agents.mcp.error/transport :request msg})))
+                  (let [m (mcp/read-json line)]
+                    (if (and (map? m)
+                             (= (get m "id") (get msg "id"))
+                             (or (contains? m "result") (contains? m "error")))
+                      m
+                      (do (on-notification m) (recur)))))))))})
+     :clj (let [pb (java.lang.ProcessBuilder. ^java.util.List (vec command))
+           _ (when (seq env)
+               (let [m (.environment pb)]
+                 (doseq [[k v] env] (.put m (str (if (keyword? k) (name k) k)) (str v)))))
+           proc (.start pb)
+           w (java.io.BufferedWriter. (java.io.OutputStreamWriter. (.getOutputStream proc) "UTF-8"))
+           r (java.io.BufferedReader. (java.io.InputStreamReader. (.getInputStream proc) "UTF-8"))
+           e (java.io.BufferedReader. (java.io.InputStreamReader. (.getErrorStream proc) "UTF-8"))
+           lock (Object.)]
+       (future (loop []
+                 (when-let [l (.readLine e)]
+                   (when on-stderr (on-stderr l))
+                   (recur))))
+       {:process proc
+        :reader r
+        :writer w
+        ;; Shutdown as the spec defines it: close the child's stdin and wait.
+        ;; A conforming server exits on EOF, so no signal is needed.
+        :close! (fn [] (.close w) (.waitFor proc))
+        :send!
+        (fn [msg]
+          ;; Write and read under one lock: this transport is synchronous
+          ;; request/response. A `subscriptions/listen` stream never produces
+          ;; the response this would wait for, so drive one off :reader
+          ;; directly rather than through :send!.
+          (locking lock
+            (.write w (mcp/write-json msg))
+            (.newLine w)
+            (.flush w)
+            (when (mcp/request? msg)
+              (loop []
+                (let [line (.readLine r)]
+                  (when (nil? line)
+                    (throw (ex-info "tools.agents.mcp.stdio: server closed its output stream before responding"
+                                    {:type :tools.agents.mcp.error/transport :request msg})))
+                  (let [m (mcp/read-json line)]
+                    (if (and (map? m)
+                             (= (get m "id") (get msg "id"))
+                             (or (contains? m "result") (contains? m "error")))
+                      m
+                      (do (on-notification m) (recur)))))))))})))
