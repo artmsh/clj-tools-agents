@@ -3,8 +3,7 @@
 A pure-Clojure client for the [Gemini Developer
 API](https://ai.google.dev/gemini-api/docs), ergonomically modeled on the
 official [python-genai](https://github.com/googleapis/python-genai) client: a
-`client` config map standing in for `genai.Client(api_key=...)` (clz has no
-classes — a plain map is the idiomatic "client object" here),
+`client` config map standing in for `genai.Client(api_key=...)`,
 `generate-content` / `count-tokens` standing in for
 `client.models.generate_content(model=..., contents=..., config=...)` /
 `client.models.count_tokens(...)`, and a typed error hierarchy matching the
@@ -74,7 +73,7 @@ model id) is used verbatim.
 
 | python-genai | tools.agents.gemini | Notes |
 |---|---|---|
-| `genai.Client(api_key=..., http_options=...)` | `(client {:api-key ... :base-url ... :api-version ... :max-retries ...})` | Returns a plain config map, not an object — clz has no classes. |
+| `genai.Client(api_key=..., http_options=...)` | `(client {:api-key ... :base-url ... :api-version ... :max-retries ...})` | Returns a plain config map. |
 | `client.models.generate_content(model=model, contents=..., config=request)` | `(generate-content client model request)` | `request` is a plain map passed through to JSON almost verbatim; `model` is a separate argument (see above), not a request key. |
 | `client.models.count_tokens(model=model, contents=...)` | `(count-tokens client model request)` | Same contract, `:countTokens` path. |
 | `response.text` | `(output-text response)` | Port of the SDK property: join every string `"text"` across `candidates[0].content.parts`, skipping `"thought"` parts. Returns `nil` (matching Python's `None`) rather than throwing when there's nothing to join — see below. |
@@ -83,7 +82,7 @@ model id) is used verbatim.
 | `GOOGLE_API_KEY` / `GEMINI_API_KEY` | same env vars, same precedence (`GOOGLE_API_KEY` wins when both are set) | Explicit `:api-key` wins over both. python-genai logs a warning when both env vars are set; this library just picks `GOOGLE_API_KEY` silently (no shared logging facility across the three runtimes). |
 | `x-goog-api-key` header | same header | Confirmed from `_api_client.py`: a bare API key, **no** `Bearer ` prefix — unlike `tools.agents.openai`'s `Authorization: Bearer`. |
 | `HttpOptions(base_url=..., api_version=...)` | `:base-url` (default `https://generativelanguage.googleapis.com`), `:api-version` (default `"v1beta"`) | Kept as two separate client fields, joined at request time, rather than one pre-concatenated base-url string — see `client`'s docstring. |
-| `client.models.generate_content_stream(...)` | *(not implemented)* | See Streaming below — a genuine platform gap on clz, same rationale as the two siblings. |
+| `client.models.generate_content_stream(...)` | *(not implemented)* | See Streaming below - same rationale as the two siblings. |
 | tenacity-backed automatic retries, `_RETRY_ATTEMPTS = 5` | `:max-retries` client opt, default 4 | Implemented — see Retries below. |
 | `client.chats.create(...)` (multi-turn chat session object) | *(not implemented)* | A stateful wrapper over `generate_content` with local history bookkeeping; `add-user-message`/`add-model-message` below give the same history-building ergonomics without the stateful object. |
 | `client.files.*` / `.caches.*` / `.tunings.*` / `.batches.*` / `.live.*` (Live API) / embeddings / image & video generation | *(not implemented)* | Only `generateContent`/`countTokens` are in scope for this port. `post-json!` is the shared transport, so adding another POST resource is a small change. |
@@ -176,8 +175,7 @@ initial call, so 4 *retries*).
   implemented here because none was found in python-genai). `409` is
   deliberately excluded, unlike `tools.agents.openai`'s retryable set.
 - **What is not retried.** Any other 4xx; a malformed JSON body on an
-  otherwise-successful 2xx; this library's own typed errors (the clz
-  TLS-on-non-443-port refusal).
+  otherwise-successful 2xx; this library's own typed errors.
 - **How long it waits.** `tenacity.wait_exponential_jitter(initial=1.0,
   max=60.0, exp_base=2, jitter=1)`'s documented formula: `delay = min(max,
   initial * exp_base^n + random.uniform(0, jitter))`, where `n` is
@@ -220,8 +218,7 @@ happened."
 | `Retry-After`-equivalent header | clamped `[0, 60]`s, private | `retry-after-ms`/`Retry-After` **and** `x-should-retry`, public, honored | **not implemented** — no such header found in python-genai's retry predicate |
 | request-key casing | snake_case verbatim (`max_tokens`) | snake_case verbatim (`max_output_tokens`) | **camelCase** verbatim (`maxOutputTokens`) — matches the REST API's own field names |
 
-Everything else — the JSON codec, the leaf-I/O split, `ex-info` typing style,
-the clz TLS-port refusal, and the three-runtime test harness — is
+Everything else — the JSON codec, the leaf-I/O split, `ex-info` typing style, and the three-runtime test harness — is
 intentionally identical.
 
 ### Platform limitation: streaming is not supported
@@ -231,26 +228,7 @@ way the two siblings each reject one — Gemini's REST streaming variant
 (`:streamGenerateContent`) is a **separate endpoint**, not a request-body
 flag, so there is simply no streaming function offered at all. The underlying
 platform reason is the same as both siblings':
-
-- clz's only HTTPS-capable HTTP request builtin, `clojure.http/request`, does
-  not stream — it returns a single buffered `{:status :headers :body}` map.
-- clz's streaming builtin, `clojure.http/request-stream`, explicitly does
-  **not** support TLS (`error.TlsNotSupported`), re-verified empirically on
-  clz v44.
 - `generativelanguage.googleapis.com` is HTTPS-only.
-
-A `stream-generate-content` could not be implemented on clz today regardless
-of how it were shaped, so none was added on any runtime — the same uniform-
-contract-over-partial-platform-support reasoning `tools.agents.openai`'s docs
-give for its own streaming rejection.
-
-### `https://` on a non-standard port
-
-Same `clz.url/parse` + explicit `tls?`-flag leaf as the two siblings (see
-`docs/anthropic.md`'s "Resolved on clz v44" section for the full history) —
-an `https://` `:base-url` on a non-443 port now attempts real TLS rather than
-silently falling back to plaintext or being refused outright. Six-arity
-`clojure.http/request` (pre-v44 clz) is not supported.
 
 ### JSON: a small hand-rolled codec, not a dependency
 
@@ -271,15 +249,6 @@ each a `#?(:clz ... :bb ... :clj ...)` reader conditional — `http-post!`,
 `tools.agents.openai`'s own three leaves (see docs/openai.md's "Isolating
 runtime-specific I/O" and "Why HTTP/1.1 is pinned" sections — both apply here
 verbatim, including the HTTP/1.1 pin on the JVM-backed leaves).
-
-### clz gotchas this code works around
-
-Same list as `tools.agents.openai` — see docs/openai.md's "clz gotchas this
-code works around" section; every item there (docstring-as-value `def`,
-missing `keep-indexed`/`Math/pow`/`Math/round`, `nth`'s ignored 3-arity
-default, the `apply`-stack-overflow-on-long-strings fix, undecoded `\b`/`\f`
-escapes) applies identically to this file, since it shares the same JSON
-codec and general structure.
 
 ## Testing
 
@@ -329,12 +298,6 @@ precedence rules themselves can be tested without touching the environment.
 ```
 ./script/test-all.sh
 ```
-
-Runs the suite on JVM Clojure (`clojure -M:test-gemini`), Babashka (`bb
-test-gemini`, or `bb test` for all four suites together), and clz (`clz
-test`), and fails loudly if any of the three is red. It is hermetic — mock
-servers only, no outbound network. There is no live-smoke-check script for
-this library yet (contrast `tools.agents.openai`'s `script/live-check.sh`).
 
 ## License
 
