@@ -3,3 +3,4 @@
 *.clzc
 .DS_Store
 target/
+.agents
