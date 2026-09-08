@@ -1,6 +1,7 @@
 ---
 name: wrap-up
 description: Wrap up the session - consolidate learnings into memory, log the session's work to the Brain journal, output a brief recap. Use when the user types /wrap-up, asks to wrap up, or conclude the session.
+tags: [skill, agents-setup]
 ---
 
 Steps:
@@ -11,7 +12,7 @@ Steps:
   - look for new user preferences, tools, or patterns observed
   - identify if project state has changed.
   
-2. Update auto-memory at `~/Brain/projects/<project-slug>/`:
+2. Update auto-memory at `~/Brain/20-Projects/<project-slug>/`:
   - for **each meaningful learning** (ask advisor if those facts are worth recalling in a future conversations):
     - check MEMORY.md first — update an existing entry if relevant, create a new file only if no match exists
     - keep the MEMORY.md index in sync
