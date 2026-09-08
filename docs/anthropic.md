@@ -2,21 +2,12 @@
 
 A pure-Clojure client for [Anthropic's Messages API](https://docs.anthropic.com/),
 ergonomically modeled on the official [anthropic-sdk-python](https://github.com/anthropics/anthropic-sdk-python)
-client: a `client` config map standing in for `Anthropic(...)` (clz's
-`defrecord` exists but yields a tagged map, not a JVM class — a real
-divergence between runtimes this library avoids, so `client` returns a plain
-map on all three), `messages-create` standing in for
+client: a `client` config map standing in for `Anthropic(...)`, `messages-create` standing in for
 `client.messages.create(**params)`, and a typed error hierarchy matching the
 SDK's exception classes. Also includes automatic retries with backoff,
 `count-tokens`, tool-calling ergonomics, a small message content-block DSL, a
 terminal response visualizer, and optional `clojure.spec.alpha` definitions
 — see Design notes below.
-
-Runs unmodified on **JVM Clojure**, **Babashka**, and **[clz](https://forgejo.lan/art/clz)**.
-It replaces clz's former hardcoded `anthropic/message` / `anthropic/output-text`
-Zig builtin — same behavioral contract, ported out to a standalone library and
-consumed back into clz via `clz.edn`'s `:ns-uri` + `RemoteResolver` (the same
-pattern already used for [corevector-relational](https://forgejo.lan/art/corevector-relational)).
 
 ## Usage
 
