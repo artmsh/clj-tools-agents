@@ -1,0 +1,19 @@
+{:paths ["src" "test" "."]
+ :tasks
+ {test {:doc "Run all four suites (anthropic + openai + gemini + mcp) on Babashka — each
+             in its own bb subprocess, since -main calls System/exit
+             unconditionally and would otherwise kill the process before the
+             next suite ran"
+        :task (let [a (shell {:continue true} "bb" "test-anthropic")
+                    o (shell {:continue true} "bb" "test-openai")
+                    g (shell {:continue true} "bb" "test-gemini")
+                    m (shell {:continue true} "bb" "test-mcp")]
+                (System/exit (if (every? zero? [(:exit a) (:exit o) (:exit g) (:exit m)]) 0 1)))}
+  test-anthropic {:doc  "Run the anthropic suite on Babashka"
+                  :task (exec 'tools.agents.anthropic.test-runner/-main)}
+  test-openai    {:doc  "Run the openai suite on Babashka"
+                  :task (exec 'tools.agents.openai.test-runner/-main)}
+  test-gemini    {:doc  "Run the gemini suite on Babashka"
+                  :task (exec 'tools.agents.gemini.test-runner/-main)}
+  test-mcp       {:doc  "Run the mcp suite on Babashka"
+                  :task (exec 'tools.agents.mcp.test-runner/-main)}}}
