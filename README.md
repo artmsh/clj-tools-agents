@@ -1,4 +1,4 @@
-# clj-tools-agents
+# toolkit for programmatic agentic coding
 
 Pure-Clojure libraries for talking to LLMs — three provider API clients and
 one Model Context Protocol implementation — under one shared base namespace
