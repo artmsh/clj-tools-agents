@@ -12,16 +12,12 @@
    Run (from the repo root):
      clojure -M script/live_check.clj
      bb script/live_check.clj
-     clz -L src script/live_check.clj
 
    Exits 1 if the Chat Completions call fails. The Responses-API probe is
    reported but not fatal: OpenAI-compatible gateways commonly implement only
    /v1/chat/completions, and a 404 there is information, not a client bug."
   (:require [tools.agents.openai :as oai]))
 
-;; Plain .clj, so no reader conditionals are available here — `System/getenv`
-;; is used rather than the library's own #?(:clz sys/getenv ...) leaf because
-;; clz registers `System/getenv` under that exact name too (verified).
 (defn- env [name default]
   (let [v (System/getenv name)]
     (if (seq v) v default)))
@@ -52,8 +48,8 @@
       (println "model      :" (get resp "model"))
       (println "usage      :" (pr-str (get resp "usage")))
       (println "text       :" (pr-str text))
-      ;; throw rather than exit: `sys/exit` is not uniformly available, and a
-      ;; non-zero exit code falls out of an uncaught throw on all three anyway.
+      ;; throw rather than exit: a non-zero exit code falls out of an
+      ;; uncaught throw on both runtimes anyway.
       (when-not (string? text)
         (throw (ex-info "live-check: completion-text did not return a string"
                         {:text text}))))
@@ -71,6 +67,6 @@
     (println)
     (println "live check OK")))
 
-;; clz/bb run the file top-to-bottom; `clojure -M <file>` does too. No -main
-;; auto-invocation on any of them, so call it explicitly.
+;; bb runs the file top-to-bottom; `clojure -M <file>` does too. Neither
+;; auto-invokes -main, so call it explicitly.
 (-main)

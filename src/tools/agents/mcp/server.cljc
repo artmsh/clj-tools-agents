@@ -94,9 +94,8 @@
 
 (defn server
   "Build a server. Returns a plain map — the same 'client object is a plain
-   map' choice tools.agents.anthropic makes, and for the same reason: clz's
-   `defrecord` yields a tagged map rather than a JVM class, so a record here
-   would be a real representation divergence between runtimes.
+   map' choice tools.agents.anthropic makes: a server is data you can print,
+   diff and assemble, not an opaque record.
 
    Identity — :name (required), :version (default \"0.0.0\"), :title,
    :description, :website-url, :icons, :instructions.
@@ -245,10 +244,8 @@
 ;; Wire shapes for the registered primitives
 ;; ---------------------------------------------------------------------------
 
-(defn- prune [m] (into {} (remove (fn [[_ v]] (nil? v)) m)))
-
 (defn tool->wire [t]
-  (prune {"name" (:name t)
+  (mcp/prune {"name" (:name t)
           "title" (:title t)
           "description" (:description t)
           "inputSchema" (or (:input-schema t) {"type" "object"})
@@ -258,28 +255,29 @@
           "_meta" (:meta t)}))
 
 (defn resource->wire [r]
-  (prune {"uri" (:uri r) "name" (:name r) "title" (:title r)
+  (mcp/prune {"uri" (:uri r) "name" (:name r) "title" (:title r)
           "description" (:description r) "mimeType" (:mime-type r)
           "annotations" (:annotations r) "size" (:size r)
           "icons" (:icons r) "_meta" (:meta r)}))
 
 (defn resource-template->wire [t]
-  (prune {"uriTemplate" (:uri-template t) "name" (:name t) "title" (:title t)
+  (mcp/prune {"uriTemplate" (:uri-template t) "name" (:name t) "title" (:title t)
           "description" (:description t) "mimeType" (:mime-type t)
           "annotations" (:annotations t) "icons" (:icons t) "_meta" (:meta t)}))
 
 (defn prompt->wire [p]
-  (prune {"name" (:name p) "title" (:title p) "description" (:description p)
+  (mcp/prune {"name" (:name p) "title" (:title p) "description" (:description p)
           "arguments" (when (seq (:arguments p))
-                        (mapv (fn [a] (prune {"name" (:name a) "title" (:title a)
+                        (mapv (fn [a] (mcp/prune {"name" (:name a) "title" (:title a)
                                               "description" (:description a)
                                               "required" (:required a)}))
                               (:arguments p)))
           "icons" (:icons p) "_meta" (:meta p)}))
 
 ;; ---------------------------------------------------------------------------
-;; URI templates — RFC 6570 simple string expansion, matched without regex so
-;; the behaviour is byte-identical on all three runtimes.
+;; URI templates — RFC 6570 simple string expansion, matched by scanning
+;; rather than by regex, so the split points are exactly the two the RFC
+;; defines and nothing else can be read as a metacharacter.
 ;; ---------------------------------------------------------------------------
 
 (defn parse-uri-template
@@ -539,9 +537,12 @@
           v (f ctx ref argument context)
           completion (cond
                        (map? v) v
-                       (sequential? v) {"values" (vec (take 100 v))
-                                        "total" (count v)
-                                        "hasMore" (> (count v) 100)}
+                       ;; `n` bound once: a handler may return a lazy seq,
+                       ;; and counting it twice walks it twice.
+                       (sequential? v) (let [n (count v)]
+                                         {"values" (vec (take 100 v))
+                                          "total" n
+                                          "hasMore" (> n 100)})
                        (nil? v) {"values" []}
                        :else (mcp/internal-error! "Completion handler returned an unusable value"))]
       {"completion" completion})))

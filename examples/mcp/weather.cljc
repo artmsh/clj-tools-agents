@@ -58,7 +58,7 @@
             [tools.agents.mcp :as mcp]
             [tools.agents.mcp.server :as server]
             [tools.agents.mcp.stdio :as stdio]
-            #?@(:bb [[babashka.http-client]] :clj [] :clz [])))
+            #?@(:bb [[babashka.http-client]] :clj [])))
 
 (def nws-api-base "https://api.weather.gov")
 (def user-agent "weather-app/1.0")
@@ -73,13 +73,7 @@
    need an HTTP client, and the ones that do should choose their own."
   [url]
   (try
-    #?(:clz
-       (let [p (clz.url/parse url)
-             port (or (:port p) (if (= (:protocol p) "https") 443 80))
-             resp (clojure.http/request "GET" (:host p) port (or (:path p) "/")
-                                        {"User-Agent" user-agent "Accept" "application/geo+json"} nil)]
-         (when (< (:status resp) 400) (mcp/read-json (:body resp))))
-       :bb
+    #?(:bb
        (let [resp (babashka.http-client/get url {:headers {"User-Agent" user-agent
                                                            "Accept" "application/geo+json"}
                                                  :throw false})]

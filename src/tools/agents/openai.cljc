@@ -5,22 +5,22 @@
    client.chat.completions.create(**params) resource methods, typed error
    hierarchy).
 
-   Sibling of tools.agents.anthropic — same architecture, same three runtimes,
+   Sibling of tools.agents.anthropic — same architecture, same two runtimes,
    same leaf-I/O and JSON-codec design. See README's parity tables for both
    the openai-python parity and the (few) deliberate divergences from
    tools.agents.anthropic.
 
-   Runs unmodified on JVM Clojure, Babashka and clz. clz has no classes, so the
-   'client object' here is a plain map built by `client`.
+   Runs unmodified on JVM Clojure and Babashka. The 'client object' here is a
+   plain map built by `client`.
 
    PORTABILITY: exactly one function does real network I/O — the private leaf
-   `http-post!` below, isolated with a #?(:clz ... :bb ... :clj ...) reader
-   conditional, same pattern as corevector.relational.durability's leaf I/O.
+   `http-post!` below, isolated with a #?(:bb ... :clj ...) reader conditional.
    Everything above it — URL/header building, the hand-rolled JSON codec,
    error typing, credential resolution, the retry policy, output-text
-   extraction — is plain, portable clojure.core exercised identically by all
-   three test runners. Only two other leaves exist: `getenv` (env-var access)
-   and `sleep!` (retry backoff).
+   extraction — is plain, portable clojure.core exercised identically by both
+   test runners. `getenv` (env-var access) and `sleep!` (retry backoff) touch
+   the process too, but need no reader conditional — they are testability
+   seams, not runtime-specific leaves.
 
    RETRIES: on by default (:max-retries, default 2) and a direct port of
    openai-python's _base_client policy — transport failures always retried,
@@ -29,15 +29,9 @@
    decision and delay functions (`should-retry?`, `retry-delay-ms`,
    `parse-retry-after-ms`) are pure, with the clock and RNG injected.
 
-   CLZ GOTCHAS worked around here (verified empirically on clz v43): `(def x
-   \"doc\" v)` binds the DOCSTRING as the value, so every `def` below is
-   docstring-free with a comment instead; `keep-indexed` is missing; `nth`'s
-   3-arity default is ignored; `Math/pow`/`Math/round` are missing; the string
-   reader does not decode \\b/\\f. See README's \"clz gotchas\" section.
-
-   JSON: there is no JSON library available on all three runtimes without
-   adding a dependency (clz and Babashka both bundle one, JVM Clojure does
-   not), so `write-json`/`read-json` below are a small hand-written codec.
+   JSON: there is no JSON library available on both runtimes without adding a
+   dependency (Babashka bundles one, JVM Clojure does not), so
+   `write-json`/`read-json` below are a small hand-written codec.
    It supports exactly what these APIs need: nil/bool/number/string/keyword/
    vector/seq/map, with map keys as either strings or keywords passed through
    VERBATIM (no kebab<->snake conversion — the same idiom openai-python uses
@@ -46,14 +40,10 @@
    \\u00XX-escaped on output (vanishingly rare in real message text) — see
    README.
 
-   STREAMING: :stream true is rejected with a clear error rather than
-   silently ignored. clz's only HTTPS-capable request builtin
-   (clojure.http/request) does not stream; the streaming builtin
-   (clojure.http/request-stream) does not support TLS at all. Since the real
-   api.openai.com host is HTTPS-only, true SSE streaming against it is not
-   implementable in clz today. See README's platform-limitations section."
+   STREAMING: not implemented. :stream true is rejected with a clear error
+   rather than silently ignored. See README's platform-limitations section."
   (:require [clojure.string :as str]
-            #?@(:bb [[babashka.http-client :as http]] :clj [] :clz [])))
+            #?@(:bb [[babashka.http-client :as http]] :clj [])))
 
 ;; openai-python's default base_url INCLUDES the /v1 path segment (unlike
 ;; anthropic-sdk-python's host-only base_url) — endpoints are appended to it
@@ -63,19 +53,7 @@
 ;; openai-python's DEFAULT_MAX_RETRIES. Override per client with :max-retries
 ;; (the analogue of `OpenAI(max_retries=n)` / `with_options(max_retries=n)`).
 ;; The rest of the retry policy lives further down, next to `should-retry?`.
-;; NOTE written as a bare `def` with a comment rather than a docstring: clz
-;; binds the DOCSTRING as the var's value for `(def name "doc" value)`
-;; (verified empirically on clz v43), which silently turns this 2 into a
-;; string. Every other `def` in this file is docstring-free for the same
-;; reason; `defn` docstrings are handled correctly and are used throughout.
 (def default-max-retries 2)
-
-;; Backspace/form-feed as computed chars: clz's string-literal reader does not
-;; decode `\b`/`\f` escapes (verified empirically — they stay literal 2-char
-;; `\` + `b`/`f`), unlike `\n`/`\r`/`\t` which it decodes correctly. Building
-;; these via `char` sidesteps the gap and works identically on all runtimes.
-(def ^:private BACKSPACE (str (char 8)))
-(def ^:private FORM-FEED (str (char 12)))
 
 ;; ---------------------------------------------------------------------------
 ;; JSON codec — pure, portable, zero dependencies.
@@ -100,8 +78,8 @@
            (str/replace "\n" "\\n")
            (str/replace "\r" "\\r")
            (str/replace "\t" "\\t")
-           (str/replace BACKSPACE "\\b")
-           (str/replace FORM-FEED "\\f"))
+           (str/replace "\b" "\\b")
+           (str/replace "\f" "\\f"))
        "\""))
 
 (defn write-json
@@ -184,11 +162,6 @@
       (when (>= j n) (json-parse-error! "unterminated string"))
       (let [c (subs s j (inc j))]
         (cond
-          ;; str/join, NOT (apply str pieces): clz overflows its stack applying
-          ;; a function to a few hundred arguments, so the original `apply`
-          ;; spelling crashed on any response string longer than that — i.e.
-          ;; on essentially every real model reply. str/join is fine into the
-          ;; hundreds of thousands of pieces (verified on clz v43).
           (= c "\"") [(str/join "" pieces) (inc j)]
 
           (= c "\\")
@@ -202,8 +175,8 @@
                 (= esc "n")  (recur (+ j 2) (conj pieces "\n"))
                 (= esc "r")  (recur (+ j 2) (conj pieces "\r"))
                 (= esc "t")  (recur (+ j 2) (conj pieces "\t"))
-                (= esc "b")  (recur (+ j 2) (conj pieces BACKSPACE))
-                (= esc "f")  (recur (+ j 2) (conj pieces FORM-FEED))
+                (= esc "b")  (recur (+ j 2) (conj pieces "\b"))
+                (= esc "f")  (recur (+ j 2) (conj pieces "\f"))
                 (= esc "u")
                 (do
                   (when (> (+ j 6) n) (json-parse-error! "unterminated unicode escape"))
@@ -300,35 +273,28 @@
                        {:type :tools.agents.openai/json-parse-error})))))
 
 ;; ---------------------------------------------------------------------------
-;; Leaf I/O — the only two runtime-specific functions in this file.
+;; I/O leaves — `http-post!` is the only runtime-specific function in this
+;; file; `getenv`, `sleep!` and `now-ms` are here beside it because they are
+;; the other side of the process boundary, not because they need a reader
+;; conditional.
 ;; ---------------------------------------------------------------------------
 
 (defn- getenv [name]
-  #?(:clz (sys/getenv name)
-     :bb (System/getenv name)
-     :clj (System/getenv name)))
+  (System/getenv name))
 
 (defn- sleep! [millis]
-  ;; clz registers `sleep` as a bare global builtin (src/stdlib/time_builtins.zig)
-  ;; and has no Thread class; JVM/bb have no bare `sleep`.
   (let [ms (long millis)]
     (when (pos? ms)
-      #?(:clz (sleep ms)
-         :bb (Thread/sleep ms)
-         :clj (Thread/sleep ms))
+      (Thread/sleep ms)
       nil)))
 
-;; `System/currentTimeMillis` is a real builtin on all three runtimes (clz
-;; registers it in time_builtins.zig), so this one needs no reader conditional.
 (defn- now-ms [] (System/currentTimeMillis))
 
 ;; One HTTP client per process, built lazily — openai-python likewise reuses a
 ;; single httpx.Client across attempts. Building one per call would allocate a
 ;; fresh selector thread for every retry (java.net.http.HttpClient had no
-;; close() before Java 21). clz's clojure.http/request is stateless, so it
-;; needs no equivalent.
-#?(:clz nil
-   :bb  (def ^:private bb-http-client
+;; close() before Java 21).
+#?(:bb  (def ^:private bb-http-client
           (delay (http/client (assoc http/default-client-opts :version :http1.1))))
    :clj (def ^:private jvm-http-client
           (delay (-> (java.net.http.HttpClient/newBuilder)
@@ -341,27 +307,7 @@
    themselves. Throws only on a genuine transport failure (DNS, connection
    refused, TLS handshake failure, timeout — no response at all)."
   [url headers body]
-  #?(:clz
-     (let [parsed (clz.url/parse url)
-           proto  (:protocol parsed)
-           host   (:host parsed)
-           port   (or (:port parsed) (if (= proto "https") 443 80))
-           base   (or (:path parsed) "/")
-           path   (if (:query parsed) (str base "?" (:query parsed)) base)]
-       ;; The 7th argument is clz v44's explicit tls? flag
-       ;; (src/net/http_builtins.zig). Before v44 the builtin took six
-       ;; arguments and inferred TLS from `port == 443` alone, with no
-       ;; URL-scheme awareness — so an https:// base-url on any other port (an
-       ;; entirely ordinary gateway/proxy/load-balancer setup) fell through to
-       ;; a *plaintext* TCP send, leaking credentials and the full JSON body.
-       ;; This leaf refused that case outright rather than let it happen. The
-       ;; flag makes the scheme, not the port, decide, so the refusal is gone.
-       ;; Verified against clz v44 directly: port 443 + true and port 80 +
-       ;; false both complete, and port 80 + true fails in the TLS handshake —
-       ;; i.e. the flag drives TLS.
-       (clojure.http/request "POST" host port path headers body (= proto "https")))
-
-     :bb
+  #?(:bb
      ;; :version :http1.1 for the same reason as the :clj leaf below —
      ;; babashka.http-client wraps java.net.http and inherits its HTTP_2
      ;; default, which breaks against a plain HTTP/1.1 proxy over cleartext.
@@ -379,12 +325,12 @@
            ;; HTTP_2, and for a cleartext http:// URL Java sends the HTTP/2
            ;; preface with no h2c upgrade negotiation — a plain HTTP/1.1
            ;; reverse proxy in front of an OpenAI-compatible gateway answers
-           ;; that with 502, so the same :base-url that works on clz and
-           ;; Babashka would fail only on JVM Clojure (observed against a live
-           ;; Caddy-fronted gateway). Over https:// ALPN would have negotiated
-           ;; safely, but pinning 1.1 keeps all three runtimes on the same wire
-           ;; protocol — clz's client is HTTP/1.1-only anyway — and this client
-           ;; issues one request at a time, so HTTP/2 buys it nothing.
+           ;; that with 502, so the same :base-url that works on Babashka would
+           ;; fail only on JVM Clojure (observed against a live Caddy-fronted
+           ;; gateway). Over https:// ALPN would have negotiated safely, but
+           ;; pinning 1.1 keeps both runtimes on the same wire protocol, and
+           ;; this client issues one request at a time, so HTTP/2 buys it
+           ;; nothing.
            resp     (.send @jvm-http-client req (java.net.http.HttpResponse$BodyHandlers/ofString))]
        {:status  (.statusCode resp)
         :headers (into {} (map (fn [[k vs]] [k (first vs)]) (.map (.headers resp))))
@@ -485,8 +431,7 @@
 
 (defn- header-value
   "Case-insensitive header lookup. Response header maps differ per runtime —
-   clz's clojure.http/request returns the wire casing verbatim (\"Retry-After\"),
-   java.net.http and babashka.http-client lower-case theirs — and keys may be
+   java.net.http and babashka.http-client lower-case theirs, and keys may be
    strings or keywords. A multi-value header arrives as a vector; take the
    first, as every HTTP client here does."
   [headers k]
@@ -506,8 +451,8 @@
 
 (defn- days-from-civil
   "Days since the Unix epoch for a proleptic-Gregorian y/m/d (Howard Hinnant's
-   days_from_civil). Pure integer arithmetic — no java.time, no clz date
-   builtins, identical on all three runtimes."
+   days_from_civil). Pure integer arithmetic — no java.time, identical on
+   both runtimes."
   [y m d]
   (let [y   (if (<= m 2) (dec y) y)
         era (quot (if (>= y 0) y (- y 399)) 400)
@@ -534,7 +479,7 @@
    through to nil, and callers then fall back to exponential backoff."
   [s]
   (let [toks (vec (remove str/blank? (str/split (str/trim (str s)) #"[\s,]+")))
-        ;; `keep-indexed` is not available on clz — find the month token by loop.
+        ;; Find the month token.
         idx  (loop [i 0]
                (cond
                  (>= i (count toks)) nil
@@ -545,8 +490,6 @@
             month      (get month-index (nth toks idx))
             year       (parse-long (nth toks (inc idx)))
             time-parts (str/split (nth toks (+ idx 2)) #":")
-            ;; nth's 3-arity default is ignored by clz (returns nil), so bounds
-            ;; check by hand rather than relying on it.
             tz         (when (> (count toks) (+ idx 3)) (nth toks (+ idx 3)))]
         (when (and day year (= 3 (count time-parts)))
           (let [hh  (parse-long (nth time-parts 0))
@@ -599,7 +542,7 @@
 
 (defn- backoff-base-ms
   "min(INITIAL_RETRY_DELAY * 2^retries-taken, MAX_RETRY_DELAY), by doubling —
-   no Math/pow (absent on clz), no overflow, no 1000-retry cap needed since
+   no Math/pow, no overflow, no 1000-retry cap needed since
    the loop stops at the ceiling."
   [retries-taken]
   (loop [n 0 v initial-retry-delay-ms]
@@ -673,18 +616,21 @@
 
 (defn- reject-streaming! [fn-name request]
   (when (or (true? (get request :stream)) (true? (get request "stream")))
-    (throw (ex-info (str "tools.agents.openai/" fn-name ": :stream true is not supported on "
-                          "this platform — clz's only TLS-capable HTTP builtin (clojure.http/request) "
-                          "does not stream, and its streaming builtin (clojure.http/request-stream) "
-                          "does not support TLS. api.openai.com is HTTPS-only, so true SSE "
-                          "streaming cannot be implemented here today. See README.")
+    (throw (ex-info (str "tools.agents.openai/" fn-name ": :stream true is not supported — "
+                          "SSE streaming is not implemented by this client. See README.")
                      {:type :tools.agents.openai/streaming-unsupported}))))
 
 (defn- own-error?
-  "True for an already-typed tools.agents.openai/* ex-info. openai-python
+  "True for an already-typed tools.agents.openai/* ex-info. Matches the
+   namespace EXACTLY: moving these keywords under a `.error` sub-namespace
+   (as tools.agents.anthropic spells its own) would silently make this
+   false for every one of them, and the retry loop would then retry
+   permanent refusals. See docs/openai.md's error-hierarchy note.
+
+   openai-python
    re-raises OpenAIError subclasses out of the send path as-is, without
-   retrying or rewrapping them — the clz TLS-on-non-443-port refusal is this
-   library's equivalent, and retrying it would be pointless as well as noisy."
+   retrying or rewrapping them, and retrying such a refusal would be pointless
+   as well as noisy."
   [e]
   (let [data (ex-data e)]
     (boolean (and data (keyword? (:type data)) (= "tools.agents.openai" (namespace (:type data)))))))
@@ -720,7 +666,7 @@
           (if (< retries-taken max-retries)
             (do (sleep! (retry-delay-ms retries-taken nil (now-ms)))
                 (recur (inc retries-taken)))
-            (throw (ex-info (str "tools.agents.openai/" fn-name ": connection failed: " (str (:error outcome)))
+            (throw (ex-info (str "tools.agents.openai/" fn-name ": connection failed: " (:error outcome))
                              {:type :tools.agents.openai/api-connection-error :status nil :body nil
                               :retries-taken retries-taken})))
           (let [resp      (:resp outcome)
@@ -799,8 +745,6 @@
     (when-not (vector? output)
       (throw (ex-info "tools.agents.openai/output-text: response has no \"output\" array"
                        {:type :tools.agents.openai/invalid-response :status nil :body nil})))
-    ;; str/join rather than `apply str` — same clz stack limit as in the JSON
-    ;; parser; a long response can carry many output_text blocks.
     (str/join ""
            (reduce
              (fn [acc item]

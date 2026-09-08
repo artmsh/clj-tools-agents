@@ -89,12 +89,10 @@
 
 ;; ---------------------------------------------------------------------------
 ;; Expense generation — deterministic per (employee-id, quarter) via a small
-;; hand-rolled LCG, NOT java.util.Random/clojure.core/hash: this file is
-;; loaded (though its multi-request mock-server tests don't run there — see
-;; live_test.cljc's multi-request-mock-server?) on clz too via the repo's
-;; src/examples symlink, and neither JVM interop nor a cross-runtime-verified
-;; hash algorithm is assumed here — plain integer arithmetic over char codes
-;; is.
+;; hand-rolled LCG, NOT java.util.Random/clojure.core/hash: the fixtures must
+;; be byte-identical wherever this example runs, so it uses plain integer
+;; arithmetic over char codes rather than anything whose seeding or hashing
+;; could differ.
 ;; ---------------------------------------------------------------------------
 
 (defn- string-seed [s]

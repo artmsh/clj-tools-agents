@@ -1,23 +1,17 @@
 (ns tools.agents.anthropic.visualize-test
-  "Pure logic — zero I/O, zero network, identical on JVM Clojure, Babashka
-   and clz (matches tools.agents.anthropic-test's own posture). Assertions
+  "Pure logic — zero I/O, zero network, identical on JVM Clojure and
+   Babashka (matches tools.agents.anthropic-test's own posture). Assertions
    target render-message's returned STRING directly (visualize-message /
    show-response / capture! / show-all! just println it — no need for
-   with-out-str anywhere, and no need to guard anything with a clz-only
-   :clz nil branch as a result)."
+   with-out-str anywhere)."
   (:require [clojure.string :as str]
-            [clojure.test :refer [deftest is testing]]
+            [clojure.test :refer [deftest is]]
             [tools.agents.anthropic.visualize :as viz]))
 
 (defn- long-str
-  "n copies of ch joined. `(str/join (repeat n ch))`, NOT `(apply str
-   (repeat n ch))` — verified empirically that clz's `apply` can
-   StackOverflow well under 1000 args once there's a few more stack frames
-   already in play (a bare top-level `(apply str (repeat 1000 ...))` is
-   fine in isolation, but the same call nested inside deftest/let/a
-   render-message call chain is not — cumulative stack depth, not a fixed
-   threshold). See tools.agents.anthropic.visualize's strip-ansi docstring for
-   the same finding against the library code itself."
+  "n copies of ch joined — `str/join`, not `(apply str (repeat n ch))`,
+   which would spread n arguments. See tools.agents.anthropic.visualize's
+   strip-ansi docstring."
   ([n] (long-str n "x"))
   ([n ch] (str/join (repeat n ch))))
 
@@ -326,14 +320,13 @@
     (is (>= (count lines) 6))
     (is (= 1 (count (distinct widths))))))
 
-(deftest panel-does-not-crash-past-clzs-apply-arg-limit
+(deftest panel-does-not-crash-past-applys-arg-limit
   ;; Regression guard: panel computed its content width via `(apply max 0
-  ;; (map visible-length lines))`, which StackOverflows/TypeErrors on clz
-  ;; once the rendered line count passes ~1010 -- reachable from realistic
-  ;; tool-output sizes (a code_execution_tool_result whose stdout has many
-  ;; lines, well within this file's own 2000-char stdout truncation limit,
-  ;; e.g. 1500 blank lines = 1500 chars total). `reduce max` has no such
-  ;; arg-count limit on any runtime.
+  ;; (map visible-length lines))` — one argument per rendered line, which
+  ;; realistic tool output reaches (a code_execution_tool_result whose stdout
+  ;; has many lines, well within this file's own 2000-char stdout truncation
+  ;; limit, e.g. 1500 blank lines = 1500 chars total). `reduce max` has no
+  ;; such arg-count limit.
   (let [many-lines-stdout (str/join (repeat 1500 "\n"))
         out (viz/render-message
               (with-content [{"type" "code_execution_tool_result"
@@ -345,8 +338,8 @@
 
 ;; ---------------------------------------------------------------------------
 ;; visualizer / capture! / show-all! — state only, ignore the println side
-;; effect (it's a plain println, harmless under clojure.test on all three
-;; runtimes, and testing it doesn't require capturing stdout at all).
+;; effect (it's a plain println, harmless under clojure.test, and testing it
+;; doesn't require capturing stdout at all).
 ;; ---------------------------------------------------------------------------
 
 (deftest visualizer-defaults-to-auto-show

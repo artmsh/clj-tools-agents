@@ -1,13 +1,8 @@
 (ns tools.agents.gemini.live-test
-  "Mock-server / transport-level coverage. `start-server!` is the ONLY
-   runtime-specific piece (three tiny leaves, same pattern as
-   tools.agents.gemini's own `http-post!`, tools.agents.anthropic/
-   tools.agents.openai's own live-test namespaces): clz uses clojure.http/
-   server+handle+serve-once, Babashka uses org.httpkit.server (com.sun.net.
-   httpserver.HttpServer is NOT resolvable under bb's native image), and JVM
-   Clojure uses com.sun.net.httpserver.HttpServer (built into the JDK, zero
-   deps). Every test above `start-server!` exercises identical handler logic
-   and identical assertions on all three runtimes.
+  "Mock-server / transport-level coverage. The mock server itself lives in
+   tools.agents.test-support, shared with the anthropic and openai suites —
+   it is the only runtime-specific piece in any of them. Everything here is
+   identical handler logic and identical assertions on both runtimes.
 
    Every retry test binds `g/*sleep-fn*` to a no-op — the real backoff floor
    is 1 SECOND (python-genai's tenacity initial=1.0), unlike tools.agents.
@@ -20,63 +15,7 @@
             [examples.gemini.basic-chat :as ex-basic]
             [examples.gemini.count-tokens :as ex-count]
             [examples.gemini.custom-gateway :as ex-gateway]
-            #?@(:bb  [[org.httpkit.server :as hk]]
-                :clj []
-                :clz [])))
-
-;; ---------------------------------------------------------------------------
-;; Mock-server leaf
-;; ---------------------------------------------------------------------------
-
-(defn- start-server!
-  "route: the exact path the mock will answer on, e.g.
-   \"/v1beta/models/gemini-2.5-flash:generateContent\". expected-requests: how
-   many requests the test will issue against this server (retry tests issue
-   several). handler: (fn [{:keys [method path headers body]}]) -> {:status
-   :headers :body}. Returns {:port port :stop! (fn [])}."
-  ([port route handler] (start-server! port route 1 handler))
-  ([port route expected-requests handler]
-  #?(:clz
-     (let [srv (clojure.http/server port)]
-       (clojure.http/handle srv "POST" route
-         (fn [req] (handler {:method (:method req) :path (:path req)
-                              :headers (:headers req) :body (:body req)})))
-       (clojure.http/handle-default srv (fn [_] {:status 404 :body "not found"}))
-       (future (loop [i 0]
-                 (when (< i expected-requests)
-                   (clojure.http/serve-once srv)
-                   (recur (inc i)))))
-       {:port port :stop! (fn [] nil)})
-
-     :bb
-     (let [server (hk/run-server
-                    (fn [req]
-                      (let [body (when (:body req) (slurp (:body req)))]
-                        (handler {:method (str/upper-case (name (:request-method req))) :path (:uri req)
-                                  :headers (:headers req) :body (or body "")})))
-                    {:port port :legacy-return-value? false})]
-       {:port port :stop! (fn [] (hk/server-stop! server))})
-
-     :clj
-     (let [server (com.sun.net.httpserver.HttpServer/create
-                    (java.net.InetSocketAddress. "127.0.0.1" port) 0)]
-       (.createContext server route
-         (reify com.sun.net.httpserver.HttpHandler
-           (handle [_ exchange]
-             (let [body    (String. (.readAllBytes (.getRequestBody exchange)) "UTF-8")
-                   headers (into {} (map (fn [[k vs]] [(str/lower-case k) (first vs)])
-                                         (.getRequestHeaders exchange)))
-                   req     {:method (.getRequestMethod exchange)
-                             :path (.getPath (.getRequestURI exchange))
-                             :headers headers :body body}
-                   {:keys [status headers body]} (handler req)
-                   resp-bytes (.getBytes (or body "") "UTF-8")]
-               (doseq [[k v] headers] (.set (.getResponseHeaders exchange) k v))
-               (.sendResponseHeaders exchange status (count resp-bytes))
-               (with-open [os (.getResponseBody exchange)] (.write os resp-bytes))))))
-       (.setExecutor server nil)
-       (.start server)
-       {:port port :stop! (fn [] (.stop server 0))}))))
+            [tools.agents.test-support :refer [start-server!]]))
 
 (defn- base-url [port] (str "http://127.0.0.1:" port))
 
@@ -247,7 +186,7 @@
 
 (deftest retries-a-503-then-succeeds
   (let [hits (atom 0)
-        {:keys [port stop!]} (start-server! 18990 "/v1beta/models/gemini-2.5-flash:generateContent" 3
+        {:keys [port stop!]} (start-server! 18990 "/v1beta/models/gemini-2.5-flash:generateContent"
                                 (fn [_]
                                   (if (< (swap! hits inc) 3)
                                     {:status 503 :body "{\"error\":{\"message\":\"overloaded\"}}"}
@@ -261,7 +200,7 @@
 
 (deftest retries-are-exhausted-then-the-status-error-surfaces
   (let [hits (atom 0)
-        {:keys [port stop!]} (start-server! 18991 "/v1beta/models/m:generateContent" 5
+        {:keys [port stop!]} (start-server! 18991 "/v1beta/models/m:generateContent"
                                 (fn [_] (swap! hits inc)
                                   {:status 500 :body "{\"error\":{\"message\":\"overloaded\"}}"}))]
     (try
@@ -301,7 +240,7 @@
 
 (deftest count-tokens-retries-too
   (let [hits (atom 0)
-        {:keys [port stop!]} (start-server! 18994 "/v1beta/models/gemini-2.5-flash:countTokens" 2
+        {:keys [port stop!]} (start-server! 18994 "/v1beta/models/gemini-2.5-flash:countTokens"
                                 (fn [_]
                                   (if (< (swap! hits inc) 2)
                                     {:status 429 :body "{}"}
@@ -321,18 +260,6 @@
         (is (= :tools.agents.gemini/api-connection-error (:type (ex-data e))))
         (is (= 1 (:retries-taken (ex-data e))))))))
 
-;; clz-only: same TLS-port rationale as tools.agents.anthropic/tools.agents.
-;; openai's identically-named test — clz v44 attempts real TLS on a non-443
-;; port rather than refusing outright, so this now reaches (and fails) the
-;; network instead of throwing a dead :tls-port-unsupported guard.
-#?(:clz
-   (deftest https-on-non-443-port-now-attempts-tls-instead-of-refusing
-     (let [client (g/client {:api-key "should-never-leave-process"
-                              :base-url "https://127.0.0.1:18999" :max-retries 0})
-           e (try (g/generate-content client "m" {"contents" []}) nil (catch Exception e e))]
-       (is (some? e))
-       (is (= :tools.agents.gemini/api-connection-error (:type (ex-data e))))
-       (is (str/starts-with? (str (ex-message e)) "tools.agents.gemini/generate-content: ")))))
 
 ;; ---------------------------------------------------------------------------
 ;; examples/*.clj wired end-to-end against the mock server
@@ -365,7 +292,7 @@
         {:keys [port stop!]} (start-server! 18997 "/v1beta/models/gemini-2.5-flash:generateContent"
                                 (fn [req] (reset! captured req)
                                   {:status 200
-                                   :body (str "{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"{}\"}]}}]}")}))]
+                                   :body "{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"{}\"}]}}]}"}))]
     (try
       (let [client (g/client {:api-key "gw-key" :base-url (base-url port)})
             result (ex-gateway/run-example client)]

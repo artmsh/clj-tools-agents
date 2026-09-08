@@ -1,12 +1,8 @@
 (ns tools.agents.openai.live-test
-  "Mock-server / transport-level coverage. `start-server!` is the ONLY
-   runtime-specific piece (three tiny leaves, same pattern as
-   tools.agents.openai's own `http-post!`): clz uses clojure.http/server+handle+
-   serve-once, Babashka uses org.httpkit.server (com.sun.net.httpserver.
-   HttpServer is NOT resolvable under bb's native image), and JVM Clojure uses
-   com.sun.net.httpserver.HttpServer (built into the JDK, zero deps). Every
-   test above `start-server!` exercises identical handler logic and identical
-   assertions on all three runtimes.
+  "Mock-server / transport-level coverage. The mock server itself lives in
+   tools.agents.test-support, shared with the anthropic and gemini suites —
+   it is the only runtime-specific piece in any of them. Everything here is
+   identical handler logic and identical assertions on both runtimes.
 
    NOTE every :base-url below deliberately carries the `/v1` segment, and every
    mock route is registered at the full `/v1/...` path — that is the shape of
@@ -18,72 +14,7 @@
             [examples.openai.basic-chat :as ex-basic]
             [examples.openai.chat-completions :as ex-chat]
             [examples.openai.custom-gateway :as ex-gateway]
-            #?@(:bb  [[org.httpkit.server :as hk]]
-                :clj []
-                :clz [])))
-
-;; ---------------------------------------------------------------------------
-;; Mock-server leaf
-;; ---------------------------------------------------------------------------
-
-(defn- start-server!
-  "route: the exact path the mock will answer on, e.g. \"/v1/responses\".
-   expected-requests: how many requests the test will issue against this
-   server (retry tests issue several). handler: (fn [{:keys [method path
-   headers body]}]) -> {:status :headers :body}. Returns
-   {:port port :stop! (fn [])}."
-  ([port route handler] (start-server! port route 1 handler))
-  ([port route expected-requests handler]
-  #?(:clz
-     ;; clz serves exactly `expected-requests` requests, one `serve-once` per
-     ;; iteration (the same shape as clojure.http/serve's own accept loop, and
-     ;; proven to compose with a synchronous client call: the socket is bound
-     ;; and listening before the future is spawned, so the client's connect()
-     ;; queues in the OS backlog regardless of thread scheduling). A bounded
-     ;; count rather than a persistent `serve` loop, because closing a
-     ;; listening socket does not reliably unblock an in-progress accept() on
-     ;; this platform — which made a `serve`+`stop` pattern hang the whole test
-     ;; process at exit (FuturePool never drains).
-     (let [srv (clojure.http/server port)]
-       (clojure.http/handle srv "POST" route
-         (fn [req] (handler {:method (:method req) :path (:path req)
-                              :headers (:headers req) :body (:body req)})))
-       (clojure.http/handle-default srv (fn [_] {:status 404 :body "not found"}))
-       (future (loop [i 0]
-                 (when (< i expected-requests)
-                   (clojure.http/serve-once srv)
-                   (recur (inc i)))))
-       {:port port :stop! (fn [] nil)})
-
-     :bb
-     (let [server (hk/run-server
-                    (fn [req]
-                      (let [body (when (:body req) (slurp (:body req)))]
-                        (handler {:method (str/upper-case (name (:request-method req))) :path (:uri req)
-                                  :headers (:headers req) :body (or body "")})))
-                    {:port port :legacy-return-value? false})]
-       {:port port :stop! (fn [] (hk/server-stop! server))})
-
-     :clj
-     (let [server (com.sun.net.httpserver.HttpServer/create
-                    (java.net.InetSocketAddress. "127.0.0.1" port) 0)]
-       (.createContext server route
-         (reify com.sun.net.httpserver.HttpHandler
-           (handle [_ exchange]
-             (let [body    (String. (.readAllBytes (.getRequestBody exchange)) "UTF-8")
-                   headers (into {} (map (fn [[k vs]] [(str/lower-case k) (first vs)])
-                                         (.getRequestHeaders exchange)))
-                   req     {:method (.getRequestMethod exchange)
-                             :path (.getPath (.getRequestURI exchange))
-                             :headers headers :body body}
-                   {:keys [status headers body]} (handler req)
-                   resp-bytes (.getBytes (or body "") "UTF-8")]
-               (doseq [[k v] headers] (.set (.getResponseHeaders exchange) k v))
-               (.sendResponseHeaders exchange status (count resp-bytes))
-               (with-open [os (.getResponseBody exchange)] (.write os resp-bytes))))))
-       (.setExecutor server nil)
-       (.start server)
-       {:port port :stop! (fn [] (.stop server 0))}))))
+            [tools.agents.test-support :refer [start-server!]]))
 
 (defn- base-url [port] (str "http://127.0.0.1:" port "/v1"))
 
@@ -306,7 +237,7 @@
 
 (deftest retries-a-429-then-succeeds
   (let [hits (atom 0)
-        {:keys [port stop!]} (start-server! 18965 "/v1/responses" 3
+        {:keys [port stop!]} (start-server! 18965 "/v1/responses"
                                 (fn [_]
                                   (if (< (swap! hits inc) 3)
                                     {:status 429 :headers {"retry-after-ms" "1"}
@@ -330,7 +261,7 @@
 
 (deftest retries-are-exhausted-then-the-status-error-surfaces
   (let [hits (atom 0)
-        {:keys [port stop!]} (start-server! 18966 "/v1/responses" 3
+        {:keys [port stop!]} (start-server! 18966 "/v1/responses"
                                 (fn [_] (swap! hits inc)
                                   {:status 503 :headers {"retry-after-ms" "1"}
                                    :body "{\"error\":{\"message\":\"overloaded\"}}"}))]
@@ -362,7 +293,7 @@
 (deftest x-should-retry-header-overrides-the-status
   ;; A 400 the server explicitly asks us to retry — and a 500 it asks us not to.
   (let [hits (atom 0)
-        {:keys [port stop!]} (start-server! 18968 "/v1/responses" 2
+        {:keys [port stop!]} (start-server! 18968 "/v1/responses"
                                 (fn [_]
                                   (if (< (swap! hits inc) 2)
                                     {:status 400 :headers {"x-should-retry" "true" "retry-after-ms" "1"}
@@ -401,7 +332,7 @@
 
 (deftest chat-completions-retries-too
   (let [hits (atom 0)
-        {:keys [port stop!]} (start-server! 18971 "/v1/chat/completions" 2
+        {:keys [port stop!]} (start-server! 18971 "/v1/chat/completions"
                                 (fn [_]
                                   (if (< (swap! hits inc) 2)
                                     {:status 429 :headers {"retry-after-ms" "1"} :body "{}"}
@@ -432,23 +363,6 @@
     (is (some? e))
     (is (= :tools.agents.openai/missing-credentials (:type (ex-data e))))))
 
-;; clz-only: this used to assert a REFUSAL. clz's clojure.http/request once
-;; inferred TLS from `port == 443` alone, so an https:// base-url on any other
-;; port would have gone out in plaintext with the credentials in it, and this
-;; leaf refused rather than let that happen. clz v44 takes an explicit tls?
-;; flag, so the scheme decides and the refusal is gone — what must now be true
-;; is that the call reaches the network and fails there. No server is started
-;; at this port, so a connect() failure is the whole expected outcome; anything
-;; still throwing :tls-port-unsupported would mean a dead guard survived.
-#?(:clz
-   (deftest https-on-non-443-port-now-attempts-tls-instead-of-refusing
-     (let [client (oai/client {:api-key "should-never-leave-process"
-                               :base-url "https://127.0.0.1:18999/v1"})
-           e (try (oai/responses-create client {"model" "m" "input" "hi"})
-                  nil (catch Exception e e))]
-       (is (some? e))
-       (is (= :tools.agents.openai/api-connection-error (:type (ex-data e))))
-       (is (str/starts-with? (str (ex-message e)) "tools.agents.openai/responses-create: ")))))
 
 ;; ---------------------------------------------------------------------------
 ;; examples/*.clj wired end-to-end against the mock server

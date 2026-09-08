@@ -9,12 +9,12 @@ official [python-genai](https://github.com/googleapis/python-genai) client: a
 `client.models.count_tokens(...)`, and a typed error hierarchy matching the
 SDK's `APIError`.
 
-Runs unmodified on **JVM Clojure**, **Babashka**, and **[clz](https://forgejo.lan/art/clz)**.
+Runs unmodified on **JVM Clojure** and **Babashka**.
 
 Sibling of [tools.agents.anthropic](anthropic.md) and
 [tools.agents.openai](openai.md) in this same repo — same architecture
 (single leaf for network I/O, hand-rolled portable JSON codec,
-`ex-info`-with-`:type` error hierarchy, three-runtime test matrix). The
+`ex-info`-with-`:type` error hierarchy, two-runtime test matrix). The
 places where this library deliberately behaves *differently* from its two
 siblings are called out in "Divergences from tools.agents.anthropic/
 tools.agents.openai" below; they all come from following python-genai rather
@@ -79,7 +79,7 @@ model id) is used verbatim.
 | `response.text` | `(output-text response)` | Port of the SDK property: join every string `"text"` across `candidates[0].content.parts`, skipping `"thought"` parts. Returns `nil` (matching Python's `None`) rather than throwing when there's nothing to join — see below. |
 | dict key `"maxOutputTokens"` (nested under `"generationConfig"`) | map key `"maxOutputTokens"` or `:maxOutputTokens` | Both string and keyword keys are accepted and encoded **verbatim** via `name` — no case conversion at all. Gemini's REST field names are camelCase already, unlike anthropic/openai's snake_case — write `:maxOutputTokens`, not `:max_output_tokens` or `:max-output-tokens`. |
 | `google.genai.errors.APIError` (`ClientError` / `ServerError` subclasses) | `ex-info` with `:type` in `ex-data` | See the error-hierarchy table below — one exception constructor discriminated by `:type`, rather than a Python-style class hierarchy. |
-| `GOOGLE_API_KEY` / `GEMINI_API_KEY` | same env vars, same precedence (`GOOGLE_API_KEY` wins when both are set) | Explicit `:api-key` wins over both. python-genai logs a warning when both env vars are set; this library just picks `GOOGLE_API_KEY` silently (no shared logging facility across the three runtimes). |
+| `GOOGLE_API_KEY` / `GEMINI_API_KEY` | same env vars, same precedence (`GOOGLE_API_KEY` wins when both are set) | Explicit `:api-key` wins over both. python-genai logs a warning when both env vars are set; this library just picks `GOOGLE_API_KEY` silently (the two runtimes share no common logging facility). |
 | `x-goog-api-key` header | same header | Confirmed from `_api_client.py`: a bare API key, **no** `Bearer ` prefix — unlike `tools.agents.openai`'s `Authorization: Bearer`. |
 | `HttpOptions(base_url=..., api_version=...)` | `:base-url` (default `https://generativelanguage.googleapis.com`), `:api-version` (default `"v1beta"`) | Kept as two separate client fields, joined at request time, rather than one pre-concatenated base-url string — see `client`'s docstring. |
 | `client.models.generate_content_stream(...)` | *(not implemented)* | See Streaming below - same rationale as the two siblings. |
@@ -111,6 +111,11 @@ the calling function (`"tools.agents.gemini/generate-content: "` /
 `"tools.agents.gemini/count-tokens: "`) and `ex-data`
 `{:type <keyword> :status <http-status-or-nil> :body <raw-body-or-nil>
 :retries-taken <int>}`:
+
+As in `tools.agents.openai`, these keywords sit directly under
+`:tools.agents.gemini/…` rather than under a `.error` sub-namespace the way
+`tools.agents.anthropic` and `tools.agents.mcp` spell theirs. Frozen
+spelling, not an oversight.
 
 | HTTP status | `:type` | python-genai class |
 |---|---|---|
@@ -156,9 +161,9 @@ text here" case: no `"candidates"` at all, an empty `"candidates"` array, a
 first candidate with no `"content"`/`"parts"`, or a `"parts"` array with no
 string-`"text"` (non-`"thought"`) entries in it (a tool-call-only or
 safety-blocked response). There is no equivalent of the SDK's warning logs
-for multiple candidates or non-text parts — none of the three runtimes here
-share a common logging facility, and a silent best-effort extraction is the
-more useful library default.
+for multiple candidates or non-text parts — the two runtimes here share no
+common logging facility, and a silent best-effort extraction is the more
+useful library default.
 
 ### Retries
 
@@ -181,8 +186,7 @@ initial call, so 4 *retries*).
   initial * exp_base^n + random.uniform(0, jitter))`, where `n` is
   retries-already-taken (in **seconds** in tenacity; ported here as integer
   **milliseconds** throughout — `initial` 1000ms, `max` 60000ms, `jitter`
-  0–1000ms — since `Math/pow`/`Math/round` are unavailable on clz and integer
-  ms is what every runtime's sleep primitive wants).
+  0–1000ms — integer ms is what every runtime's sleep primitive wants).
 - **No `Retry-After` equivalent.** See "What is retried" above — this is the
   one place this library's retry policy is knowingly less complete than
   `tools.agents.openai`'s, because the upstream behavior it would port isn't
@@ -218,21 +222,20 @@ happened."
 | `Retry-After`-equivalent header | clamped `[0, 60]`s, private | `retry-after-ms`/`Retry-After` **and** `x-should-retry`, public, honored | **not implemented** — no such header found in python-genai's retry predicate |
 | request-key casing | snake_case verbatim (`max_tokens`) | snake_case verbatim (`max_output_tokens`) | **camelCase** verbatim (`maxOutputTokens`) — matches the REST API's own field names |
 
-Everything else — the JSON codec, the leaf-I/O split, `ex-info` typing style, and the three-runtime test harness — is
+Everything else — the JSON codec, the leaf-I/O split, `ex-info` typing
+style, and the two-runtime test harness — is
 intentionally identical.
 
-### Platform limitation: streaming is not supported
+### Streaming is not supported
 
 There is no `stream-generate-content`/`:stream true` flag to reject here, the
 way the two siblings each reject one — Gemini's REST streaming variant
 (`:streamGenerateContent`) is a **separate endpoint**, not a request-body
-flag, so there is simply no streaming function offered at all. The underlying
-platform reason is the same as both siblings':
-- `generativelanguage.googleapis.com` is HTTPS-only.
+flag, so there is simply no streaming function offered at all.
 
 ### JSON: a small hand-rolled codec, not a dependency
 
-There is no JSON library available on all three runtimes without adding a
+There is no JSON library available on both runtimes without adding a
 dependency, so `write-json`/`read-json` in `tools/agents/gemini.cljc` are the
 same small hand-written codec as the two siblings (byte-for-byte identical
 algorithm, kept as a separate copy rather than a shared ns — see
@@ -243,22 +246,21 @@ characters other than `\n \r \t` and backspace/form-feed are not
 
 ### Isolating runtime-specific I/O
 
-Exactly three functions in `tools/agents/gemini.cljc` are runtime-specific,
-each a `#?(:clz ... :bb ... :clj ...)` reader conditional — `http-post!`,
-`getenv`, and `sleep!`, identical in shape and rationale to
-`tools.agents.openai`'s own three leaves (see docs/openai.md's "Isolating
-runtime-specific I/O" and "Why HTTP/1.1 is pinned" sections — both apply here
-verbatim, including the HTTP/1.1 pin on the JVM-backed leaves).
+Exactly one function in `tools/agents/gemini.cljc` is runtime-specific:
+`http-post!`, behind a `#?(:bb ... :clj ...)` reader conditional, identical in
+shape and rationale to `tools.agents.openai`'s own leaf (see docs/openai.md's
+"Isolating runtime-specific I/O" and "Why HTTP/1.1 is pinned" sections — both
+apply here verbatim, including the HTTP/1.1 pin).
 
 ## Testing
 
 `test/tools/agents/gemini_test.cljc` is pure logic (JSON codec, credential
 resolution, `output-text`, the retry policy's `retryable-status?`/
 `retry-delay-ms`, contents-list helpers) — zero I/O, zero network, zero
-sleeping (the RNG is injected), identical on all three runtimes.
+sleeping (the RNG is injected), identical on both runtimes.
 
-`test/tools/agents/gemini/live_test.cljc` runs a local mock server on all
-three runtimes: request line and required headers (`x-goog-api-key`,
+`test/tools/agents/gemini/live_test.cljc` runs a local mock server on both
+runtimes: request line and required headers (`x-goog-api-key`,
 `content-type`), bare-model-id vs. `tunedModels/`-prefixed model-path
 building, trailing-slash base-urls, `generateContent`/`countTokens` path
 building, outbound JSON preserving the request map verbatim, credentials
@@ -275,17 +277,14 @@ no-op so they cost no measurable wall-clock, since — unlike
 trick available to shrink the real ~1s-per-retry floor). All three
 `examples/gemini/*.clj` ports run end-to-end against the mock server too.
 
-Mock server per runtime: same three leaves (clz `clojure.http/server` +
-`handle` + `serve-once`, Babashka `org.httpkit.server`, JVM Clojure
-`com.sun.net.httpserver.HttpServer`) as the two siblings' live-test
-namespaces. Mock ports are `18980`–`18997`, chosen not to collide with
-`tools.agents.anthropic`'s `18930`–`18946` or `tools.agents.openai`'s
-`18950`–`18971` (`./script/test-all.sh`'s `clz test` invocation runs each
-suite's mock servers in its own process per suite, but ports are kept
-disjoint across suites regardless as a matter of hygiene). Port `18999` is
-additionally used by the tests that deliberately start *no* server (missing
-credentials, the clz TLS refusal, and the connection-failure tests, which
-actually dial it and so assume nothing else on the host has `18999` bound).
+The mock server is `tools.agents.test-support/start-server!`, shared by all three provider suites: two leaves, Babashka
+`org.httpkit.server` and JVM Clojure `com.sun.net.httpserver.HttpServer`.
+Mock ports are `18980`–`18997`, kept disjoint from
+`tools.agents.anthropic`'s `18930`–`18946` and `tools.agents.openai`'s
+`18950`–`18971` as a matter of hygiene. Port `18999` is additionally used by
+the tests that deliberately start *no* server (missing credentials and the
+connection-failure tests, which actually dial it and so assume nothing else
+on the host has `18999` bound).
 
 A couple of client-construction tests read the real environment (they assert
 the behavior that applies when `GOOGLE_API_KEY`/`GEMINI_API_KEY` are unset),

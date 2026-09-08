@@ -1,6 +1,5 @@
 (ns tools.agents.gemini.test-runner
-  "Entry point for `clojure -M:test` and `bb test`. clz runs the same files
-   through its own `clz test` runner, so there are no per-runtime test shims."
+  "Entry point for `clojure -M:test-gemini` and `bb test-gemini`."
   (:require [clojure.test :as t]
             tools.agents.gemini-test
             tools.agents.gemini.live-test))

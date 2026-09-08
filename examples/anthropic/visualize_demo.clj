@@ -13,12 +13,7 @@
   (:require [tools.agents.anthropic.visualize :as viz]))
 
 ;; What messages-create returns mid tool-calling loop: the model's turn
-;; asking for a weather lookup. NOTE: no docstring on these `def`s — `(def
-;; name "doc" value)` is valid standard Clojure (def's 3-arity docstring
-;; form), but clz doesn't honor it: it silently treats the "doc" string
-;; itself as the var's value and drops the real init form, verified
-;; empirically (`(def x "doc" {:a 1})` -> `x` is `"doc"`, not `{:a 1}`, on
-;; clz alone). A `;;` comment above the def is the portable equivalent.
+;; asking for a weather lookup.
 (def fixture-assistant-turn
   {"role" "assistant"
    "model" "claude-sonnet-4-6"

@@ -26,11 +26,11 @@
    Its practical consequence for this repo: the entire conformance suite is
    plain data in / plain data out, with no mock server and no subprocess.
 
-   Runs unmodified on JVM Clojure, Babashka and clz — same three-runtime
-   contract as tools.agents.anthropic and tools.agents.openai, and (unlike
-   those two) with no runtime-specific leaf at all in this namespace: the
-   stdio transport needs only `read-line`/`println`/`*err*`, all of which
-   are plain clojure.core on all three.
+   Runs unmodified on JVM Clojure and Babashka — same two-runtime contract
+   as tools.agents.anthropic and tools.agents.openai, and (unlike those two)
+   with no runtime-specific leaf at all in this namespace: the stdio
+   transport needs only `read-line`/`println`/`*err*`, all of which are
+   plain clojure.core on both.
 
    WIRE VALUES ARE STRING-KEYED MAPS, passed through VERBATIM — the same
    contract as this repo's other two libraries, and the same idiom the
@@ -40,8 +40,8 @@
    protocol value' and 'this is your program'.
 
    JSON: a hand-written codec, as in the sibling libraries — there is no
-   JSON library available on all three runtimes without adding a
-   dependency. It diverges from theirs in one deliberate way: `write-json`
+   JSON library available on both runtimes without adding a dependency. It
+   diverges from theirs in one deliberate way: `write-json`
    here \\u00XX-escapes EVERY control character below 0x20, not just the
    five with short escapes. That gap is cosmetic for an HTTP request body
    but load-bearing here, because the stdio transport's framing contract is
@@ -118,13 +118,6 @@
         b (logging-level-rank minimum)]
     (boolean (and a b (>= a b)))))
 
-;; Backspace/form-feed as computed chars: clz's string-literal reader does not
-;; decode `\b`/`\f` escapes (they stay literal 2-char `\` + `b`/`f`), unlike
-;; `\n`/`\r`/`\t` which it decodes correctly. Building these via `char`
-;; sidesteps the gap and works identically on all three runtimes.
-(def ^:private BACKSPACE (str (char 8)))
-(def ^:private FORM-FEED (str (char 12)))
-
 ;; ---------------------------------------------------------------------------
 ;; JSON codec — pure, portable, zero dependencies.
 ;; ---------------------------------------------------------------------------
@@ -161,8 +154,8 @@
                     (str/replace "\n" "\\n")
                     (str/replace "\r" "\\r")
                     (str/replace "\t" "\\t")
-                    (str/replace BACKSPACE "\\b")
-                    (str/replace FORM-FEED "\\f"))]
+                    (str/replace "\b" "\\b")
+                    (str/replace "\f" "\\f"))]
     (str "\""
          (if (some control-char? escaped) (json-escape-controls escaped) escaped)
          "\"")))
@@ -247,9 +240,6 @@
       (when (>= j n) (json-parse-error! "unterminated string"))
       (let [c (subs s j (inc j))]
         (cond
-          ;; `(str/join pieces)`, NOT `(apply str pieces)`: apply spreads
-          ;; every element as a separate arg, which StackOverflows on clz
-          ;; once a string value's char count passes ~1000.
           (= c "\"") [(str/join pieces) (inc j)]
 
           (= c "\\")
@@ -263,29 +253,23 @@
                 (= esc "n")  (recur (+ j 2) (conj pieces "\n"))
                 (= esc "r")  (recur (+ j 2) (conj pieces "\r"))
                 (= esc "t")  (recur (+ j 2) (conj pieces "\t"))
-                (= esc "b")  (recur (+ j 2) (conj pieces BACKSPACE))
-                (= esc "f")  (recur (+ j 2) (conj pieces FORM-FEED))
+                (= esc "b")  (recur (+ j 2) (conj pieces "\b"))
+                (= esc "f")  (recur (+ j 2) (conj pieces "\f"))
                 (= esc "u")
                 (do
                   (when (> (+ j 6) n) (json-parse-error! "unterminated unicode escape"))
                   (let [code (Integer/parseInt (subs s (+ j 2) (+ j 6)) 16)
                         ;; A code point above the BMP is ALWAYS written as a
-                        ;; surrogate pair in JSON, so the pair has to be
-                        ;; recognised here rather than decoded one half at a
-                        ;; time: clz strings hold code points, not UTF-16
-                        ;; units, and `(char 0xD83C)` alone is not half of
-                        ;; anything there.
+                        ;; surrogate pair in JSON; recognise the pair here so
+                        ;; the two halves are re-joined rather than emitted
+                        ;; as lone surrogates.
                         low (when (and (<= 0xD800 code 0xDBFF)
                                        (<= (+ j 12) n)
                                        (= "\\u" (subs s (+ j 6) (+ j 8))))
                               (let [l (Integer/parseInt (subs s (+ j 8) (+ j 12)) 16)]
                                 (when (<= 0xDC00 l 0xDFFF) l)))]
                     (if low
-                      (let [cp (+ 0x10000 (* 0x400 (- code 0xD800)) (- low 0xDC00))]
-                        (recur (+ j 12)
-                               (conj pieces #?(:clz (str (char cp))
-                                               :bb (str (char code) (char low))
-                                               :clj (str (char code) (char low))))))
+                      (recur (+ j 12) (conj pieces (str (char code) (char low))))
                       (recur (+ j 6) (conj pieces (str (char code)))))))
                 :else (json-parse-error! (str "invalid escape at position " j)))))
 
@@ -376,7 +360,7 @@
 ;; JSON-RPC framing
 ;; ---------------------------------------------------------------------------
 
-(defn- prune
+(defn prune
   "Drop keys whose value is nil. Optional protocol fields are omitted, never
    sent as JSON null — `\"title\": null` is not the same as an absent title
    to a validator, and several MCP fields are typed `string | undefined`."

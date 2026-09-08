@@ -12,42 +12,40 @@
 
    THE SERVER MAPPING IS PURE AND PORTABLE; the HOST is not. `handle-http`
    turns {method, headers, body-string} into {status, headers, body} using
-   nothing but clojure.core, so it runs on all three runtimes and is tested
-   as plain data. Actually binding a socket needs something the runtime
-   provides: `serve!` below uses the JDK's built-in
-   `com.sun.net.httpserver` (still zero dependencies) and is therefore JVM
-   Clojure only — Babashka does not ship that module, and clz has no HTTP
-   server builtin. On those two, host `handle-http` in whatever server you
-   already have; that is the whole integration.
+   nothing but clojure.core, so it runs on both runtimes and is tested as
+   plain data. Actually binding a socket needs a server: `serve!` below uses
+   the JDK's built-in `com.sun.net.httpserver` (still zero dependencies) and
+   is therefore JVM Clojure only, since Babashka does not ship that module.
+   That is a choice of implementation, not a capability limit — hosting under
+   bb would need a bb-only server dependency, which this namespace avoids. On
+   Babashka, host `handle-http` in whatever server you already have; that is
+   the whole integration.
 
-   THE CLIENT SIDE runs on JVM Clojure, Babashka and clz, behind the same
-   single-leaf `http-post!` pattern tools.agents.anthropic uses, including
-   its clz TLS-port refusal.
+   THE CLIENT SIDE runs on both runtimes, behind the same single-leaf
+   `http-post!` pattern tools.agents.anthropic uses.
 
    HEADER MIRRORING (SEP-2243) is the fiddly part and it is all here:
    `MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name` and `Mcp-Param-{Name}`
    mirror body fields so intermediaries can route without parsing the body,
    and the server MUST reject any mismatch with -32020 and HTTP 400. Values
    that cannot be carried as plain ASCII use the `=?base64?...?=` sentinel,
-   which is implemented here from arithmetic rather than from
-   `java.util.Base64` so it behaves identically on clz."
+   implemented here from arithmetic rather than `java.util.Base64` so that a
+   malformed sentinel fails as this library's own typed `ex-info` — which the
+   -32020 path depends on — rather than as an opaque IllegalArgumentException
+   from the JDK."
   (:require [clojure.string :as str]
             [tools.agents.mcp :as mcp]
             [tools.agents.mcp.server :as server]
-            #?@(:bb [[babashka.http-client :as bb-http]] :clj [] :clz [])))
+            #?@(:bb [[babashka.http-client :as bb-http]] :clj [])))
 
 ;; ---------------------------------------------------------------------------
 ;; UTF-8 + Base64, hand-rolled for portability
 ;; ---------------------------------------------------------------------------
 
 (defn- chars->str
-  "Join a seq of characters into a string.
-
-   `(str/join chars)` is WRONG on clz: it stringifies a character as its
-   reader form, so [\\a \\b] joins to \"\\\\a\\\\b\" rather than to \"ab\". `(str c)`
-   is correct everywhere, so each element is stringified first. `(apply str
-   chars)` is also correct but StackOverflows on clz once the sequence passes
-   ~1000 elements, which a Base64'd header value easily does."
+  "Join a seq of characters into a string. `str/join` over stringified
+   elements rather than `(apply str cs)`, which spreads one argument per
+   character — a Base64'd header value easily runs to thousands."
   [cs]
   (str/join (map str cs)))
 
@@ -58,10 +56,10 @@
 
 (defn utf8-bytes
   "UTF-8 code units of a string, as a vector of integers 0-255. Written from
-   code points rather than `(.getBytes s \"UTF-8\")` so it is identical on
-   clz, which has no Java interop. A surrogate pair is recombined into the
-   single code point it encodes — which is a no-op on clz, where a string is
-   already a sequence of code points and there are no surrogates to pair."
+   code points rather than `(.getBytes s \"UTF-8\")` so the encoder and the
+   Base64 codec below share one representation — a vector of ints — and both
+   halves of the sentinel round-trip through the same code. A surrogate pair
+   is recombined into the single code point it encodes."
   [s]
   (loop [cs (seq s) out []]
     (if-not cs
@@ -87,9 +85,8 @@
 
 (defn bytes->utf8
   "Inverse of `utf8-bytes`. A code point above the BMP comes back as the
-   surrogate pair that represents it on JVM Clojure and Babashka, and as a
-   single character on clz, whose strings are sequences of code points rather
-   than of UTF-16 units. Either way `(bytes->utf8 (utf8-bytes s))` is `s`."
+   surrogate pair that represents it, so `(bytes->utf8 (utf8-bytes s))` is
+   `s`."
   [bs]
   (loop [bs (seq bs) out []]
     (if-not bs
@@ -112,22 +109,20 @@
                      (nthnext bs 4)])]
         (recur rest-bs
                (if (> cp 0xFFFF)
-                 ;; The two runtimes disagree about what a string IS. JVM
-                 ;; Clojure and Babashka store UTF-16, so a code point above
-                 ;; the BMP is two chars and `(char cp)` throws; clz stores
-                 ;; code points, so `(char cp)` is right and a surrogate pair
-                 ;; would come back out as two replacement characters.
-                 #?(:clz (conj out (char cp))
-                    :bb (let [v (- cp 0x10000)]
-                          (conj out (char (+ 0xD800 (bit-shift-right v 10)))
-                                (char (+ 0xDC00 (bit-and v 0x3FF)))))
-                    :clj (let [v (- cp 0x10000)]
-                           (conj out (char (+ 0xD800 (bit-shift-right v 10)))
-                                 (char (+ 0xDC00 (bit-and v 0x3FF))))))
+                 ;; Strings are UTF-16, so a code point above the BMP is two
+                 ;; chars and `(char cp)` would throw — emit the pair.
+                 (let [v (- cp 0x10000)]
+                   (conj out (char (+ 0xD800 (bit-shift-right v 10)))
+                         (char (+ 0xDC00 (bit-and v 0x3FF)))))
                  (conj out (char cp))))))))
 
 (defn base64-encode
-  "Standard Base64 (RFC 4648) of a string's UTF-8 bytes, with padding."
+  "Standard Base64 (RFC 4648) of a string's UTF-8 bytes, with padding.
+
+   Sized for header values, not for large blobs: this allocates per output
+   character, which is free at the ~100-byte sentinel values it exists for
+   and roughly linear-with-a-large-constant beyond that. A megabyte-scale
+   `mcp/blob-contents` payload is better encoded by the caller."
   [s]
   (chars->str
    (mapcat (fn [group]
@@ -470,30 +465,24 @@
 ;; Leaf I/O — the only runtime-specific function in this file.
 ;; ---------------------------------------------------------------------------
 
+;; One HTTP client per process, built lazily, so a retry does not allocate a
+;; fresh selector thread (java.net.http.HttpClient had no close() before Java
+;; 21). Both are pinned to HTTP/1.1 — see http-post!'s :clj branch below.
+#?(:bb  (def ^:private bb-http-client
+          (delay (bb-http/client (assoc bb-http/default-client-opts :version :http1.1))))
+   :clj (def ^:private jvm-http-client
+          (delay (-> (java.net.http.HttpClient/newBuilder)
+                     (.version java.net.http.HttpClient$Version/HTTP_1_1)
+                     (.build)))))
+
 (defn- http-post!
   "POST body to url with headers. Returns {:status int :headers map :body
    string} on ANY HTTP response. Throws only on a genuine transport failure.
    Same shape as tools.agents.anthropic's own leaf."
   [url headers body]
-  #?(:clz
-     (let [parsed (clz.url/parse url)
-           proto  (:protocol parsed)
-           host   (:host parsed)
-           port   (or (:port parsed) (if (= proto "https") 443 80))
-           base   (or (:path parsed) "/")
-           path   (if (:query parsed) (str base "?" (:query parsed)) base)]
-       ;; The 7th argument is clz v44's explicit tls? flag. Earlier clz took
-       ;; six arguments and inferred TLS from `port == 443` alone, which meant
-       ;; an https:// endpoint on any other port was sent in PLAINTEXT — this
-       ;; leaf used to refuse that case outright rather than leak an
-       ;; Authorization header. The flag makes the scheme, not the port,
-       ;; decide, so the refusal is gone. Verified against clz v44 directly:
-       ;; port 443 + true and port 80 + false both complete, and port 80 +
-       ;; true fails in the TLS handshake — i.e. the flag drives TLS.
-       (clojure.http/request "POST" host port path headers body (= proto "https")))
-
-     :bb
-     (let [resp (bb-http/post url {:headers headers :body body :throw false})]
+  #?(:bb
+     ;; :version :http1.1 for the same reason as the :clj leaf below.
+     (let [resp (bb-http/post url {:client @bb-http-client :headers headers :body body :throw false})]
        {:status (:status resp) :headers (:headers resp) :body (:body resp)})
 
      :clj
@@ -507,7 +496,7 @@
                    (.version java.net.http.HttpClient$Version/HTTP_1_1)
                    (.POST (java.net.http.HttpRequest$BodyPublishers/ofString body))
                    (.build))
-           resp (.send (java.net.http.HttpClient/newHttpClient) req
+           resp (.send @jvm-http-client req
                        (java.net.http.HttpResponse$BodyHandlers/ofString))]
        {:status (.statusCode resp)
         :headers (into {} (map (fn [[k vs]] [k (first vs)]) (.map (.headers resp))))
@@ -576,10 +565,11 @@
   "Bind an HTTP endpoint and host `handle-http` on it, using the JDK's
    built-in com.sun.net.httpserver — still zero external dependencies.
 
-   JVM CLOJURE ONLY. Babashka does not ship the jdk.httpserver module and clz
-   has no HTTP server builtin; on those two, call `handle-http` from whatever
-   server you already run. That is the entire integration surface — it is a
-   pure function from an HTTP request map to an HTTP response map.
+   JVM CLOJURE ONLY: Babashka does not ship the jdk.httpserver module, and
+   this namespace will not take a bb-only server dependency to work around
+   that. Under bb, call `handle-http` from whatever server you already run —
+   that is the entire integration surface, a pure function from an HTTP
+   request map to an HTTP response map.
 
    Binds 127.0.0.1 by default: the spec SHOULDs localhost-only for a local
    server, because binding 0.0.0.0 exposes it to the network. Returns a map
@@ -589,10 +579,7 @@
   ([srv] (serve! srv nil))
   ([srv {:keys [port host path allowed-origins tools-by-name]
          :or {port 0 host "127.0.0.1" path "/mcp"}}]
-   #?(:clz
-      (throw (ex-info "tools.agents.mcp.http/serve!: clz has no HTTP server builtin — host handle-http yourself, or use tools.agents.mcp.stdio/serve!"
-                      {:type :tools.agents.mcp.error/unsupported-runtime}))
-      :bb
+   #?(:bb
       (throw (ex-info "tools.agents.mcp.http/serve!: Babashka does not ship com.sun.net.httpserver — host handle-http in your own server, or use tools.agents.mcp.stdio/serve!"
                       {:type :tools.agents.mcp.error/unsupported-runtime}))
       :clj

@@ -1,7 +1,5 @@
 (ns tools.agents.mcp.test-runner
-  "Entry point for `clojure -M:test-mcp` and `bb test-mcp`. clz runs the six
-   suites through its own `clz test` runner directly (see script/test-all.sh),
-   so they need no shim here.
+  "Entry point for `clojure -M:test-mcp` and `bb test-mcp`.
 
    tools.agents.mcp.stdio-child is NOT listed: it is the server half of the
    stdio end-to-end test, launched as a subprocess by

@@ -10,7 +10,7 @@ and a typed error hierarchy matching the SDK's exception classes.
 
 Sibling of [tools.agents.anthropic](anthropic.md) in this same repo — same
 architecture (single leaf for network I/O, hand-rolled portable JSON codec,
-`ex-info`-with-`:type` error hierarchy, three-runtime test matrix). The
+`ex-info`-with-`:type` error hierarchy, two-runtime test matrix). The
 handful of places where the two libraries deliberately behave *differently*
 are called out in "Divergences from tools.agents.anthropic" below; they all come
 from following the respective vendor SDK rather than each other.
@@ -88,7 +88,7 @@ yourself, exactly as the Python README's own example does:
 | `timeout` (default 10 min) / `APITimeoutError` | *(not implemented)* | Each runtime's HTTP leaf uses its own default timeout; a timeout surfaces as `:tools.agents.openai/api-connection-error` (which is also where Python's `APITimeoutError` sits in the hierarchy, as a subclass of `APIConnectionError`) and is retried like any other transport failure, exactly as the SDK does. |
 | `client.responses.create(..., stream=True)` / `client.responses.stream(...)` | **rejected outright** | See Streaming below. |
 | `client.embeddings.*` / `.images.*` / `.files.*` / `.batches.*` / `.fine_tuning.*` / Assistants / Realtime / webhooks | *(not implemented)* | Only the two text-generation resource methods are in scope for this port. `post-json!` is the shared transport, so adding another POST resource is a two-line change. |
-| `admin_api_key` / `OPENAI_ADMIN_KEY`, Workload Identity Federation, `AzureOpenAI` | *(not implemented)* | The credential chain here is explicit `:api-key` → `OPENAI_API_KEY` → throw. The SDK's fuller chain (admin keys, token-exchange workload identity, Azure's separate deployment/api-version routing) has no clz-portable equivalent and is out of scope. |
+| `admin_api_key` / `OPENAI_ADMIN_KEY`, Workload Identity Federation, `AzureOpenAI` | *(not implemented)* | The credential chain here is explicit `:api-key` → `OPENAI_API_KEY` → throw. The SDK's fuller chain (admin keys, token-exchange workload identity, Azure's separate deployment/api-version routing) is out of scope. |
 
 ### Credential resolution & headers (confirmed from openai-python source)
 
@@ -137,6 +137,12 @@ Non-status error types:
 | `:stream true` requested | `:tools.agents.openai/streaming-unsupported` |
 | response has no `"output"` / `"choices"` array, or an empty `"choices"` | `:tools.agents.openai/invalid-response` |
 | structurally wrong content (non-array `"content"`, non-string `"text"`, non-string non-null `"content"`) | `:tools.agents.openai/invalid-content-shape` |
+
+These keywords sit directly under `:tools.agents.openai/…`, not under a
+`.error` sub-namespace the way `tools.agents.anthropic` and
+`tools.agents.mcp` spell theirs. That is a frozen spelling, not an
+oversight — renaming it would break every `catch` that matches on `:type`,
+and there is nothing to gain by it.
 
 When the response body matches OpenAI's `{"error":{"message":"..."}}` shape,
 that human-readable message is extracted and appended to the thrown message
@@ -199,12 +205,11 @@ as an HTTP-date. Only the RFC-1123 date spelling is handled; the obsolete
 RFC-850 and asctime forms that Python's `email.utils.parsedate_tz` also
 accepts parse to `nil` here and fall back to exponential backoff. Date
 arithmetic is a hand-rolled `days-from-civil` rather than `java.time`, so it
-behaves identically on clz.
+adds no dependency and behaves identically on both runtimes.
 
 Delay arithmetic is integer-milliseconds throughout (the jitter numerator is
-drawn from `[751, 1000]` over 1000) — `Math/pow` and `Math/round` are not
-available on clz, and integer ms is what every runtime's sleep primitive
-wants anyway.
+drawn from `[751, 1000]` over 1000) — integer ms is what every runtime's
+sleep primitive wants anyway.
 
 ### Divergences from tools.agents.anthropic
 
@@ -221,30 +226,22 @@ purpose. If you use both, these are the places not to assume symmetry:
 | invalid `:max-retries` | **throws** `:invalid-max-retries` — must be a non-negative integer | **never throws** — negatives clamp to `0`, fractions truncate, non-numbers fall back to the default `2`; see Retries above |
 
 Everything else — the JSON codec, the leaf-I/O split, `ex-info` typing style,
-message-list helpers, the `:stream true` refusal, and the three-runtime test harness — is intentionally identical.
+message-list helpers, the `:stream true` refusal, and the two-runtime test
+harness — is intentionally identical.
 
-### Platform limitation: streaming is not supported
+### Streaming is not supported
 
 `:stream true` throws `{:type :tools.agents.openai/streaming-unsupported}`
 immediately, before any network request, rather than being silently ignored
-or hanging. This is a genuine platform gap, not an oversight:
-- `api.openai.com` is HTTPS-only.
+or hanging. SSE streaming is simply not implemented by this client.
 
-### Platform quirk: `clz test`'s namespace resolution for `examples/`
+### Requiring `examples/` from the tests
 
-`clz test`'s transitive `require` resolution (inside a file being compiled by
-the `test` subcommand) only honors an **implicit literal `./src`** search
-root — declared `-L <dir>` roots are *not* consulted there, even though a
-plain `clz -L <dir> script.clj` **does** honor arbitrary `-L` roots for its
-own top-level requires (verified empirically; this is a narrower behavior
-specific to `clz test`). Since `examples/*.clj` needs to be requireable from
-`test/tools/agents/openai/live_test.cljc` on all three runtimes, and `clz test`
-won't see it via `-L examples`, this repo ships a checked-in symlink
-`src/examples -> ../examples` so clz's implicit `./src` convention picks it
-up. JVM Clojure and Babashka instead get the repo root (`.`) added to their
-`:test-anthropic`/`:test-openai` aliases' extra paths (`deps.edn` / `bb.edn`),
-which resolves `examples.openai.basic-chat` →
-`./examples/openai/basic_chat.clj` directly, no symlink needed there.
+`examples/*.clj` is requireable from
+`test/tools/agents/openai/live_test.cljc` because the repo root (`.`) is on
+every test alias's extra paths in `deps.edn`, and on `bb.edn`'s global
+`:paths`. That resolves `examples.openai.basic-chat` →
+`./examples/openai/basic_chat.clj`.
 
 ### JSON: a small hand-rolled codec, not a dependency
 
@@ -256,40 +253,32 @@ control characters other than `\n \r \t` and backspace/form-feed are not
 
 ### Isolating runtime-specific I/O
 
-Exactly three functions in `tools/agents/openai.cljc` are runtime-specific, each
-a `#?(:clz ... :bb ... :clj ...)` reader conditional —
-
-- `http-post!` — the actual network POST. clz uses `clojure.http/request` (via
-  `clz.url/parse`). Babashka uses `babashka.http-client` (bundled by default).
-  JVM Clojure uses `java.net.http.HttpClient` (built into the JDK since 11 —
-  zero added dependency). Both JVM-backed leaves pin **HTTP/1.1** — see below.
-- `getenv` — env-var access (`sys/getenv` on clz, `System/getenv` on bb/clj).
-- `sleep!` — the retry backoff wait (clz registers `sleep` as a bare global
-  builtin and has no `Thread`; JVM/bb use `Thread/sleep`).
-
-`System/currentTimeMillis` needs no conditional — clz registers it as a
-builtin under the same name.
+Exactly one function in `tools/agents/openai.cljc` is runtime-specific:
+`http-post!`, the actual network POST, behind a `#?(:bb ... :clj ...)` reader
+conditional. Babashka uses `babashka.http-client` (bundled by default); JVM
+Clojure uses `java.net.http.HttpClient` (built into the JDK since 11 — zero
+added dependency). Both leaves pin **HTTP/1.1** — see below.
 
 Everything else — URL/header building, the JSON codec, credential resolution,
 error typing, the whole retry policy, `output-text`/`completion-text`
 extraction, the message-list helpers — is plain, portable `clojure.core`,
-exercised identically by all three test runners.
+exercised identically by both test runners.
 
 ### Why HTTP/1.1 is pinned
 
 `java.net.http.HttpClient` defaults to `HTTP_2`, and for a **cleartext**
 `http://` URL it sends the HTTP/2 connection preface without any h2c upgrade
 negotiation. A plain HTTP/1.1 reverse proxy in front of an OpenAI-compatible
-gateway answers that with a bare `502` — so the same `:base-url` worked on clz
-(whose client is HTTP/1.1-only) and failed on JVM Clojure and Babashka, which
-both sit on `java.net.http`. Observed against a live Caddy-fronted gateway,
-not theorized.
+gateway answers that with a bare `502`, so a `:base-url` that works
+everywhere else fails on JVM Clojure and Babashka, which both sit on
+`java.net.http`. Observed against a live Caddy-fronted gateway, not
+theorized.
 
 Both JVM-backed leaves therefore pin HTTP/1.1 explicitly
 (`HttpClient$Version/HTTP_1_1`; `:version :http1.1` for babashka.http-client).
 Over `https://` ALPN would have negotiated safely either way, and this client
-issues one request at a time, so HTTP/2 bought it nothing — pinning keeps all
-three runtimes on the same wire protocol.
+issues one request at a time, so HTTP/2 bought it nothing — pinning keeps
+both runtimes on the same wire protocol.
 
 ## Testing
 
@@ -298,10 +287,9 @@ resolution, client construction, `output-text`, `completion-text`, the full
 retry policy — `parse-retry-after-ms` including HTTP-dates and leap days,
 `should-retry?`, the `retry-delay-ms` backoff curve and jitter bounds —
 message helpers, `:stream true` rejection) — zero I/O, zero network, zero
-sleeping (the clock and the RNG are injected), identical on all three
-runtimes.
+sleeping (the clock and the RNG are injected), identical on both runtimes.
 
-`test/tools/agents/openai/live_test.cljc` runs a local mock server on all three
+`test/tools/agents/openai/live_test.cljc` runs a local mock server on both
 runtimes: request line and required headers, `OpenAI-Organization` /
 `OpenAI-Project` being absent when unset and present when set, `/v1`-suffixed
 base-urls (with and without a trailing slash) producing exactly
@@ -318,21 +306,17 @@ retried then typed — all with `retry-after-ms: 1` so they cost no measurable
 wall-clock), and all three `examples/*.clj` ports run end-to-end against the
 mock server.
 
-Mock server per runtime (three tiny leaves, same shape as `http-post!`): clz
-uses `clojure.http/server` + `handle` + `serve-once` (a single request per
-server instance — a persistent `serve` loop was tried first and abandoned:
-closing a listening socket does not reliably unblock an in-progress `accept()`
-on this platform, which hung the whole test process at exit). Babashka uses
-`org.httpkit.server` (`com.sun.net.httpserver.HttpServer` is not resolvable
-under bb's native image). JVM Clojure uses `com.sun.net.httpserver.HttpServer`
-(built into the JDK, zero deps). Mock ports are `18950`–`18964`, chosen not to
-collide with tools.agents.anthropic's `18930`–`18946` (`./script/test-all.sh`'s
-`clz test` invocation runs both suites' mock servers in the same process, so a
-shared port would bind twice), and `18965`–`18971` for the retry tests. Port `18999` is
-additionally used by the four tests that deliberately start *no* server
-(missing credentials, the clz TLS refusal, and the two connection-failure
-tests, which actually dial it and so assume nothing else on the host has
-`18999` bound).
+The mock server is `tools.agents.test-support/start-server!`, shared by all three provider suites — two tiny leaves, same shape as
+`http-post!`. Babashka uses `org.httpkit.server`
+(`com.sun.net.httpserver.HttpServer` is not resolvable under bb's native
+image). JVM Clojure uses `com.sun.net.httpserver.HttpServer` (built into the
+JDK, zero deps). Mock
+ports are `18950`–`18964`, chosen not to collide with
+tools.agents.anthropic's `18930`–`18946`, and `18965`–`18971` for the retry
+tests. Port `18999` is additionally used by the three tests that deliberately
+start *no* server (missing credentials and the two connection-failure tests,
+which actually dial it and so assume nothing else on the host has `18999`
+bound).
 
 A few client-construction tests read the real environment (they assert the
 defaults that apply when `OPENAI_API_KEY` / `OPENAI_ORG_ID` /
