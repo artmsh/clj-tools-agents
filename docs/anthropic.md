@@ -318,8 +318,8 @@ arity — strictly backward compatible) to accept more than a bare string:
   through verbatim.
 
 `content-blocks` (and everything above it that calls it) throws `ex-info`
-`{:type :tools.agents.anthropic.error/invalid-content-block}` — consistently
-on all three runtimes — for anything that's not a string, a map, a seqable
+`{:type :tools.agents.anthropic.error/invalid-content-block}` for anything
+that's not a string, a map, a seqable
 collection, or `nil`. A `nil` seq ITEM (as
 opposed to `items` itself) is silently dropped, not rejected — the ordinary
 `[(when include-image? (a/image-url u)) (a/text "hi")]` idiom is common
@@ -357,8 +357,8 @@ the raw wire map and hand it to `content-blocks`/`add-user-message`/
 
 This DSL came out of a 4-candidate design panel (hiccup-style tagged
 vectors, plain builder functions, a macro-templating approach, and this
-plain-data-normalizer approach) judged against simplicity, power, portability
-across all three runtimes, consistency with the existing helpers, and how
+plain-data-normalizer approach) judged against simplicity, power,
+portability, consistency with the existing helpers, and how
 pleasant it makes the tool-calling loop above — the synthesis above won on
 consistency (it widens `add-user-message`/`add-assistant-message` in place
 rather than adding a competing parallel API) and portability (plain functions
@@ -401,33 +401,22 @@ unrecognized type as a raw-JSON fallback).
 | `visualize_message(message, console=None)` | `(render-message message opts)` (pure, returns a string) + `(visualize-message message opts)` (prints it) | Split in two, unlike the Python original, specifically so the renderer itself is unit-testable with zero I/O — see `test/tools/agents/anthropic/visualize_test.cljc`. |
 | `class visualize` (context manager) | `(visualizer opts)` — a plain map holding an atom, plus `capture!`/`show-all!` | Same "no OO here" translation this library already applies to `client` (see the parity table above): a plain map, not a stateful object. |
 | `show_response(response)` | `(show-response response)` / `(show-response response opts)` | |
-| `rich.tree.Tree` / `rich.panel.Panel` / `rich.syntax.Syntax` (Rich, an added dependency) | hand-rolled ANSI tree/panel renderer, zero dependencies | No `rich`-equivalent is available on all three runtimes without adding one — same zero-dependency, data-transparency spirit as this library's own hand-rolled JSON codec. |
+| `rich.tree.Tree` / `rich.panel.Panel` / `rich.syntax.Syntax` (Rich, an added dependency) | hand-rolled ANSI tree/panel renderer, zero dependencies | No `rich`-equivalent is available on both runtimes without adding one — same zero-dependency, data-transparency spirit as this library's own hand-rolled JSON codec. |
 | `Syntax(..., theme="monokai")` per-token highlighting | single ANSI color per block | No syntax highlighter is being ported, just Rich's structural coloring (role/type/status labels). |
 | `Syntax(code, "python", line_numbers=True)` | `number-lines` — plain `<n> | <line>` prefix | Ported (the decision point was explicit, not a silent drop), minus per-token highlighting. |
 | tty / `NO_COLOR` auto-detection | explicit `{:color? true}` opt, no auto-detection | Simplicity: no new runtime-specific leaf added just for this — see below. |
 | `isinstance(dict)` / `hasattr(SDK object)` / `str` 3-way branch in `parse_content_block` | one `cond` branch | tools.agents.anthropic's `messages-create` always returns a plain decoded (string-keyed) map — there's no second, SDK-object-typed representation to bridge here, unlike the Python SDK's own `Message`/`ContentBlock` classes. |
 
-**Fully portable, unlike everything else optional in this library:** this
-file needs no `#?(:clz ... :bb ... :clj ...)` reader conditional anywhere —
-no runtime-specific leaf at all. `tools.agents.anthropic`
-itself isolates exactly two leaves (`http-post!`, `getenv`). Rendering text to
-a string and `println`-ing it needs neither.
+**No runtime-specific leaf at all:** this file needs no `#?(:bb ... :clj
+...)` reader conditional anywhere. `tools.agents.anthropic` itself isolates
+exactly two leaves (`http-post!`, `getenv`); rendering text to a string and
+`println`-ing it needs neither.
 
-**Design constraint, verified empirically:** clz's `count`/`subs` are
-BYTE-indexed, not codepoint-indexed — `(count "héllo")` is 6 on clz, 5 on JVM
-Clojure/Babashka; `(count "│")` is 3 on clz (a 3-byte UTF-8 char), 1
-elsewhere. Any Unicode box-drawing character used for the tree/panel would
-throw off width/padding math on clz alone, so this renderer uses plain ASCII
-(`+`, `-`, `|`, `` ` ``) for all structural drawing — classic `tree`-CLI
-style rather than Rich's rounded Unicode boxes, the one representation whose
-width math is correct on all three runtimes without a runtime branch.
-Truncation lengths (1000/2000/500 chars, matching the Python original) stay
-a KNOWN GAP across runtimes for the same reason: a byte count on clz vs a
-codepoint count on JVM Clojure/Babashka, so the cut point can differ and
-could in rare cases land mid-character on clz — same posture as the JSON
-codec's own documented control-character gap below: known, not fixed,
-vanishingly rare in real tool/text content, and always followed by an
-explicit truncation marker either way.
+**Plain ASCII** (`+`, `-`, `|`, `` ` ``) for all structural drawing —
+classic `tree`-CLI style rather than Rich's rounded Unicode boxes. Every
+structural character is then one column wide, which is what keeps the
+count-based width math correct without a display-width table. Truncation
+lengths (1000/2000/500 chars) match the Python original.
 
 See `test/tools/agents/anthropic/visualize_test.cljc` for the full behavioral
 coverage (every content-type renderer, truncation, color on/off, panel-border
@@ -485,25 +474,15 @@ of its own) and fixed:
 
 `:stream true` throws `{:type :tools.agents.anthropic.error/streaming-unsupported}`
 immediately, before any network request, rather than being silently ignored
-or hanging. This is a genuine platform gap, not an oversight:
-- `api.anthropic.com` is HTTPS-only.
+or hanging. SSE streaming is simply not implemented by this client.
 
+### Requiring `examples/` from the tests
 
-### Platform quirk: `clz test`'s namespace resolution for `examples/`
-
-`clz test`'s transitive `require` resolution (inside a file being compiled by
-the `test` subcommand) only honors an **implicit literal `./src`** search
-root — declared `-L <dir>` roots are *not* consulted there, even though a
-plain `clz -L <dir> script.clj` **does** honor arbitrary `-L` roots for its
-own top-level requires (verified empirically; this is a narrower behavior
-specific to `clz test`). Since `examples/*.clj` needs to be requireable from
-`test/tools/agents/anthropic/live_test.cljc` on all three runtimes, and `clz
-test` won't see it via `-L examples`, this repo ships a checked-in symlink
-`src/examples -> ../examples` so clz's implicit `./src` convention picks it
-up. JVM Clojure and Babashka instead get the repo root (`.`) added to their
-`:test-anthropic`/`:test-openai` aliases' extra paths (`deps.edn` / `bb.edn`),
-which resolves `examples.anthropic.basic-chat` →
-`./examples/anthropic/basic_chat.clj` directly, no symlink needed there.
+`examples/*.clj` is requireable from
+`test/tools/agents/anthropic/live_test.cljc` because the repo root (`.`) is
+on the `:test-anthropic`/`:test-openai` aliases' extra paths (`deps.edn` /
+`bb.edn`), which resolves `examples.anthropic.basic-chat` →
+`./examples/anthropic/basic_chat.clj`.
 
 ### JSON: a small hand-rolled codec, not a dependency
 
@@ -521,7 +500,7 @@ are not `\u00XX`-escaped on output — vanishingly rare in real message text.
 resolution, error typing, `output-text`, message helpers, the content-block
 DSL, tool-calling helpers, `request-with-retries!`'s count/backoff/Retry-After
 selection via a fake attempt-fn, `:stream true` rejection, client fail-fast)
-— zero I/O, zero network, identical on all three runtimes.
+— zero I/O, zero network, identical on both runtimes.
 
 `test/tools/agents/anthropic/live_test.cljc`: request line and required headers,
 outbound JSON preserving `messages`/`max_tokens` verbatim, credentials never
@@ -541,15 +520,8 @@ suite against its own path — happy path, non-2xx error shape, and
 `messages-create`'s coverage (a copy-paste slip dropping its retry
 pass-through, or breaking its error wiring, would otherwise pass the suite
 clean). A real retry-then-succeed round trip (for both `messages-create` and
-`count-tokens`) and the tool-calling example's 2-request loop all need a
-mock server that survives multiple requests, so those tests are
-Babashka/JVM Clojure only (`#?(:clz nil :bb ... :clj ...)`) — clz's mock
-server is deliberately serve-once (see below), so a real 2nd request has
-nothing listening to answer it; note that clz's own `#?()` reader falls back
-to matching `:clj` when no `:clz` clause is present in the form (verified
-empirically against clz v43 — unlike JVM Clojure/Babashka, an unlisted-tag
-form is NOT elided there), so an explicit `:clz nil` clause is required to
-actually suppress a test on clz, not just omitting a `:clz` branch.
+`count-tokens`) and the tool-calling example's 2-request loop each drive the
+mock server through multiple requests.
 
 `test/tools/agents/anthropic/spec_test.clj` — asserts each spec both
 accepts a valid value and REJECTS a malformed one (including the exact
@@ -563,8 +535,8 @@ constrain their functions — including one that instruments
 closing the gap where instrumenting it used to reject every correct call.
 
 `test/tools/agents/anthropic/visualize_test.cljc` — pure logic, zero I/O, run
-directly on all three runtimes (no `#?()` branching needed anywhere, unlike
-spec_test.clj — see Response visualization above): every content-type
+directly on both runtimes (no `#?()` branching needed anywhere — see Response
+visualization above): every content-type
 renderer (text, tool_use, tool_result incl. list-content and error status,
 server_tool_use with/without code, code_execution_tool_result incl. the
 no-output case, and the unrecognized-type JSON-dump fallback), truncation,
@@ -572,15 +544,10 @@ color on/off, panel-border alignment, thousands-separator grouping in the
 usage line, and `visualizer`/`capture!`/`show-all!` state (asserted via the
 returned/atom state, not by capturing stdout — `visualize-message` just
 `println`s `render-message`'s return value, so there's nothing that needs
-`with-out-str`, and therefore nothing that needs a `:clz nil` guard either).
+`with-out-str`).
 
-Mock server per runtime (three tiny leaves, same shape as `http-post!`): clz
-uses `clojure.http/server` + `handle` + `serve-once` (a single request per
-server instance — see the code comment in `live_test.cljc` for why a
-persistent `serve` loop was tried first and abandoned: closing a listening
-socket does not reliably unblock an in-progress `accept()` on this platform,
-which hung the whole test process at exit). Babashka uses
-`org.httpkit.server` — verified empirically that
+Mock server per runtime (two tiny leaves, same shape as `http-post!`):
+Babashka uses `org.httpkit.server` — verified empirically that
 `com.sun.net.httpserver.HttpServer` is not resolvable under bb's native
 image, so this is a deliberate fallback, not a default choice. JVM Clojure
 uses `com.sun.net.httpserver.HttpServer` (built into the JDK, zero deps).

@@ -1,6 +1,6 @@
 (ns tools.agents.openai-test
-  "Pure logic — zero I/O, zero network, identical on JVM Clojure, Babashka and
-   clz. Mock-server / transport-level coverage lives in
+  "Pure logic — zero I/O, zero network, identical on JVM Clojure and
+   Babashka. Mock-server / transport-level coverage lives in
    tools.agents.openai.live-test."
   (:require [clojure.test :refer [deftest is testing]]
             [tools.agents.openai :as oai]))
@@ -92,12 +92,9 @@
 
 (deftest read-json-handles-long-strings
   ;; Regression: parse-string used to accumulate one piece per character and
-  ;; join them with `(apply str pieces)`, which overflows clz's stack applying
-  ;; a function to more than a few hundred arguments. That made every response
-  ;; carrying a message longer than ~500 characters — i.e. essentially every
-  ;; real model reply — die with "Runtime error: StackOverflow" on clz while
-  ;; passing on JVM Clojure and Babashka. Both the escape-free fast path and
-  ;; the escaped slow path are exercised here at length.
+  ;; join them with `(apply str pieces)` — one argument per character of the
+  ;; response. Both the escape-free fast path and the escaped slow path are
+  ;; exercised here at length.
   (doseq [n [600 5000 50000]]
     (testing (str "plain, " n " chars")
       (let [payload (clojure.string/join "" (repeat n "x"))]
@@ -303,8 +300,8 @@
   (is (= 3000 (oai/parse-retry-after-ms {"retry-after" " 3 "} t0))))
 
 (deftest parse-retry-after-ms-is-case-insensitive-and-shape-tolerant
-  ;; clz returns wire-cased header names, java.net.http/babashka lower-case
-  ;; theirs, and a multi-value header can arrive as a vector.
+  ;; A server may send any casing, java.net.http/babashka lower-case theirs,
+  ;; and a multi-value header can arrive as a vector.
   (is (= 3000 (oai/parse-retry-after-ms {"Retry-After" "3"} t0)))
   (is (= 3000 (oai/parse-retry-after-ms {"RETRY-AFTER" "3"} t0)))
   (is (= 3000 (oai/parse-retry-after-ms {:retry-after "3"} t0)))

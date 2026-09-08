@@ -14,58 +14,27 @@
 
    NO DEPENDENCY: the Python original leans on the `rich` library (Tree,
    Panel, Syntax, Text, Console) for layout and syntax highlighting. There is
-   no rich-equivalent available on all three runtimes without adding one, so
-   this is a small hand-rolled ANSI tree+panel renderer — same
-   zero-dependency, data-transparency spirit as tools.agents.anthropic's own
-   JSON codec.
+   no rich-equivalent available on both runtimes without adding one, so this
+   is a small hand-rolled ANSI tree+panel renderer — same zero-dependency,
+   data-transparency spirit as tools.agents.anthropic's own JSON codec.
 
-   FULLY PORTABLE, UNLIKE EVERYTHING ELSE OPTIONAL IN THIS LIBRARY: this file
-   needs no #?(:clz ... :bb ... :clj ...) reader conditional anywhere — no
-   runtime-specific leaf at all. tools.agents.anthropic.spec is JVM
-   Clojure+Babashka only (clz has no clojure.spec.alpha); tools.agents.anthropic
-   itself isolates exactly two leaves (http-post!, getenv). Rendering text to
-   a string and `println`-ing it needs neither.
+   NO RUNTIME-SPECIFIC LEAF AT ALL: rendering text to a string and
+   `println`-ing it needs neither an HTTP client nor env-var access, so
+   unlike tools.agents.anthropic (http-post!, getenv) this file has no reader
+   conditional anywhere.
 
-   TWO CLZ-SPECIFIC DESIGN CONSTRAINTS, VERIFIED EMPIRICALLY (not assumed —
-   see the probe below), both worth remembering if this file is ever
-   extended:
-
-     1. clz's `count`/`subs` are BYTE-indexed, not codepoint-indexed —
-        `(count \"héllo\")` is 6 on clz, 5 on JVM Clojure/Babashka; `(count
-        \"│\")` is 3 on clz (a 3-byte UTF-8 char), 1 elsewhere. Any Unicode
-        box-drawing character (├── │ ╭╮╰╯) used for the tree/panel would
-        throw off every width/padding computation on clz alone. This file
-        therefore uses plain ASCII (`+`, `-`, `|`, backtick) for all
-        structural drawing — classic `tree`-CLI style, not Rich's rounded
-        Unicode boxes, but the one representation whose count/subs-based
-        width math is correct on all three runtimes without a runtime
-        branch. Response TEXT CONTENT (arbitrary, possibly non-ASCII) is
-        still truncated via `subs` at the same char counts as the Python
-        original (1000/2000/500) for parity — KNOWN GAP: that's a byte
-        count on clz vs a codepoint count on JVM Clojure/Babashka, so the
-        cut point can differ across runtimes and could in rare cases land
-        mid-character on clz. Same posture as tools.agents.anthropic's own
-        JSON codec control-character gap: documented, not fixed, vanishingly
-        rare in real tool/text content, and always followed by an explicit
-        truncation marker either way.
-
-     2. `clojure.string/reverse` is unverified and `(format \"%,d\" n)`
-        THROWS on clz (verified empirically — bb/clj return \"12,345\", clz
-        throws). group-digits below hand-rolls thousands-separator grouping
-        with plain subs/count arithmetic over an ASCII digit string instead
-        of relying on `format`.
+   PLAIN ASCII (`+`, `-`, `|`, backtick) for all structural drawing —
+   classic `tree`-CLI style, not Rich's rounded Unicode boxes. Every
+   structural character is then one column wide, which is what makes the
+   count-based width math below correct without a display-width table.
+   Response TEXT CONTENT (arbitrary, possibly non-ASCII) is still truncated
+   via `subs` at the same char counts as the Python original (1000/2000/500)
+   for parity.
 
    split-lines and strip-ansi below are hand-rolled char-scans rather than a
-   regex replace/split — NOT because regex is unsafe on clz (verified
-   empirically that it works fine: `re-seq`/`clojure.string/split-lines` both
-   behave correctly there), but to match tools.agents.anthropic's own JSON
-   parser, which is hand-rolled for a different reason (fine-grained error
-   positions) and happens to give a ready-made, already-proven-portable
-   peek-char/subs idiom to reuse here. That idiom stays correct under clz's
-   byte-indexed count/subs because it only ever matches single-byte ASCII
-   structural markers (\\n, ESC, '[', 'm') and copies every other byte
-   through verbatim without reinterpreting it — the same reasoning that
-   already makes read-json's \\u-escape decoding safe there.
+   regex replace/split, to match tools.agents.anthropic's own JSON parser —
+   hand-rolled there for a different reason (fine-grained error positions),
+   and giving a ready-made peek-char/subs idiom to reuse here.
 
    parse-content-block also collapses a 3-way branch the Python original
    needs (isinstance(dict) / hasattr(SDK object, gives Anthropic SDK
@@ -83,10 +52,7 @@
 ;; reason about color at all except via strip-ansi/visible-length below.
 ;; ---------------------------------------------------------------------------
 
-;; Built via `char`, not a `` string-literal escape — same reasoning as
-;; tools.agents.anthropic's BACKSPACE/FORM-FEED constants: control-character
-;; string-literal escapes are not uniformly verified across all three
-;; runtimes, `char` is.
+;; Built via `char`: a literal ESC has no string-literal escape in Clojure.
 (def ^:private ESC (str (char 27)))
 
 (def ^:private ansi-codes
@@ -101,16 +67,8 @@
 (defn- strip-ansi
   "s with every ESC[...m SGR sequence removed — used only for panel-border
    width math. Manual char-scan (see ns docstring) rather than a regex
-   replace. Joins the scanned pieces with `str/join`, NOT `(apply str
-   pieces)` — verified empirically that clz's `apply` hard-crashes
-   (StackOverflow) past ~1020 arguments, which a long response text block
-   (this library truncates at up to 2000 chars) would blow straight through
-   if collected into a per-character vector and `apply`ed; `str/join`
-   handles the same collection safely at 5000+ elements. The SAME
-   apply-with-too-many-args shape, independently, turns out to already
-   exist in tools.agents.anthropic's read-json (parse-string does `(apply str
-   pieces)` on a per-character vector too — flagged separately, not fixed
-   here, since that file is out of this port's scope)."
+   replace, joining the scanned pieces with `str/join` rather than spreading
+   a per-character vector through `apply str`."
   [s]
   (let [n (count s)]
     (loop [i 0 pieces []]
@@ -135,10 +93,8 @@
   ([s max-len marker] (if (> (count s) max-len) (str (subs s 0 max-len) marker) s)))
 
 (defn- repeat-str
-  "s repeated n times, joined. `(str/join (repeat n s))`, NOT `(apply str
-   (repeat n s))` — see strip-ansi's docstring: clz's `apply` crashes past
-   ~1020 arguments, and n here can be panel-width-sized (a long truncated
-   text line can push n past that easily)."
+  "s repeated n times, joined — `str/join`, not `apply str` over n
+   arguments; see strip-ansi's docstring."
   [n s]
   (str/join (repeat n s)))
 
@@ -215,10 +171,6 @@
   ([color? style text] (map (fn [line] (node (colorize color? style line))) (split-lines text))))
 
 (defn- render-children [children prefix]
-  ;; single-collection mapcat over [idx child] pairs, NOT the 2-collection
-  ;; form (mapcat f coll1 coll2) — verified empirically that clz's mapcat
-  ;; only supports the 1-collection arity ("Wrong number of args (3) passed
-  ;; to: mapcat" otherwise).
   (let [n (count children)]
     (mapcat
       (fn [[idx child]]
@@ -236,12 +188,8 @@
   "Wrap lines (already-rendered tree lines) in an ASCII box titled title."
   [root title]
   (let [lines (tree-lines root)
-        ;; `(reduce max 0 ...)`, NOT `(apply max 0 ...)`: apply spreads
-        ;; every line as a separate arg, the same clz apply-arg-limit crash
-        ;; this file already fixes in strip-ansi/repeat-str via str/join —
-        ;; verified empirically (~900 lines renders fine, ~1500 lines, well
-        ;; within this file's own 2000-char stdout/stderr truncation limit,
-        ;; crashes). reduce has no such arg-count limit on any runtime.
+        ;; `reduce`, not `(apply max 0 ...)`: apply spreads every line as a
+        ;; separate argument, and a long render has thousands of them.
         content-w (reduce max 0 (map visible-length lines))
         title-bar (str " " title " ")
         inner-w (+ 2 (max content-w (count title-bar)))

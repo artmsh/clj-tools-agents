@@ -10,7 +10,7 @@
    never print to stdout, and this file is where that is actually put to the
    test, because anything it leaks would corrupt the client's parse.
 
-   A .clj file, not .cljc, deliberately: clz cannot spawn a subprocess and is
+   A .clj file, not .cljc, deliberately: it is
    never given this namespace."
   (:require [examples.mcp.weather :as weather]
             [tools.agents.mcp.stdio :as stdio])

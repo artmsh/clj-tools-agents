@@ -6,21 +6,21 @@
    config=...)` resource method, typed error hierarchy).
 
    Sibling of tools.agents.anthropic and tools.agents.openai — same
-   architecture, same three runtimes, same leaf-I/O and JSON-codec design.
+   architecture, same two runtimes, same leaf-I/O and JSON-codec design.
    See README's parity tables for the google-genai parity and the deliberate
    divergences from the other two providers.
 
-   Runs unmodified on JVM Clojure, Babashka and clz. clz has no classes, so
-   the 'client object' here is a plain map built by `client`.
+   Runs unmodified on JVM Clojure and Babashka. The 'client object' here is a
+   plain map built by `client`.
 
    PORTABILITY: exactly one function does real network I/O — the private leaf
-   `http-post!` below, isolated with a #?(:clz ... :bb ... :clj ...) reader
-   conditional, same pattern as tools.agents.anthropic/tools.agents.openai's
-   own leaf I/O. Everything above it — URL/header building, the hand-rolled
-   JSON codec, error typing, credential resolution, the retry policy,
-   output-text extraction — is plain, portable clojure.core exercised
-   identically by all three test runners. Only two other leaves exist:
-   `getenv` (env-var access) and `sleep!` (retry backoff).
+   `http-post!` below, isolated with a #?(:bb ... :clj ...) reader conditional,
+   same pattern as tools.agents.anthropic/tools.agents.openai's own leaf I/O.
+   Everything above it — URL/header building, the hand-rolled JSON codec,
+   error typing, credential resolution, the retry policy, output-text
+   extraction — is plain, portable clojure.core exercised identically by both
+   test runners. Only two other leaves exist: `getenv` (env-var access) and
+   `sleep!` (retry backoff).
 
    AUTH: unlike anthropic-sdk-python's api_key/auth_token split and
    openai-python's single Bearer token, the Gemini Developer API authenticates
@@ -30,8 +30,8 @@
    precedence: explicit :api-key -> GOOGLE_API_KEY env var -> GEMINI_API_KEY
    env var -> throw (same precedence and same two env vars as python-genai's
    `get_env_api_key`, which logs a warning and prefers GOOGLE_API_KEY when
-   both are set — this library just picks GOOGLE_API_KEY silently, since none
-   of the three runtimes share a common logging facility).
+   both are set — this library just picks GOOGLE_API_KEY silently, since the
+   two runtimes share no common logging facility).
 
    URL SHAPE: unlike anthropic/openai, the model is part of the URL path, not
    the request body — `client.models.generate_content(model=\"gemini-2.5-
@@ -54,14 +54,7 @@
    inspection found in `_api_client.py`, so none is implemented here either.
    `should-retry?`/`retry-delay-ms` are pure, with the RNG injected.
 
-   CLZ GOTCHAS worked around here (verified empirically on clz v43, same as
-   tools.agents.openai): `(def x \"doc\" v)` binds the DOCSTRING as the
-   value, so every `def` below is docstring-free with a comment instead;
-   `keep-indexed` is missing; `nth`'s 3-arity default is ignored; `Math/pow`/
-   `Math/round` are missing; the string reader does not decode \\b/\\f. See
-   README's \"clz gotchas\" section.
-
-   JSON: there is no JSON library available on all three runtimes without
+   JSON: there is no JSON library available on both runtimes without
    adding a dependency, so `write-json`/`read-json` below are the same small
    hand-written codec as tools.agents.anthropic/tools.agents.openai. Map keys
    are strings or keywords passed through VERBATIM (no kebab<->snake
@@ -73,14 +66,9 @@
    STREAMING: not offered. The Gemini REST API's streaming variant is a
    SEPARATE endpoint (`:streamGenerateContent`), not a `:stream true` request
    flag the way anthropic/openai model it — so there is no flag to reject
-   here, only an absent function. clz's only HTTPS-capable request builtin
-   (clojure.http/request) does not stream, and its streaming builtin
-   (clojure.http/request-stream) does not support TLS — the same platform
-   blocker documented in tools.agents.anthropic/tools.agents.openai's ns
-   docstrings — so a `stream-generate-content` could not be implemented on
-   clz today regardless. See README's platform-limitations section."
+   here, only an absent function. See README's platform-limitations section."
   (:require [clojure.string :as str]
-            #?@(:bb [[babashka.http-client :as http]] :clj [] :clz [])))
+            #?@(:bb [[babashka.http-client :as http]] :clj [])))
 
 ;; python-genai's HttpOptions defaults (Gemini Developer API, not Vertex):
 ;; base_url = 'https://generativelanguage.googleapis.com/', api_version =
@@ -95,19 +83,10 @@
 ;; tools.agents.openai, which each store max-retries as "retries after the
 ;; first attempt" too, this is deliberately the same convention (a count of
 ;; RETRIES, not attempts), so default-max-retries = 4 here, not 5.
-;; NOTE written as a bare `def` with a comment rather than a docstring: clz
-;; binds the DOCSTRING as the var's value for `(def name "doc" value)`
-;; (verified empirically on clz v43), which silently turns this 4 into a
-;; string. Every other `def` in this file is docstring-free for the same
-;; reason; `defn` docstrings are handled correctly and are used throughout.
 (def default-max-retries 4)
 
-;; Backspace/form-feed as computed chars: clz's string-literal reader does not
-;; decode `\b`/`\f` escapes (verified empirically — they stay literal 2-char
-;; `\` + `b`/`f`), unlike `\n`/`\r`/`\t` which it decodes correctly. Building
-;; these via `char` sidesteps the gap and works identically on all runtimes.
-(def ^:private BACKSPACE (str (char 8)))
-(def ^:private FORM-FEED (str (char 12)))
+(def ^:private BACKSPACE "\b")
+(def ^:private FORM-FEED "\f")
 
 ;; ---------------------------------------------------------------------------
 ;; JSON codec — pure, portable, zero dependencies. Byte-for-byte the same
@@ -219,11 +198,6 @@
       (when (>= j n) (json-parse-error! "unterminated string"))
       (let [c (subs s j (inc j))]
         (cond
-          ;; str/join, NOT (apply str pieces): clz overflows its stack applying
-          ;; a function to a few hundred arguments, so the original `apply`
-          ;; spelling crashed on any response string longer than that — i.e.
-          ;; on essentially every real model reply. str/join is fine into the
-          ;; hundreds of thousands of pieces (verified on clz v43).
           (= c "\"") [(str/join "" pieces) (inc j)]
 
           (= c "\\")
@@ -335,26 +309,18 @@
                        {:type :tools.agents.gemini/json-parse-error})))))
 
 ;; ---------------------------------------------------------------------------
-;; Leaf I/O — the only two runtime-specific functions in this file.
+;; Leaf I/O — the only runtime-specific function in this file.
 ;; ---------------------------------------------------------------------------
 
 (defn- getenv [name]
-  #?(:clz (sys/getenv name)
-     :bb (System/getenv name)
-     :clj (System/getenv name)))
+  (System/getenv name))
 
 (defn- sleep! [millis]
-  ;; clz registers `sleep` as a bare global builtin (src/stdlib/time_builtins.zig)
-  ;; and has no Thread class; JVM/bb have no bare `sleep`.
   (let [ms (long millis)]
     (when (pos? ms)
-      #?(:clz (sleep ms)
-         :bb (Thread/sleep ms)
-         :clj (Thread/sleep ms))
+      (Thread/sleep ms)
       nil)))
 
-;; `System/currentTimeMillis` is a real builtin on all three runtimes (clz
-;; registers it in time_builtins.zig), so this one needs no reader conditional.
 (defn- now-ms [] (System/currentTimeMillis))
 
 ;; Rebindable retry sleep — same pattern as tools.agents.anthropic's
@@ -364,10 +330,8 @@
 
 ;; One HTTP client per process, built lazily — same rationale as
 ;; tools.agents.openai's own bb-http-client/jvm-http-client: avoids allocating
-;; a fresh selector thread per retry. clz's clojure.http/request is stateless,
-;; so it needs no equivalent.
-#?(:clz nil
-   :bb  (def ^:private bb-http-client
+;; a fresh selector thread per retry.
+#?(:bb  (def ^:private bb-http-client
           (delay (http/client (assoc http/default-client-opts :version :http1.1))))
    :clj (def ^:private jvm-http-client
           (delay (-> (java.net.http.HttpClient/newBuilder)
@@ -380,20 +344,7 @@
    themselves. Throws only on a genuine transport failure (DNS, connection
    refused, TLS handshake failure, timeout — no response at all)."
   [url headers body]
-  #?(:clz
-     (let [parsed (clz.url/parse url)
-           proto  (:protocol parsed)
-           host   (:host parsed)
-           port   (or (:port parsed) (if (= proto "https") 443 80))
-           base   (or (:path parsed) "/")
-           path   (if (:query parsed) (str base "?" (:query parsed)) base)]
-       ;; The 7th argument is clz v44's explicit tls? flag — see
-       ;; tools.agents.anthropic/http-post!'s comment for the full rationale
-       ;; (a plaintext fallback on a non-443 https:// base-url would otherwise
-       ;; leak the API key and full JSON body).
-       (clojure.http/request "POST" host port path headers body (= proto "https")))
-
-     :bb
+  #?(:bb
      (let [resp (http/post url {:client @bb-http-client :headers headers :body body :throw false})]
        {:status (:status resp) :headers (:headers resp) :body (:body resp)})
 
@@ -500,8 +451,8 @@
 (def ^:private retry-jitter-ms 1000)         ;; tenacity's jitter=1 (seconds)
 
 (defn- pow2 [n]
-  ;; No Math/pow on clz (see ns docstring's CLZ GOTCHAS) — n is always small
-  ;; (retries-taken, bounded by max-retries), so a plain loop is fine.
+  ;; n is always small (retries-taken, bounded by max-retries), so a plain
+  ;; loop beats Math/pow's float round-trip.
   (loop [i 0 v 1] (if (>= i n) v (recur (inc i) (* v 2)))))
 
 (defn retry-delay-ms
@@ -565,9 +516,8 @@
    "content-type"   "application/json"})
 
 (defn- own-error?
-  "True for an already-typed tools.agents.gemini/* ex-info — the clz
-   TLS-on-non-443-port refusal is this library's equivalent of an SDK-side
-   permanent error, and retrying it would be pointless as well as noisy."
+  "True for an already-typed tools.agents.gemini/* ex-info — an SDK-side
+   permanent error, which it would be pointless as well as noisy to retry."
   [e]
   (let [data (ex-data e)]
     (boolean (and data (keyword? (:type data)) (= "tools.agents.gemini" (namespace (:type data)))))))
@@ -667,8 +617,8 @@
    tools.agents.openai/completion-text handles by returning nil).
 
    Unlike the SDK, this does not warn on multiple candidates or non-text
-   parts — none of the three runtimes here share a common logging facility,
-   and a silent best-effort extraction is the more useful library default."
+   parts — the two runtimes here share no common logging facility, and a
+   silent best-effort extraction is the more useful library default."
   [response]
   (let [candidates (get response "candidates")]
     (when (and (vector? candidates) (seq candidates))
@@ -680,8 +630,6 @@
                                           (not (true? (get part "thought"))))
                                  (get part "text")))
                              parts)]
-            ;; str/join, NOT (apply str texts) — same clz stack-depth limit
-            ;; documented in the JSON parser above.
             (when (seq texts) (str/join "" texts))))))))
 
 ;; ---------------------------------------------------------------------------

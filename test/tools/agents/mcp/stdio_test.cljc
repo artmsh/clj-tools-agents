@@ -2,13 +2,12 @@
   "The stdio transport.
 
    Two halves. The first drives `connection`/`handle-line!`/`notify!` with a
-   capturing writer, so the framing rules are asserted as data on all three
-   runtimes. The second launches a REAL subprocess — `stdio-child`, which
-   serves the build-server tutorial's weather server — and drives it through
-   `connect!` over real pipes, which is the only way to prove that the
-   framing, the newline discipline and the 'never write to stdout' rule
-   actually hold end to end. clz cannot spawn a process, so it runs the first
-   half only."
+   capturing writer, so the framing rules are asserted as data. The second
+   launches a REAL subprocess — `stdio-child`, which serves the build-server
+   tutorial's weather server — and drives it through `connect!` over real
+   pipes, which is the only way to prove that the framing, the newline
+   discipline and the 'never write to stdout' rule actually hold end to
+   end."
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [tools.agents.mcp :as mcp]
@@ -237,59 +236,52 @@
     (is (some? (:parse-error res)))
     (is (= -32700 (get-in (mcp/read-json (first @written)) ["error" "code"])))))
 
-#?(:clz nil
-   :default
-   (deftest serve!-with-legacy-handshake?-completes-a-full-classic-session
-     ;; The exact sequence a classic client sends: initialize,
-     ;; notifications/initialized (no id, no response), a ping, then a
-     ;; tools/call carrying only a progressToken _meta — none of which
-     ;; plain serve! (legacy-handshake? false, the default) can answer.
-     (let [written (atom [])
-           conn (stdio/connection (a-server) {:write-fn (fn [s] (swap! written conj s))})]
-       (with-in-str (str (a-classic-initialize 1) "\n"
-                         (mcp/write-json {"jsonrpc" mcp/jsonrpc-version "method" "notifications/initialized"}) "\n"
-                         (mcp/write-json {"jsonrpc" mcp/jsonrpc-version "id" 2 "method" "ping"}) "\n"
-                         (mcp/write-json {"jsonrpc" mcp/jsonrpc-version "id" 3 "method" "tools/call"
-                                         "params" {"name" "echo" "arguments" {"m" "hi"}
-                                                   "_meta" {"progressToken" "p"}}}) "\n")
-         (stdio/serve! (a-server) {:conn conn :legacy-handshake? true}))
-       (is (= 3 (count @written))
-           "initialize + ping + tools/call answered; notifications/initialized produced nothing")
-       (is (= ["initialize-result" "ping-result" "tools/call-result"]
-              (mapv (fn [s] (let [r (mcp/read-json s)]
-                             (cond
-                               (get-in r ["result" "protocolVersion"]) "initialize-result"
-                               (= {} (get r "result")) "ping-result"
-                               :else "tools/call-result")))
-                    @written)))
-       (is (= "hi" (mcp/output-text (get (mcp/read-json (last @written)) "result")))))))
+(deftest serve!-with-legacy-handshake?-completes-a-full-classic-session
+  ;; The exact sequence a classic client sends: initialize,
+  ;; notifications/initialized (no id, no response), a ping, then a
+  ;; tools/call carrying only a progressToken _meta — none of which
+  ;; plain serve! (legacy-handshake? false, the default) can answer.
+  (let [written (atom [])
+        conn (stdio/connection (a-server) {:write-fn (fn [s] (swap! written conj s))})]
+    (with-in-str (str (a-classic-initialize 1) "\n"
+                      (mcp/write-json {"jsonrpc" mcp/jsonrpc-version "method" "notifications/initialized"}) "\n"
+                      (mcp/write-json {"jsonrpc" mcp/jsonrpc-version "id" 2 "method" "ping"}) "\n"
+                      (mcp/write-json {"jsonrpc" mcp/jsonrpc-version "id" 3 "method" "tools/call"
+                                      "params" {"name" "echo" "arguments" {"m" "hi"}
+                                                "_meta" {"progressToken" "p"}}}) "\n")
+      (stdio/serve! (a-server) {:conn conn :legacy-handshake? true}))
+    (is (= 3 (count @written))
+        "initialize + ping + tools/call answered; notifications/initialized produced nothing")
+    (is (= ["initialize-result" "ping-result" "tools/call-result"]
+           (mapv (fn [s] (let [r (mcp/read-json s)]
+                          (cond
+                            (get-in r ["result" "protocolVersion"]) "initialize-result"
+                            (= {} (get r "result")) "ping-result"
+                            :else "tools/call-result")))
+                 @written)))
+    (is (= "hi" (mcp/output-text (get (mcp/read-json (last @written)) "result"))))))
 
 ;; ---------------------------------------------------------------------------
 ;; serve! — the read loop
 ;; ---------------------------------------------------------------------------
 
-;; `with-in-str` is JVM Clojure and Babashka only (clz has no implementation),
-;; so the loop itself is exercised there; every rule it depends on is asserted
-;; above on all three runtimes.
-#?(:clz nil
-   :default
-   (deftest serve!-answers-every-line-and-stops-at-eof
-     (let [written (atom [])
-           conn (stdio/connection (a-server) {:write-fn (fn [s] (swap! written conj s))})
-           started (atom nil)
-           stopped (atom nil)]
-       (with-in-str (str (line "tools/list" nil) "\n"
-                         "\n"                       ; blank lines are framing noise
-                         "   \n"
-                         (line "tools/call" {"name" "echo" "arguments" {"m" "hi"}}) "\n")
-         (stdio/serve! (a-server) {:conn conn
-                                   :on-start (fn [c] (reset! started c))
-                                   :on-stop (fn [c] (reset! stopped c))}))
-       (is (= conn @started))
-       (is (= conn @stopped))
-       (testing "a blank line is skipped, not answered with a parse error"
-         (is (= 2 (count @written))))
-       (is (= "hi" (mcp/output-text (get (mcp/read-json (second @written)) "result")))))))
+(deftest serve!-answers-every-line-and-stops-at-eof
+  (let [written (atom [])
+        conn (stdio/connection (a-server) {:write-fn (fn [s] (swap! written conj s))})
+        started (atom nil)
+        stopped (atom nil)]
+    (with-in-str (str (line "tools/list" nil) "\n"
+                      "\n"                       ; blank lines are framing noise
+                      "   \n"
+                      (line "tools/call" {"name" "echo" "arguments" {"m" "hi"}}) "\n")
+      (stdio/serve! (a-server) {:conn conn
+                                :on-start (fn [c] (reset! started c))
+                                :on-stop (fn [c] (reset! stopped c))}))
+    (is (= conn @started))
+    (is (= conn @stopped))
+    (testing "a blank line is skipped, not answered with a parse error"
+      (is (= 2 (count @written))))
+    (is (= "hi" (mcp/output-text (get (mcp/read-json (second @written)) "result"))))))
 
 ;; ---------------------------------------------------------------------------
 ;; End to end, over real pipes
@@ -300,8 +292,7 @@
 ;; than shelling out to the `clojure` CLI: the CLI re-resolves deps on every
 ;; invocation, which turned a two-second test into a one-minute one.
 (def child-command
-  #?(:clz nil
-     :bb ["bb" "-cp" "src:test:." "-m" "tools.agents.mcp.stdio-child"]
+  #?(:bb ["bb" "-cp" "src:test:." "-m" "tools.agents.mcp.stdio-child"]
      :clj ["java" "-cp" (System/getProperty "java.class.path")
            "clojure.main" "-m" "tools.agents.mcp.stdio-child"]))
 
@@ -316,59 +307,50 @@
     (try (f c stderr)
          (finally ((:close! transport))))))
 
-#?(:clz nil
-   :default
-   (deftest end-to-end-against-the-tutorial-weather-server
-     (with-child
-       (fn [c stderr]
-         (testing "server/discover — no initialize handshake exists to perform"
-           (let [d (client/discover! c)]
-             (is (= ["2026-07-28"] (get d "supportedVersions")))
-             (is (= {"name" "weather" "version" "1.0.0"}
-                    (get-in d ["_meta" mcp/meta-server-info])))
-             (is (= {"tools" {}} (get d "capabilities")))))
+(deftest end-to-end-against-the-tutorial-weather-server
+  (with-child
+    (fn [c stderr]
+      (testing "server/discover — no initialize handshake exists to perform"
+        (let [d (client/discover! c)]
+          (is (= ["2026-07-28"] (get d "supportedVersions")))
+          (is (= {"name" "weather" "version" "1.0.0"}
+                 (get-in d ["_meta" mcp/meta-server-info])))
+          (is (= {"tools" {}} (get d "capabilities")))))
 
-         (testing "tools/list returns the tutorial's two tools"
-           (let [tools (client/list-all-tools! c)]
-             (is (= ["get_alerts" "get_forecast"] (mapv #(get % "name") tools)))
-             (is (= ["state"] (get-in (first tools) ["inputSchema" "required"])))
-             (is (= ["latitude" "longitude"]
-                    (get-in (second tools) ["inputSchema" "required"])))))
+      (testing "tools/list returns the tutorial's two tools"
+        (let [tools (client/list-all-tools! c)]
+          (is (= ["get_alerts" "get_forecast"] (mapv #(get % "name") tools)))
+          (is (= ["state"] (get-in (first tools) ["inputSchema" "required"])))
+          (is (= ["latitude" "longitude"]
+                 (get-in (second tools) ["inputSchema" "required"])))))
 
-         (testing "tools/call get_alerts formats each alert as the tutorial does"
-           (let [text (mcp/output-text (client/call-tool! c "get_alerts" {"state" "CA"}))]
-             (is (str/includes? text "Event: Flood Warning"))
-             (is (str/includes? text "Area: Sacramento County"))
-             (is (str/includes? text "Instructions: Avoid low crossings."))))
+      (testing "tools/call get_alerts formats each alert as the tutorial does"
+        (let [text (mcp/output-text (client/call-tool! c "get_alerts" {"state" "CA"}))]
+          (is (str/includes? text "Event: Flood Warning"))
+          (is (str/includes? text "Area: Sacramento County"))
+          (is (str/includes? text "Instructions: Avoid low crossings."))))
 
-         (testing "tools/call get_forecast walks points -> forecast and joins periods"
-           (let [text (mcp/output-text (client/call-tool! c "get_forecast"
-                                                          {"latitude" 38.58 "longitude" -121.49}))]
-             (is (str/includes? text "Tonight:"))
-             (is (str/includes? text "55°F"))
-             (is (str/includes? text "Tuesday:"))
-             (is (str/includes? text "Sunny."))))
+      (testing "tools/call get_forecast walks points -> forecast and joins periods"
+        (let [text (mcp/output-text (client/call-tool! c "get_forecast"
+                                                       {"latitude" 38.58 "longitude" -121.49}))]
+          (is (str/includes? text "Tonight:"))
+          (is (str/includes? text "55°F"))
+          (is (str/includes? text "Tuesday:"))
+          (is (str/includes? text "Sunny."))))
 
-         (testing "an unknown tool is a protocol error, not a result"
-           (let [e (try (client/call-tool! c "nope" {}) nil (catch Exception ex ex))]
-             (is (= :tools.agents.mcp.error/invalid-params (:type (ex-data e))))))
+      (testing "an unknown tool is a protocol error, not a result"
+        (let [e (try (client/call-tool! c "nope" {}) nil (catch Exception ex ex))]
+          (is (= :tools.agents.mcp.error/invalid-params (:type (ex-data e))))))
 
-         (testing "the server's own diagnostics went to stderr, where they belong"
-           (is (some #(str/includes? % "weather server up") @stderr)))))))
+      (testing "the server's own diagnostics went to stderr, where they belong"
+        (is (some #(str/includes? % "weather server up") @stderr))))))
 
-#?(:clz nil
-   :default
-   (deftest a-server-exits-when-its-stdin-closes
-     ;; "The server SHOULD exit when stdin is closed" — the client's shutdown
-     ;; sequence is exactly that, with no signal sent.
-     (let [transport (stdio/connect! child-command {})
-           c (client/client {:name "t" :capabilities {} :send! (:send! transport)})]
-       (client/discover! c)
-       (is (= 0 ((:close! transport)))
-           "closing stdin is the whole shutdown; a conforming server exits 0"))))
+(deftest a-server-exits-when-its-stdin-closes
+  ;; "The server SHOULD exit when stdin is closed" — the client's shutdown
+  ;; sequence is exactly that, with no signal sent.
+  (let [transport (stdio/connect! child-command {})
+        c (client/client {:name "t" :capabilities {} :send! (:send! transport)})]
+    (client/discover! c)
+    (is (= 0 ((:close! transport)))
+        "closing stdin is the whole shutdown; a conforming server exits 0")))
 
-#?(:clz
-   (deftest connect!-refuses-on-clz-rather-than-failing-obscurely
-     (let [e (try (stdio/connect! ["true"] {}) nil (catch Exception ex ex))]
-       (is (= :tools.agents.mcp.error/unsupported-runtime (:type (ex-data e))))))
-   :default nil)

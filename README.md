@@ -6,14 +6,12 @@ one Model Context Protocol implementation — under one shared base namespace
 Python SDK (`client` config map standing in for the SDK's constructor,
 resource methods matching its `create(**params)` calls, a typed `ex-info`
 error hierarchy matching its exception classes) and runs unmodified on **JVM
-Clojure**, **Babashka**, and **[clz](https://forgejo.lan/art/clz)** (v44 or
-newer — v44 changed `clojure.http/request`'s arity, and all four libraries'
-clz HTTP leaf now passes its `tls?` flag).
+Clojure** and **Babashka**.
 
 Merged from the formerly separate `corevector-anthropic` and
 `corevector-openai` repos — same architecture in both (single leaf for
 network I/O, hand-rolled portable JSON codec, `ex-info`-with-`:type` error
-hierarchy, three-runtime test matrix), now sharing one repo, one CI run, and
+hierarchy, two-runtime test matrix), now sharing one repo, one CI run, and
 one `tools.agents.*` namespace root instead of two `corevector.*` ones.
 
 | Library | Namespace | Docs |
@@ -24,9 +22,8 @@ one `tools.agents.*` namespace root instead of two `corevector.*` ones.
 | Model Context Protocol, revision 2026-07-28 — server, client, stdio & Streamable HTTP | `tools.agents.mcp` (+ `.server`, `.client`, `.stdio`, `.http`) | [docs/mcp.md](docs/mcp.md) |
 
 Each doc covers that library's usage, full API parity table against its
-vendor SDK, error hierarchy, retries, and platform notes (streaming,
-non-standard-port TLS under clz, `clz test`'s `examples/` namespace
-resolution). "Divergences from tools.agents.anthropic" in docs/openai.md
+vendor SDK, error hierarchy, retries, and platform notes (streaming, HTTP
+server hosting). "Divergences from tools.agents.anthropic" in docs/openai.md
 covers the handful of places the two deliberately behave differently —
 each follows its own vendor SDK rather than the other. docs/mcp.md's
 "The everything server, row by row" does the same for the MCP library
@@ -90,19 +87,10 @@ for the full list.
 
 Runs all four suites (anthropic + openai + gemini + mcp) on JVM Clojure
 (`clojure -M:test-anthropic` / `-M:test-openai` / `-M:test-gemini` /
-`-M:test-mcp`), Babashka (`bb test`), and clz (one `clz test` per suite), and
-fails loudly if any of the three runtimes is red for any suite. Hermetic —
-mock servers and in-process loopbacks only, no outbound network. See each
-doc's Testing section for what each suite covers.
-
-The clz stage runs one `clz test` invocation per suite rather than one for all
-thirteen files, under a 15-minute `timeout` each. Two reasons, both learned the
-hard way while every clz mock-server test was failing on the pre-v44 arity:
-a suite that parks at exit takes the results of every suite after it on the
-same command line down with it, and a suite left parked keeps its fixed mock
-ports bound into the next run, where Babashka then fails with "Address already
-in use". Nothing parks today — all three clz suites exit 0 — but the isolation
-is what makes that observable rather than inferred.
+`-M:test-mcp`) and Babashka (`bb test`), and fails loudly if either runtime
+is red for any suite. Hermetic — mock servers and in-process loopbacks only,
+no outbound network. See each doc's Testing section for what each suite
+covers.
 
 `script/live-check.sh` is OpenAI's manual, non-CI live smoke check against a
 real endpoint — see docs/openai.md's Live smoke check section.

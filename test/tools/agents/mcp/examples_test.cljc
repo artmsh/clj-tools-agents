@@ -11,7 +11,7 @@
 
    Both servers take their impure inputs — the HTTP fetch, the clock, the
    sleep, the notification sink — as arguments, so every test here is exact
-   rather than approximate, and runs on all three runtimes."
+   rather than approximate, and runs on both runtimes."
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [examples.mcp.everything :as everything]

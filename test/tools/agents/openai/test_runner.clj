@@ -1,6 +1,5 @@
 (ns tools.agents.openai.test-runner
-  "Entry point for `clojure -M:test` and `bb test`. clz runs the same files
-   through its own `clz test` runner, so there are no per-runtime test shims."
+  "Entry point for `clojure -M:test-openai` and `bb test-openai`."
   (:require [clojure.test :as t]
             tools.agents.openai-test
             tools.agents.openai.live-test))

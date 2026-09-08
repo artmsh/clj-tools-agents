@@ -91,7 +91,6 @@
 
     :completions (fn [_ctx ref argument _context]
                    (when (= "greet" (get ref "name"))
-                     ;; `vec`+`filter`, not `filterv`: clz has no filterv.
                      (vec (filter #(str/starts-with? % (get argument "value" ""))
                                   ["ada" "alan" "grace"]))))
 

@@ -48,7 +48,7 @@
        resources are ADDED to the list so that `resources/list` pagination is
        reachable — the reference server lists nothing pageable.
 
-   Run it: `clojure -M -m examples.mcp.everything` (or under bb / clz)
+   Run it: `clojure -M -m examples.mcp.everything` (or under bb)
    speaks stdio. `--http` serves Streamable HTTP on JVM Clojure."
   (:require [clojure.string :as str]
             [tools.agents.mcp :as mcp]
@@ -175,9 +175,7 @@
   "Every environment variable, as the reference server's get-env returns.
    The one runtime-specific call in this file."
   []
-  #?(:clz (into {} (map (fn [k] [k (sys/getenv k)]) (sys/environ)))
-     :bb (into {} (System/getenv))
-     :clj (into {} (System/getenv))))
+  (into {} (System/getenv)))
 
 (defn echo-tool []
   {:name "echo"
@@ -697,8 +695,7 @@
    `completions` and `resources/read` deserve a target whose bytes never
    change, and because a server with only generated resources reads as a toy."
   []
-  ;; Sorted by key, not by map entry: `(sort a-map)` returns nil on clz, so
-  ;; every ordered traversal of a map in this repo goes through its keys.
+  ;; Sorted by key, not by map entry.
   (mapv (fn [nm]
           (let [text (get static-documents nm)]
             {:name nm
@@ -760,13 +757,9 @@
   (str (System/currentTimeMillis)))
 
 (defn- default-sleep [millis]
-  ;; clz has `sleep` as a bare global builtin and no Thread class; JVM and bb
-  ;; have Thread/sleep and no bare `sleep`. Same split as tools.agents.openai.
   (let [ms (long millis)]
     (when (pos? ms)
-      #?(:clz (sleep ms)
-         :bb (Thread/sleep ms)
-         :clj (Thread/sleep ms))
+      (Thread/sleep ms)
       nil)))
 
 (defn everything-server

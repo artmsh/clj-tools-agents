@@ -1,6 +1,6 @@
 (ns tools.agents.anthropic-test
-  "Pure logic — zero I/O, zero network, identical on JVM Clojure, Babashka and
-   clz. Mock-server / transport-level coverage lives in
+  "Pure logic — zero I/O, zero network, identical on JVM Clojure and
+   Babashka. Mock-server / transport-level coverage lives in
    tools.agents.anthropic.live-test."
   (:require [clojure.test :refer [deftest is testing]]
             [tools.agents.anthropic :as a]))
@@ -86,10 +86,8 @@
 (deftest read-json-decodes-a-long-string-value-without-crashing
   ;; Regression guard: parse-string used to collect every character of a
   ;; JSON string value into a vector and spread it through `(apply str
-  ;; pieces)`, which StackOverflowed on clz (uncaught, not even reaching
-  ;; read-json's own catch clause) once a string value passed ~1000
-  ;; characters -- i.e. almost any non-trivial real Claude completion.
-  ;; str/join has no such arg-count limit on any runtime.
+  ;; pieces)` — one argument per character. str/join has no such arg-count
+  ;; limit.
   (let [long-text (clojure.string/join (repeat 1500 "x"))]
     (is (= long-text (a/read-json (a/write-json long-text)))))
   ;; Longer, and through the escaped slow path too (every 10th char is an
@@ -104,10 +102,10 @@
         (is (= text (get (a/read-json (str "{\"t\":" (a/write-json text) "}")) "t")))))))
 
 (deftest output-text-concatenates-many-blocks-without-crashing
-  ;; Same clz arg-count StackOverflow as read-json's, one arg per text BLOCK
-  ;; rather than per character: `(apply str texts)` here crashed on a
-  ;; completion carrying enough text blocks (a long tool-use turn reaches
-  ;; this). str/join has no such limit.
+  ;; Same arg-count trap as read-json's, one argument per text BLOCK rather
+  ;; than per character: `(apply str texts)` on a completion carrying enough
+  ;; text blocks (a long tool-use turn reaches this). str/join has no such
+  ;; limit.
   (let [content (vec (repeat 5000 {"type" "text" "text" "ab"}))]
     (is (= (* 2 5000) (count (a/output-text {"content" content}))))))
 
@@ -250,11 +248,8 @@
 
 (deftest content-blocks-rejects-bare-scalar-consistently
   ;; Regression guard: a bare scalar (neither string, map, nor collection)
-  ;; used to diverge across runtimes -- clz's `map`/`seq` silently treat a
-  ;; non-seqable value as empty, so content-blocks normalized it to []
-  ;; there, while JVM Clojure/Babashka threw an untyped
-  ;; java.lang.IllegalArgumentException. Now it's the same typed ex-info on
-  ;; all three runtimes.
+  ;; used to fall through to `map`/`seq` and throw an untyped
+  ;; java.lang.IllegalArgumentException. Now it's a typed ex-info.
   (doseq [bad [42 true :kw]]
     (let [e (try (a/content-blocks bad) nil (catch Exception e e))]
       (is (some? e))
@@ -543,9 +538,9 @@
   ;; the docstring's own "capped at 8s" claim. Jitter now only ever
   ;; shortens the delay (base * (1 - 0.25*rand())), same direction as
   ;; anthropic-sdk-python's own retry jitter, so the cap actually holds.
-  ;; Driven through the public request-with-retries! (rather than reaching
-  ;; into the private backoff-seconds directly) to stay portable across all
-  ;; three runtimes. 6 retries with no Retry-After header walks attempt
+  ;; Driven through the public request-with-retries! rather than reaching
+  ;; into the private backoff-seconds directly. 6 retries with no
+  ;; Retry-After header walks attempt
   ;; 0..5, which saturates the exponential base at 8.0 by attempt 4.
   (let [slept (atom [])
         calls (atom 0)

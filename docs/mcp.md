@@ -10,13 +10,12 @@ map standing in for `MCPServer(...)`, descriptor maps standing in for its
 `ctx` map standing in for its `Context`, and a typed error hierarchy matching
 its exception classes.
 
-Runs unmodified on **JVM Clojure**, **Babashka**, and
-**[clz](https://forgejo.lan/art/clz)**.
+Runs unmodified on **JVM Clojure** and **Babashka**.
 
 Third sibling of [tools.agents.anthropic](anthropic.md) and
 [tools.agents.openai](openai.md) in this repo — same architecture (single
 leaf for I/O, hand-rolled portable JSON codec, `ex-info`-with-`:type` error
-hierarchy, plain maps rather than records, three-runtime test matrix). The
+hierarchy, plain maps rather than records, two-runtime test matrix). The
 one architectural difference is forced by the problem: those two are clients
 of an HTTP API, this one is a *protocol* implementation, so its core is a
 **pure function** — `server/handle` takes a message and returns everything it
@@ -86,10 +85,10 @@ map — `mcp/tool-result`, `mcp/tool-error` and `mcp/text`/`mcp/image`/
 (:stop! endpoint)
 ```
 
-On Babashka and clz there is no bundled HTTP *server* — `http/handle-http` is
-a pure function from an HTTP request map to an HTTP response map, so hosting
-it in whatever server that runtime already has is the whole integration. The
-HTTP *client* half works on all three.
+On Babashka there is no bundled HTTP *server* — `http/handle-http` is a pure
+function from an HTTP request map to an HTTP response map, so hosting it in
+whatever server you already run is the whole integration. The HTTP *client*
+half works on both runtimes.
 
 ### Examples
 
@@ -141,7 +140,7 @@ every outgoing request so a caller cannot forget.
 
 No I/O, no globals, no clock. The transports do nothing but frame bytes and
 call it, which is why the conformance suite can assert the spec's MUSTs
-directly against `handle` on all three runtimes with no server running, and
+directly against `handle` on both runtimes with no server running, and
 why the client suite can loop a real client into a real server in-process
 without a mock at either end.
 
@@ -320,9 +319,9 @@ and, where the schema fixes one, `:data`.
 | `::error/transport` | The transport failed underneath a request |
 | `::error/unsupported-runtime` | See Platform limitations |
 
-`:type` values are flat keywords, not a `derive` hierarchy: clz has no
-`derive`, and a hierarchy that only works on two of three runtimes is worse
-than none.
+`:type` values are flat keywords, not a `derive` hierarchy: flat keywords
+compare and pattern-match the same everywhere, and nothing here needs
+hierarchical dispatch.
 
 ### Legacy-client compatibility
 
@@ -448,71 +447,29 @@ suite can assert byte-exact output rather than shapes.
 
 ### Platform limitations
 
-| | JVM Clojure | Babashka | clz |
-|---|---|---|---|
-| Server core, both transports' pure halves | ✓ | ✓ | ✓ |
-| stdio `serve!` (be a server) | ✓ | ✓ | ✓ |
-| stdio `connect!` (drive a subprocess server) | ✓ | ✓ | ✗ no subprocess spawn |
-| HTTP `connect!` | ✓ | ✓ | ✓ |
-| HTTP `serve!` | ✓ | ✗ no `com.sun.net.httpserver` | ✗ no HTTP server builtin |
+| | JVM Clojure | Babashka |
+|---|---|---|
+| Server core, both transports' pure halves | ✓ | ✓ |
+| stdio `serve!` (be a server) | ✓ | ✓ |
+| stdio `connect!` (drive a subprocess server) | ✓ | ✓ |
+| HTTP `connect!` | ✓ | ✓ |
+| HTTP `serve!` | ✓ | ✗ no `com.sun.net.httpserver` |
 
-Both `serve!` gaps throw `::error/unsupported-runtime` with the workaround in
-the message: host `http/handle-http` in whatever server that runtime has, or
-use stdio. `connect!` on clz throws the same, noting that a clz program can
-still *be* an MCP server.
-
-HTTP `connect!` on clz requires **clz v44 or newer**. v44 added a seventh
-`tls?` argument to `clojure.http/request`; on older clz every request throws
-`clojure.http/request: ArityMismatch`. That argument is also what lets an
-`https://` endpoint sit on a non-443 port — clz used to infer TLS from the
-port alone, so this leaf refused that case outright rather than send an
-`Authorization` header in plaintext. Verified against clz v44: port 443 with
-`true` and port 80 with `false` both complete, port 80 with `true` fails in
-the TLS handshake. The same change applies to `tools.agents.anthropic` and
-`tools.agents.openai`; see [docs/anthropic.md](anthropic.md).
-
-#### clz divergences that are correctness hazards, not style
-
-Each of these silently produced a *wrong value* rather than an error, and
-each is worked around at the point of use with a comment saying why the
-obvious form is wrong:
-
-- **`(def x "doc" v)` binds the docstring, not `v`.** This is why every
-  constant in these namespaces is a `;;` comment plus a docstring-free `def`,
-  and why `test/tools/agents/mcp_test.cljc` opens by asserting the literal
-  value of every one of them. A test that only exercises functions never sees
-  it; a test that reads the constants catches the whole class. (Already
-  documented as a repo-wide gotcha in [docs/openai.md](openai.md).)
-- **`(sort a-map)` returns `nil`.** Every ordered traversal of a map in this
-  repo goes through its keys instead.
-- **`(str/join chars)` stringifies a character as its reader form** — `[\a
-  \b]` joins to `"\\a\\b"`. The Base64 codec in `tools.agents.mcp.http`
-  maps `str` over the sequence first. `(apply str chars)` is also correct but
-  StackOverflows past ~1000 arguments, which a Base64'd header value reaches
-  easily.
-- **Strings hold code points, not UTF-16 units.** `(count "🎉")` is 1 and
-  `(char 128169)` works, both unlike the JVM. So `http/bytes->utf8` and the
-  JSON `\uXXXX` decoder each need a reader conditional: JSON always writes an
-  astral code point as a surrogate *pair*, so the pair has to be recombined
-  before `(char cp)` on clz, and kept as two units on the JVM.
-- No `filterv`, no `with-in-str`.
+The `serve!` gap throws `::error/unsupported-runtime` with the workaround in
+the message: host `http/handle-http` in whatever server you already run, or
+use stdio.
 
 ## Testing
 
 ```
 clojure -M:test-mcp                             # JVM Clojure
 bb test-mcp                                     # Babashka
-clz -L src -L test test test/tools/agents/mcp_test.cljc \
-    test/tools/agents/mcp/{conformance,client,http,stdio,examples}_test.cljc
 ./script/test-all.sh                            # every runtime, every library
 ```
 
-The MCP suite is green on all three: JVM 177 tests / 683 assertions, Babashka
-the same, clz 664 tests (the count differs because the reader conditionals
-that gate `with-in-str` and the subprocess tests take different branches).
-So is the rest of `test-all.sh` — anthropic 165/421 and openai 84/304 on JVM
-and Babashka, 351 and 307 on clz. `test-all.sh` runs one clz invocation per
-suite; see the README's Testing section for why.
+The MCP suite is green on both runtimes: 186 tests / 699 assertions. So is
+the rest of `test-all.sh` — anthropic 167/424, openai 84/304 and gemini
+47/126.
 
 Six suites, hermetic — no network, no fixed ports, and the only subprocess is
 this repo's own weather server.
@@ -521,7 +478,7 @@ this repo's own weather server.
   C0 escaping, framing safety, surrogate pairs), JSON-RPC framing, typed
   errors, `_meta` construction and extraction, capability helpers, content
   blocks, notifications, MRTR constructors. Opens with literal-value
-  assertions on every protocol constant, as the clz `def`-docstring tripwire.
+  assertions on every protocol constant.
 - **`conformance_test.cljc`** — one test per normative clause `server/handle`
   enforces: `resultType` on every result, `ttlMs`/`cacheScope` on every
   cacheable one, `serverInfo` stamping, `-32602` for missing or invalid
@@ -547,31 +504,24 @@ this repo's own weather server.
   this logic on a real socket. Both are thin — `serve!` binds
   `com.sun.net.httpserver` and delegates every request to `handle-http`;
   `connect!` is the private `http-post!` leaf (`java.net.http.HttpClient` on
-  JVM, `babashka.http-client` on bb, `clojure.http/request` on clz) plus
-  `parse-sse` — and testing either means binding a port, which this repo's
-  other suites have already shown to be the one thing that makes a run
-  non-hermetic. The logic underneath both is tested; the socket
-  wiring is not — and that gap is exactly what let clz v44's
-  `clojure.http/request` arity change sit undetected in `connect!`'s clz
-  branch until the anthropic and openai suites, which do exercise their own
-  identical leaf, went red on it. The fix there was therefore checked out of
-  band rather than by a test: `connect!` against a closed port on clz raises
-  `clojure.http/request: ConnectionRefused` for both `http://` and `https://`,
-  i.e. the call now reaches the network on either scheme instead of dying in
-  argument dispatch.
+  JVM, `babashka.http-client` on bb) plus `parse-sse` — and testing either
+  means binding a port, which this repo's other suites have already shown to
+  be the one thing that makes a run non-hermetic. The logic underneath both
+  is tested; the socket wiring is not. A change to either leaf therefore has
+  to be checked out of band, and the anthropic and openai suites — which do
+  exercise their own identical leaf — are the tripwire that catches it.
 - **`stdio_test.cljc`** — framing (one message per line; tool output that
   contains newlines cannot break it), `-32700` with a null id, notification
   ordering, listen/notify/cancel/close, `log!` writing nothing to stdout, and
-  a real subprocess round trip against the weather server. The `serve!` loop
-  test is JVM/bb only (clz has no `with-in-str`); a clz-only test asserts
-  `connect!` refuses cleanly. Legacy-handshake compatibility: `initialize`
+  a real subprocess round trip against the weather server.
+  Legacy-handshake compatibility: `initialize`
   answered without reaching `server/handle` (and its version-omitted
   fallback), `notifications/initialized` and `ping` handled,
   `legacy-stamp-meta` repairing a partial `_meta` without losing
   `progressToken` (asserted by checking the progress notification it still
   drives) versus leaving a well-formed one untouched, the parse-error path
   unchanged, and a full classic session end to end through `serve!
-  {:legacy-handshake? true}` (JVM/bb only, same `with-in-str` constraint).
+  {:legacy-handshake? true}`.
 - **`examples_test.cljc`** — both example servers, including every divergence
   claimed above: `resources-paginate-but-tools-do-not`,
   `static-documents-are-served-in-a-stable-order`,

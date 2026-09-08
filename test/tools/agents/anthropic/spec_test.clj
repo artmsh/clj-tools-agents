@@ -1,9 +1,7 @@
 (ns tools.agents.anthropic.spec-test
-  "JVM Clojure + Babashka only (plain .clj, mirrors tools.agents.anthropic.spec
-   itself) — never named on script/test-all.sh's `clz test` command line, so
-   clz never sees this file. Every test below asserts a spec REJECTS a
-   malformed value, not just that it accepts a good one — a spec that only
-   ever says true is not exercising anything."
+  "Plain .clj, mirroring tools.agents.anthropic.spec itself. Every test below
+   asserts a spec REJECTS a malformed value, not just that it accepts a good
+   one — a spec that only ever says true is not exercising anything."
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.spec.alpha :as s]
             [clojure.spec.test.alpha :as stest]
@@ -149,8 +147,8 @@
   ;; Regression guard for the ::tool-result-descriptor key-mismatch bug:
   ;; instrumenting add-tool-results and calling it with the EXACT shape
   ;; README.md/examples/tool_use.clj document ({:tool-use-id .. :content ..})
-  ;; must succeed, not throw a spec-conformance error. Covers all three
-  ;; :content shapes add-tool-results actually accepts (a plain string, the
+  ;; must succeed, not throw a spec-conformance error. Covers every
+  ;; :content shape add-tool-results actually accepts (a plain string, the
   ;; docstring's own bare-image-block-map example, and a mixed string/map
   ;; seq) -- a first version of this test only exercised the plain-string
   ;; case, which is exactly why the ::tool-result-content value spec being

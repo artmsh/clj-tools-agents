@@ -3,41 +3,31 @@
    the official anthropic-sdk-python client (Anthropic(...) constructor,
    client.messages.create(**params) resource method, typed error hierarchy).
 
-   Runs unmodified on JVM Clojure, Babashka and clz. clz's `defrecord` exists
-   but yields a tagged map (`{:clz/type Foo ...}`), not a JVM class — a real
-   divergence in representation between runtimes, exactly the kind of thing
-   this library avoids. So the 'client object' here is a plain map built by
-   `client`, same shape on all three runtimes.
+   Runs unmodified on JVM Clojure and Babashka. The 'client object' here is a
+   plain map built by `client` rather than a record, so it has the same shape
+   on both runtimes.
 
    PORTABILITY: exactly one function does real network I/O — the private leaf
-   `http-post!` below, isolated with a #?(:clz ... :bb ... :clj ...) reader
-   conditional, same pattern as corevector.relational.durability's leaf I/O.
+   `http-post!` below, isolated with a #?(:bb ... :clj ...) reader conditional.
    Everything above it — URL/header building, the hand-rolled JSON codec,
    error typing, credential resolution, output-text extraction — is plain,
-   portable clojure.core exercised identically by all three test runners.
-   `getenv` is the only other leaf (env-var access differs per runtime).
+   portable clojure.core exercised identically by both test runners.
 
-   JSON: there is no JSON library available on all three runtimes without
-   adding a dependency (clz and Babashka both bundle one, JVM Clojure does
-   not), so `write-json`/`read-json` below are a small hand-written codec —
-   in the same data-transparency spirit as the original Zig builtin's own
-   recursive std.json <-> CljVal conversion. It supports exactly what the
-   Messages API needs: nil/bool/number/string/keyword/vector/seq/map, with
+   JSON: there is no JSON library available on both runtimes without adding a
+   dependency (Babashka bundles one, JVM Clojure does not), so
+   `write-json`/`read-json` below are a small hand-written codec. It supports
+   exactly what the Messages API needs: nil/bool/number/string/keyword/vector/seq/map, with
    map keys as either strings or keywords passed through VERBATIM (no
-   kebab<->snake conversion — same contract as the original builtin, and
-   the same idiom the Python SDK uses with literal dict keys like
+   kebab<->snake conversion — the same idiom the Python SDK uses with
+   literal dict keys like
    \"max_tokens\"). Known gap: control characters other than \\n \\r \\t and
    backspace/form-feed are not \\u00XX-escaped on output (vanishingly rare in
    real message text) — see README.
 
-   STREAMING: :stream true is rejected with a clear error rather than
-   silently ignored. clz's only HTTPS-capable request builtin
-   (clojure.http/request) does not stream; the streaming builtin
-   (clojure.http/request-stream) does not support TLS at all. Since the real
-   api.anthropic.com host is HTTPS-only, true SSE streaming against it is not
-   implementable in clz today. See README's platform-limitations section."
+   STREAMING: not implemented. :stream true is rejected with a clear error
+   rather than silently ignored. See README's platform-limitations section."
   (:require [clojure.string :as str]
-            #?@(:bb [[babashka.http-client :as http]] :clj [] :clz [])))
+            #?@(:bb [[babashka.http-client :as http]] :clj [])))
 
 (def default-base-url "https://api.anthropic.com")
 (def ^:private anthropic-version "2023-06-01")
@@ -47,12 +37,8 @@
 ;; DEFAULT_MAX_RETRIES = 2 in both SDKs.
 (def default-max-retries 2)
 
-;; Backspace/form-feed as computed chars: clz's string-literal reader does not
-;; decode `\b`/`\f` escapes (verified empirically — they stay literal 2-char
-;; `\` + `b`/`f`), unlike `\n`/`\r`/`\t` which it decodes correctly. Building
-;; these via `char` sidesteps the gap and works identically on all runtimes.
-(def ^:private BACKSPACE (str (char 8)))
-(def ^:private FORM-FEED (str (char 12)))
+(def ^:private BACKSPACE "\b")
+(def ^:private FORM-FEED "\f")
 
 ;; ---------------------------------------------------------------------------
 ;; JSON codec — pure, portable, zero dependencies.
@@ -170,13 +156,6 @@
       (when (>= j n) (json-parse-error! "unterminated string"))
       (let [c (subs s j (inc j))]
         (cond
-          ;; `(str/join pieces)`, NOT `(apply str pieces)`: apply spreads
-          ;; every element as a separate arg, which StackOverflows on clz
-          ;; once a JSON string value's char count passes ~1000 (verified
-          ;; empirically against clz v43 — a 900-char string decodes fine, a
-          ;; 1500-char one crashes uncaught, not even reaching read-json's
-          ;; own catch clause). str/join has no such arg-count limit on any
-          ;; runtime.
           (= c "\"") [(str/join pieces) (inc j)]
 
           (= c "\\")
@@ -290,13 +269,11 @@
                        {:type :tools.agents.anthropic.error/json-parse})))))
 
 ;; ---------------------------------------------------------------------------
-;; Leaf I/O — the only two runtime-specific functions in this file.
+;; Leaf I/O — the only runtime-specific function in this file.
 ;; ---------------------------------------------------------------------------
 
 (defn- getenv [name]
-  #?(:clz (sys/getenv name)
-     :bb (System/getenv name)
-     :clj (System/getenv name)))
+  (System/getenv name))
 
 (defn- http-post!
   "POST body to url with headers. Returns {:status int :headers map :body
@@ -304,27 +281,7 @@
    themselves. Throws only on a genuine transport failure (DNS, connection
    refused, TLS handshake failure, timeout — no response at all)."
   [url headers body]
-  #?(:clz
-     (let [parsed (clz.url/parse url)
-           proto  (:protocol parsed)
-           host   (:host parsed)
-           port   (or (:port parsed) (if (= proto "https") 443 80))
-           base   (or (:path parsed) "/")
-           path   (if (:query parsed) (str base "?" (:query parsed)) base)]
-       ;; The 7th argument is clz v44's explicit tls? flag
-       ;; (src/net/http_builtins.zig). Before v44 the builtin took six
-       ;; arguments and inferred TLS from `port == 443` alone, with no
-       ;; URL-scheme awareness — so an https:// base-url on any other port (an
-       ;; entirely ordinary gateway/proxy/load-balancer setup) fell through to
-       ;; a *plaintext* TCP send, leaking credentials and the full JSON body.
-       ;; This leaf refused that case outright rather than let it happen. The
-       ;; flag makes the scheme, not the port, decide, so the refusal is gone.
-       ;; Verified against clz v44 directly: port 443 + true and port 80 +
-       ;; false both complete, and port 80 + true fails in the TLS handshake —
-       ;; i.e. the flag drives TLS.
-       (clojure.http/request "POST" host port path headers body (= proto "https")))
-
-     :bb
+  #?(:bb
      (let [resp (http/post url {:headers headers :body body :throw false})]
        {:status (:status resp) :headers (:headers resp) :body (:body resp)})
 
@@ -462,9 +419,7 @@
       (catch Exception _ nil))))
 
 ;; ---------------------------------------------------------------------------
-;; Retries — pure clojure.core, no runtime-specific leaf needed. `Thread/sleep`
-;; and `Math/pow` behave identically on JVM Clojure, Babashka and clz
-;; (verified empirically against clz v43), unlike `http-post!`/`getenv` above.
+;; Retries — pure clojure.core, no runtime-specific leaf needed.
 ;; ---------------------------------------------------------------------------
 
 (defn- retryable-status?
@@ -481,9 +436,8 @@
 ;; negative value (malformed, hostile, or from a misbehaving gateway) sails
 ;; through to *sleep-fn*/Thread-sleep and crashes the whole retry loop with
 ;; an unrelated, untyped IllegalArgumentException ("timeout value is
-;; negative" on JVM/Babashka, "sleep: negative millis" on clz) instead of
-;; either retrying or propagating the real rate-limit/5xx error — verified
-;; empirically on all three runtimes. An absurdly large-but-well-formed
+;; negative") instead of either retrying or propagating the real
+;; rate-limit/5xx error — verified empirically. An absurdly large-but-well-formed
 ;; value (a malicious/misconfigured gateway saying "retry-after: 86400")
 ;; would otherwise also be honored verbatim with no upper bound at all.
 (def ^:private max-retry-after-seconds 60.0)
@@ -523,10 +477,7 @@
       (try
         (let [n (Double/parseDouble (str v))]
           ;; `(= n n)` rather than Double/isNaN: NaN is the only value not
-          ;; equal to itself under IEEE 754, and clz has no Double/isNaN at
-          ;; all (verified: `clz -e "(Double/isNaN 5.0)"` throws "Undefined
-          ;; var: Double/isNaN") — this check is portable across all three
-          ;; runtimes instead.
+          ;; equal to itself under IEEE 754.
           (when (and (= n n) (>= n 0))
             (min n max-retry-after-seconds)))
         (catch Exception _ nil)))))
@@ -551,19 +502,11 @@
 ;; retry *count* instead of eating multi-second delays. Left bound to a real
 ;; sleep in production — same pattern as resolve-credentials' injected
 ;; getenv-fn (a testability seam, not a runtime-specific leaf).
-;;
-;; The sleep itself IS runtime-specific: clz registers `sleep` as a bare
-;; global builtin (src/stdlib/time_builtins.zig) and has no Thread class,
-;; while JVM/bb have no bare `sleep`. Written as a reader conditional inside
-;; the fn body rather than a third leaf function, to keep this file's "the
-;; only two runtime-specific functions" boundary honest.
 (def ^:dynamic *sleep-fn*
   (fn [seconds]
     (let [ms (long (* seconds 1000))]
       (when (pos? ms)
-        #?(:clz (sleep ms)
-           :bb (Thread/sleep ms)
-           :clj (Thread/sleep ms))
+        (Thread/sleep ms)
         nil))))
 
 (defn request-with-retries!
@@ -647,8 +590,8 @@
    :tools.agents.anthropic.error/api-connection. caller-name (e.g.
    \"tools.agents.anthropic/messages-create\") prefixes that error's message.
    An already-typed tools.agents.anthropic.error/* ex-info thrown by
-   http-post! itself (e.g. the clz TLS-on-non-443-port refusal) surfaces
-   verbatim instead — those are permanent, not connection failures."
+   http-post! itself surfaces verbatim instead — those are permanent, not
+   connection failures."
   [caller-name url headers body-str]
   (try
     (http-post! url headers body-str)
@@ -709,11 +652,8 @@
    <response-headers-map-or-nil>}."
   [client request]
   (when (or (true? (get request :stream)) (true? (get request "stream")))
-    (throw (ex-info (str "tools.agents.anthropic/messages-create: :stream true is not supported on "
-                          "this platform — clz's only TLS-capable HTTP builtin (clojure.http/request) "
-                          "does not stream, and its streaming builtin (clojure.http/request-stream) "
-                          "does not support TLS. api.anthropic.com is HTTPS-only, so true SSE "
-                          "streaming cannot be implemented here today. See README.")
+    (throw (ex-info (str "tools.agents.anthropic/messages-create: :stream true is not supported — "
+                          "SSE streaming is not implemented by this client. See README.")
                      {:type :tools.agents.anthropic.error/streaming-unsupported})))
   (let [caller-name "tools.agents.anthropic/messages-create"
         url         (api-url (:base-url client) "/v1/messages")
@@ -780,11 +720,6 @@
                              text)))
                        content)]
       (if (seq texts)
-        ;; `(str/join texts)`, NOT `(apply str texts)` — the same clz
-        ;; arg-count StackOverflow that parse-string above works around.
-        ;; Rarer to hit here (one arg per text BLOCK, not per character), but
-        ;; a long tool-use or multi-block completion reaches it, and the
-        ;; failure mode is identical: an uncaught crash on clz only.
         (str/join texts)
         (throw (ex-info "tools.agents.anthropic/output-text: no text content blocks found"
                          {:type :tools.agents.anthropic.error/no-text-content :status nil :body nil}))))))
@@ -824,13 +759,9 @@
    itself being anything other than a string, a map, a seqable collection,
    or nil (nil/empty items is not otherwise rejected — normalizes to [],
    matching add-tool-results' existing behavior on an empty results seq: it
-   fails at the API boundary with a 400, not locally). This top-level guard
-   matters cross-runtime: without it, a bare scalar like 42 hits `map`/`seq`
-   in the :else branch below, which throws java.lang.IllegalArgumentException
-   on JVM Clojure/Babashka but SILENTLY returns [] on clz (`(seq 42)` => nil
-   there instead of throwing) — verified empirically. Checking `coll?` up
-   front makes the reject-a-bare-scalar behavior identical on all three
-   runtimes instead of diverging."
+   fails at the API boundary with a 400, not locally). Checking `coll?` up
+   front keeps the reject-a-bare-scalar behavior explicit rather than relying
+   on `map`/`seq` in the :else branch to throw."
   [items]
   (cond
     (string? items) [{"type" "text" "text" items}]

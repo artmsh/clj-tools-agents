@@ -1,21 +1,18 @@
 (ns tools.agents.mcp-test
   "Pure logic for the core namespace — codec, JSON-RPC framing, the typed
    error hierarchy, `_meta` accessors, content blocks and the multi round-trip
-   constructors. Zero I/O, so it runs identically on JVM Clojure, Babashka and
-   clz.
+   constructors. Zero I/O, so it runs identically on JVM Clojure and Babashka.
 
    The first block is deliberately dull: it asserts the literal VALUE of every
-   module constant. That is not busywork. clz binds `(def x \"doc\" v)` to the
-   docstring rather than to `v`, silently, and a namespace built that way
-   loads perfectly and then answers -32022 to every well-formed request. A
-   test that only exercises functions never sees it; a test that reads the
-   constants catches the whole class."
+   module constant. A wrong constant loads perfectly and then answers -32022
+   to every well-formed request; a test that only exercises functions never
+   sees it."
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [tools.agents.mcp :as mcp]))
 
 ;; ---------------------------------------------------------------------------
-;; Constants — the clz def-docstring tripwire
+;; Constants — the protocol values, asserted literally
 ;; ---------------------------------------------------------------------------
 
 (deftest protocol-constants-have-their-literal-values
@@ -99,8 +96,8 @@
   (is (= "ä" (mcp/read-json "\"\\u00e4\"")))
   (is (= "ä" (mcp/read-json "\"ä\"")))
   (testing "a code point above the BMP arrives as a surrogate PAIR of escapes"
-    ;; The two halves must be decoded together: on clz a string is a sequence
-    ;; of code points, so half a pair is not half of anything.
+    ;; The two halves must be decoded together — a lone surrogate is not a
+    ;; character.
     (is (= "🎉" (mcp/read-json "\"\\ud83c\\udf89\"")))
     (is (= "a🎉b" (mcp/read-json "\"a\\ud83c\\udf89b\"")))))
 

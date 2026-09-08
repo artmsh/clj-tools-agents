@@ -4,16 +4,13 @@
 
    THE SERVER HALF IS PORTABLE WITH NO LEAF AT ALL. It needs `read-line`,
    `println`, `*err*` and `flush`, every one of which is plain clojure.core
-   on JVM Clojure, Babashka and clz alike — so unlike tools.agents.anthropic
-   and tools.agents.openai, which each isolate an HTTP leaf behind a reader
+   on JVM Clojure and Babashka alike — so unlike tools.agents.anthropic and
+   tools.agents.openai, which each isolate an HTTP leaf behind a reader
    conditional, this namespace's server path has nothing runtime-specific in
-   it beyond a write lock that only a multi-threaded runtime needs.
+   it at all.
 
-   THE CLIENT HALF LAUNCHES A SUBPROCESS and is therefore JVM Clojure and
-   Babashka only; clz has no process-spawning builtin, and `connect!` says so
-   rather than failing obscurely. Nothing else in this library is affected:
-   a clz program can still BE an MCP server, and can still be an MCP client
-   over `tools.agents.mcp.http`.
+   THE CLIENT HALF LAUNCHES A SUBPROCESS via java.lang.ProcessBuilder, which
+   both runtimes provide.
 
    FRAMING RULES THIS ENFORCES (specification/2026-07-28/basic/transports/stdio):
 
@@ -60,9 +57,7 @@
     (flush)))
 
 (defn- new-lock []
-  #?(:clz nil
-     :bb (Object.)
-     :clj (Object.)))
+  (Object.))
 
 (defn- write-line!
   "Write one framed message. Serialized against concurrent writers, because a
@@ -70,9 +65,7 @@
    handling writes from this one, and two interleaved half-lines are two
    corrupt messages."
   [lock s]
-  #?(:clz (do (println s) (flush))
-     :bb (locking lock (println s) (flush))
-     :clj (locking lock (println s) (flush))))
+  (locking lock (println s) (flush)))
 
 ;; ---------------------------------------------------------------------------
 ;; Connection
@@ -305,106 +298,52 @@
 
    The server's stderr is drained on its own thread into `:on-stderr`
    (default: discard). The spec says a client SHOULD NOT treat stderr output
-   as indicating an error.
-
-   Not available on clz, which has no process-spawning builtin."
+   as indicating an error."
   [command {:keys [on-notification on-stderr env]
             :or {on-notification (fn [_])}}]
-  #?(:clz
-     (throw (ex-info (str "tools.agents.mcp.stdio/connect!: clz cannot spawn a subprocess, "
-                          "so it cannot drive a stdio MCP server. A clz program can still BE "
-                          "a stdio server (serve! is fully portable), and can be a client over "
-                          "tools.agents.mcp.http.")
-                     {:type :tools.agents.mcp.error/unsupported-runtime :command command}))
-     :bb (let [pb (java.lang.ProcessBuilder. ^java.util.List (vec command))
-           _ (when (seq env)
-               (let [m (.environment pb)]
-                 (doseq [[k v] env] (.put m (str (if (keyword? k) (name k) k)) (str v)))))
-           proc (.start pb)
-           w (java.io.BufferedWriter. (java.io.OutputStreamWriter. (.getOutputStream proc) "UTF-8"))
-           r (java.io.BufferedReader. (java.io.InputStreamReader. (.getInputStream proc) "UTF-8"))
-           e (java.io.BufferedReader. (java.io.InputStreamReader. (.getErrorStream proc) "UTF-8"))
-           lock (Object.)]
-       ;; A DAEMON thread, not `future`: clojure.core/future runs on the agent
-       ;; send-off pool, whose non-daemon threads keep a JVM alive for a full
-       ;; minute after main returns. A transport must not hold its host open.
-       (doto (Thread. ^Runnable (fn [] (loop []
-                                         (when-let [l (.readLine e)]
-                                           (when on-stderr (on-stderr l))
-                                           (recur)))))
-         (.setDaemon true)
-         (.start))
-       {:process proc
-        :reader r
-        :writer w
-        ;; Shutdown as the spec defines it: close the child's stdin and wait.
-        ;; A conforming server exits on EOF, so no signal is needed.
-        :close! (fn [] (.close w) (.waitFor proc))
-        :send!
-        (fn [msg]
-          ;; Write and read under one lock: this transport is synchronous
-          ;; request/response. A `subscriptions/listen` stream never produces
-          ;; the response this would wait for, so drive one off :reader
-          ;; directly rather than through :send!.
-          (locking lock
-            (.write w (mcp/write-json msg))
-            (.newLine w)
-            (.flush w)
-            (when (mcp/request? msg)
-              (loop []
-                (let [line (.readLine r)]
-                  (when (nil? line)
-                    (throw (ex-info "tools.agents.mcp.stdio: server closed its output stream before responding"
-                                    {:type :tools.agents.mcp.error/transport :request msg})))
-                  (let [m (mcp/read-json line)]
-                    (if (and (map? m)
-                             (= (get m "id") (get msg "id"))
-                             (or (contains? m "result") (contains? m "error")))
-                      m
-                      (do (on-notification m) (recur)))))))))})
-     :clj (let [pb (java.lang.ProcessBuilder. ^java.util.List (vec command))
-           _ (when (seq env)
-               (let [m (.environment pb)]
-                 (doseq [[k v] env] (.put m (str (if (keyword? k) (name k) k)) (str v)))))
-           proc (.start pb)
-           w (java.io.BufferedWriter. (java.io.OutputStreamWriter. (.getOutputStream proc) "UTF-8"))
-           r (java.io.BufferedReader. (java.io.InputStreamReader. (.getInputStream proc) "UTF-8"))
-           e (java.io.BufferedReader. (java.io.InputStreamReader. (.getErrorStream proc) "UTF-8"))
-           lock (Object.)]
-       ;; A DAEMON thread, not `future`: clojure.core/future runs on the agent
-       ;; send-off pool, whose non-daemon threads keep a JVM alive for a full
-       ;; minute after main returns. A transport must not hold its host open.
-       (doto (Thread. ^Runnable (fn [] (loop []
-                                         (when-let [l (.readLine e)]
-                                           (when on-stderr (on-stderr l))
-                                           (recur)))))
-         (.setDaemon true)
-         (.start))
-       {:process proc
-        :reader r
-        :writer w
-        ;; Shutdown as the spec defines it: close the child's stdin and wait.
-        ;; A conforming server exits on EOF, so no signal is needed.
-        :close! (fn [] (.close w) (.waitFor proc))
-        :send!
-        (fn [msg]
-          ;; Write and read under one lock: this transport is synchronous
-          ;; request/response. A `subscriptions/listen` stream never produces
-          ;; the response this would wait for, so drive one off :reader
-          ;; directly rather than through :send!.
-          (locking lock
-            (.write w (mcp/write-json msg))
-            (.newLine w)
-            (.flush w)
-            (when (mcp/request? msg)
-              (loop []
-                (let [line (.readLine r)]
-                  (when (nil? line)
-                    (throw (ex-info "tools.agents.mcp.stdio: server closed its output stream before responding"
-                                    {:type :tools.agents.mcp.error/transport :request msg})))
-                  (let [m (mcp/read-json line)]
-                    (if (and (map? m)
-                             (= (get m "id") (get msg "id"))
-                             (or (contains? m "result") (contains? m "error")))
-                      m
-                      (do (on-notification m) (recur)))))))))})))
+  (let [pb (java.lang.ProcessBuilder. ^java.util.List (vec command))
+        _ (when (seq env)
+            (let [m (.environment pb)]
+              (doseq [[k v] env] (.put m (str (if (keyword? k) (name k) k)) (str v)))))
+        proc (.start pb)
+        w (java.io.BufferedWriter. (java.io.OutputStreamWriter. (.getOutputStream proc) "UTF-8"))
+        r (java.io.BufferedReader. (java.io.InputStreamReader. (.getInputStream proc) "UTF-8"))
+        e (java.io.BufferedReader. (java.io.InputStreamReader. (.getErrorStream proc) "UTF-8"))
+        lock (Object.)]
+    ;; A DAEMON thread, not `future`: clojure.core/future runs on the agent
+    ;; send-off pool, whose non-daemon threads keep a JVM alive for a full
+    ;; minute after main returns. A transport must not hold its host open.
+    (doto (Thread. ^Runnable (fn [] (loop []
+                                      (when-let [l (.readLine e)]
+                                        (when on-stderr (on-stderr l))
+                                        (recur)))))
+      (.setDaemon true)
+      (.start))
+    {:process proc
+     :reader r
+     :writer w
+     ;; Shutdown as the spec defines it: close the child's stdin and wait.
+     ;; A conforming server exits on EOF, so no signal is needed.
+     :close! (fn [] (.close w) (.waitFor proc))
+     :send!
+     (fn [msg]
+       ;; Write and read under one lock: this transport is synchronous
+       ;; request/response. A `subscriptions/listen` stream never produces
+       ;; the response this would wait for, so drive one off :reader
+       ;; directly rather than through :send!.
+       (locking lock
+         (.write w (mcp/write-json msg))
+         (.newLine w)
+         (.flush w)
+         (when (mcp/request? msg)
+           (loop []
+             (let [line (.readLine r)]
+               (when (nil? line)
+                 (throw (ex-info "tools.agents.mcp.stdio: server closed its output stream before responding"
+                                 {:type :tools.agents.mcp.error/transport :request msg})))
+               (let [m (mcp/read-json line)]
+                 (if (and (map? m)
+                          (= (get m "id") (get msg "id"))
+                          (or (contains? m "result") (contains? m "error")))
+                   m
+                   (do (on-notification m) (recur)))))))))}))

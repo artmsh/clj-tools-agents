@@ -94,9 +94,8 @@
 
 (defn server
   "Build a server. Returns a plain map — the same 'client object is a plain
-   map' choice tools.agents.anthropic makes, and for the same reason: clz's
-   `defrecord` yields a tagged map rather than a JVM class, so a record here
-   would be a real representation divergence between runtimes.
+   map' choice tools.agents.anthropic makes: a server is data you can print,
+   diff and assemble, not an opaque record.
 
    Identity — :name (required), :version (default \"0.0.0\"), :title,
    :description, :website-url, :icons, :instructions.
@@ -279,7 +278,7 @@
 
 ;; ---------------------------------------------------------------------------
 ;; URI templates — RFC 6570 simple string expansion, matched without regex so
-;; the behaviour is byte-identical on all three runtimes.
+;; the behaviour is byte-identical on both runtimes.
 ;; ---------------------------------------------------------------------------
 
 (defn parse-uri-template

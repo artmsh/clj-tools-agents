@@ -6,8 +6,8 @@
      clj -Sdeps '{:aliases {:spec {:extra-paths [\".spec\"]}}}' -M:spec
      (require 'tools.agents.openai.specs.alpha)
 
-   JVM Clojure only. clz has no clojure.spec.alpha at all and babashka does
-   not bundle it — the same constraint tools.agents.anthropic.spec documents.
+   JVM Clojure only — Babashka does not bundle clojure.spec.alpha, the same
+   constraint tools.agents.anthropic.spec documents.
 
    Data specs are registered under the SOURCE namespace's keywords
    (:tools.agents.openai/…, spelled ::oai/… via the alias below), not under this
@@ -149,11 +149,11 @@
 ;; Retry policy
 ;; ---------------------------------------------------------------------------
 
-;; A response header map as the three runtime leaves actually deliver it, per
+;; A response header map as the runtime leaves actually deliver it, per
 ;; `header-value`'s own docstring: nil or a map whose keys may be strings
-;; (clz keeps the wire casing "Retry-After"; java.net.http and
-;; babashka.http-client lower-case theirs) or keywords, and whose values are a
-;; single string or a vector of strings for a multi-value header.
+;; (java.net.http and babashka.http-client lower-case theirs, a server may
+;; send any casing) or keywords, and whose values are a single string or a
+;; vector of strings for a multi-value header.
 (s/def ::oai/http-headers
   (s/nilable
     (s/map-of (s/or :string string? :keyword keyword?)

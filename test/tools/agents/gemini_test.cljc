@@ -1,6 +1,6 @@
 (ns tools.agents.gemini-test
-  "Pure logic — zero I/O, zero network, identical on JVM Clojure, Babashka and
-   clz. Mock-server / transport-level coverage lives in
+  "Pure logic — zero I/O, zero network, identical on JVM Clojure and
+   Babashka. Mock-server / transport-level coverage lives in
    tools.agents.gemini.live-test."
   (:require [clojure.test :refer [deftest is]]
             [tools.agents.gemini :as g]))

@@ -3,13 +3,8 @@
    is git-dep-only, never released to Maven Central, and absent from
    Babashka) definitions for tools.agents.anthropic.
 
-   JVM Clojure + Babashka ONLY. clz has no clojure.spec.alpha implementation
-   at all (verified empirically against clz v43:
-   `(require '[clojure.spec.alpha :as s])` throws \"Undefined var:
-   clojure.spec.alpha/def\"). This file is a plain .clj, never required by
-   tools.agents.anthropic.cljc itself, and never named on script/test-all.sh's
-   `clz test` command line — loading it has zero effect on clz; require it
-   explicitly yourself when running on JVM Clojure/Babashka.
+   This file is a plain .clj, never required by tools.agents.anthropic.cljc
+   itself — require it explicitly yourself when you want the specs.
 
    THE STRING-KEYED TRAP: the Messages API wire format (request/response
    maps — \"model\"/\"max_tokens\"/\"messages\"/content blocks/etc.) is

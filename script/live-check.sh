@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Live smoke check against a real OpenAI-compatible endpoint, on all three
+# Live smoke check against a real OpenAI-compatible endpoint, on both
 # runtimes. NOT part of CI — script/test-all.sh stays hermetic. This is the
 # manual counterpart that proves the client works against a live gateway
 # rather than only against a mock this repo wrote itself.
@@ -22,7 +22,7 @@ if [ -z "${OPENAI_API_KEY:-}" ]; then
 fi
 
 fail=0
-for runtime in "clojure -M" "bb" "clz -L src"; do
+for runtime in "clojure -M" "bb"; do
   echo "── ${runtime} ─────────────────────────────"
   # shellcheck disable=SC2086
   $runtime script/live_check.clj || fail=1
