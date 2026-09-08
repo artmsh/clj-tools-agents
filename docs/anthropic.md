@@ -50,17 +50,17 @@ Programmatic Tool Calling below.
 
 | Python SDK | tools.agents.anthropic | Notes |
 |---|---|---|
-| `Anthropic(api_key=..., auth_token=..., base_url=...)` | `(client {:api-key ... :auth-token ... :base-url ... :max-retries ...})` | Returns a plain config map, not an object. **Resolved:** clz's `defrecord` *does* exist, but it yields a tagged map (`{:clz/type Foo ...}`), not a JVM class — a real divergence in runtime representation, exactly what this library avoids elsewhere. A plain map, same shape on all three runtimes, is the correct answer here, not a stopgap — the earlier "clz has no classes, TODO return defrecord" framing was simply wrong about *why* a map is right. |
+| `Anthropic(api_key=..., auth_token=..., base_url=...)` | `(client {:api-key ... :auth-token ... :base-url ... :max-retries ...})` | Returns a plain config map, not an object. |
 | `client.messages.create(**params)` | `(messages-create client params)` | `params` is a plain map passed through to JSON almost verbatim. |
 | `message.content[0].text` | `(output-text response)` | Concatenates ALL `"text"` blocks (not just the first) — matches the original Zig builtin's contract; throws instead of ever returning `nil`. |
 | dict key `"max_tokens"` | map key `"max_tokens"` or `:max_tokens` | Both string and keyword keys are accepted and encoded **verbatim** via `name` — no kebab-case↔snake_case conversion. Write `:max_tokens`, not `:max-tokens`. **Resolved, kept as-is:** this is a deliberate data-transparency contract (matches the original Zig builtin and the Python SDK's own literal dict keys), not a gap — converting to kebab-only would be a breaking design change in the wrong direction. If you want kebab-case authoring, use the message content-block DSL below, which is sugar *on top of* the verbatim wire format rather than a replacement for it. |
-| `anthropic.APIError` / `.APIStatusError` / `.RateLimitError` / etc. | `ex-info` with `:type` in `ex-data` | See the error-hierarchy table below — one exception constructor, discriminated by `:type`, rather than a Python-style class hierarchy (there is no `class` in Clojure/clz to mirror it with). |
+| `anthropic.APIError` / `.APIStatusError` / `.RateLimitError` / etc. | `ex-info` with `:type` in `ex-data` | See the error-hierarchy table below — one exception constructor, discriminated by `:type`, rather than a Python-style class hierarchy (there is no `class` in Clojure to mirror it with). |
 | `client.with_options(...)` | *(not implemented)* | Per-request override without mutating the client. Out of scope for this port; `client` is a plain map, so callers can just `(assoc client :base-url ...)` themselves. |
 | `max_retries` / automatic backoff | `:max-retries` client opt, default 2 | **Resolved, implemented.** See Retries below. |
-| `client.messages.stream(...)` / `stream=True` | **rejected outright** | Not resolved — this is a genuine, re-verified platform blocker, not an open TODO. clz's streaming HTTP builtin (`clojure.http/request-stream`) still refuses TLS as of clz v44 (re-checked empirically 2026-08-30: it takes v44's `tls?` flag and throws `TlsNotSupported` anyway) — see Streaming below for why that rules out true SSE streaming on clz today, and why this library rejects `:stream true` uniformly on all three runtimes rather than build a JVM/Babashka-only path. |
+| `client.messages.stream(...)` / `stream=True` | **rejected outright** | Not resolved — this is  an open TODO. |
 | `client.messages.count_tokens(...)` | `(count-tokens client request)` | **Resolved, implemented** — same request shape as `messages-create` minus `max_tokens`, same retry policy and error hierarchy, POSTs to `/v1/messages/count_tokens`. |
-| `.batches.*` | *(not implemented)* | Kept out of scope — a whole separate resource family (create/retrieve/list/cancel/JSONL results), unlike `count_tokens`'s single endpoint; only `messages-create` was in the original Zig builtin's contract. |
-| Workload Identity Federation / `ant auth login` OAuth profile / `ANTHROPIC_PROFILE` | *(not implemented)* | The credential chain here is explicit-arg → `ANTHROPIC_API_KEY` → `ANTHROPIC_AUTH_TOKEN` → throw. The Python SDK's fuller chain (OAuth profile, WIF env vars, default disk profile) has no clz-portable equivalent (no local OAuth token store, no cloud SDKs) and is out of scope. |
+| `.batches.*` | *(not implemented)* | Kept out of scope — a whole separate resource family (create/retrieve/list/cancel/JSONL results), unlike `count_tokens`'s single endpoint. |
+| Workload Identity Federation / `ant auth login` OAuth profile / `ANTHROPIC_PROFILE` | *(not implemented)* | The credential chain here is explicit-arg → `ANTHROPIC_API_KEY` → `ANTHROPIC_AUTH_TOKEN` → throw. The Python SDK's fuller chain (OAuth profile, WIF env vars, default disk profile) is out of scope. |
 | `tools=[...]` / manual `tool_use`/`tool_result` handling | `"tools"` passes straight through `messages-create`; `tool-use?`/`tool-calls`/`add-tool-results`/`add-tool-result` add the response-side/reply-side ergonomics | **New.** See Tool calling below. |
 | `client.beta.messages.create(..., betas=[...])` (Programmatic Tool Calling and other beta features) | `:betas` client opt → comma-joined `anthropic-beta` header | **New.** See Credential resolution below and Programmatic Tool Calling below. |
 | `message._request_id` | `(request-id response)` | **Resolved.** The Python SDK hangs this off a hidden attribute on the response object; `messages-create`/`count-tokens` return a plain map, verbatim, per the data-transparency contract above — so the `request-id` response header is carried as Clojure metadata on that same map instead (out of the way of equality, printing, and JSON re-encoding) and `request-id` reads it back. Returns `nil` for a hand-built map or a response genuinely missing the header. For most logging/correlation purposes the response body's own `"id"` field (`msg_...`) needs no accessor and works just as well. |
@@ -320,12 +320,7 @@ arity — strictly backward compatible) to accept more than a bare string:
 `content-blocks` (and everything above it that calls it) throws `ex-info`
 `{:type :tools.agents.anthropic.error/invalid-content-block}` — consistently
 on all three runtimes — for anything that's not a string, a map, a seqable
-collection, or `nil`. (An earlier version relied on `map`/`seq` to reject a
-bare scalar like `42` implicitly, which diverged across runtimes: clz's
-`map`/`seq` silently treat a non-seqable value as empty, normalizing to `[]`
-with no error at all, while JVM Clojure/Babashka threw an untyped
-`IllegalArgumentException`. An explicit `coll?` guard makes the reject
-outcome — and its `:type` — identical everywhere.) A `nil` seq ITEM (as
+collection, or `nil`. A `nil` seq ITEM (as
 opposed to `items` itself) is silently dropped, not rejected — the ordinary
 `[(when include-image? (a/image-url u)) (a/text "hi")]` idiom is common
 Clojure, not malformed input, and used to throw once the top-level guard
@@ -367,7 +362,7 @@ across all three runtimes, consistency with the existing helpers, and how
 pleasant it makes the tool-calling loop above — the synthesis above won on
 consistency (it widens `add-user-message`/`add-assistant-message` in place
 rather than adding a competing parallel API) and portability (plain functions
-over string-keyed maps, no macros, no new grammar to hand-verify on clz).
+over string-keyed maps, no macros, no new grammar).
 
 ### Response visualization
 
@@ -414,8 +409,7 @@ unrecognized type as a raw-JSON fallback).
 
 **Fully portable, unlike everything else optional in this library:** this
 file needs no `#?(:clz ... :bb ... :clj ...)` reader conditional anywhere —
-no runtime-specific leaf at all. `tools.agents.anthropic.spec` is JVM
-Clojure+Babashka only (clz has no `clojure.spec.alpha`); `tools.agents.anthropic`
+no runtime-specific leaf at all. `tools.agents.anthropic`
 itself isolates exactly two leaves (`http-post!`, `getenv`). Rendering text to
 a string and `println`-ing it needs neither.
 
@@ -435,85 +429,12 @@ codec's own documented control-character gap below: known, not fixed,
 vanishingly rare in real tool/text content, and always followed by an
 explicit truncation marker either way.
 
-**Two clz bugs found and worked around while building this** (both
-independent of the byte-indexing constraint above, and both worth knowing
-about beyond this file):
-
-- **`apply` hard-crashes (StackOverflow) past roughly 1020 arguments on
-  clz**, verified empirically (`(apply str (repeat 1000 "x"))` is fine,
-  `(apply str (repeat 1024 "x"))` is not — and the exact threshold shifts
-  lower with however much call-stack depth is already in use, so it isn't a
-  fixed magic number to code against). This renderer builds per-character
-  vectors (`strip-ansi`) and per-line padding whose length tracks a truncated
-  response's length — comfortably past 1020 for the 2000-char stdout/stderr
-  truncation limit alone — so every such spot uses `(str/join coll)` instead
-  of `(apply str coll)` (`str/join` is verified safe well past 5000
-  elements). `panel`'s content-width computation (`(apply max 0 (map
-  visible-length lines))`) had the identical defect — the same fix
-  (`reduce max` instead) is applied there too; a code_execution_tool_result
-  with ~1500 lines of stdout (well within the 2000-char truncation limit)
-  used to crash `render-message` on clz. **This exact defect shape already
-  existed, independently, in `tools.agents.anthropic`'s own `read-json`**
-  (`parse-string`'s per-character `pieces` vector was joined via `(apply str
-  pieces)`) — reproduced directly (not inferred): `(a/read-json
-  "{\"t\":\"<900 chars>\"}")` decoded correctly on clz, `(a/read-json
-  "{\"t\":\"<1000 chars>\"}")` StackOverflowed, in a minimal script with none
-  of this port's own call-stack depth in the way — so a real API response
-  body with a JSON string value anywhere past roughly 900–1000 characters
-  (i.e. almost any non-trivial assistant reply) crashed `read-json`, and
-  therefore `messages-create`, on clz. **Since fixed** with the same
-  `apply str` → `str/join` swap on that one `pieces` vector (see `parse-string`
-  in `anthropic.cljc`), with a regression test (`read-json-decodes-a-long-
-  string-value-without-crashing`) pinning it.
-- **`(def name "doc-string" value)` — standard Clojure's 3-arity docstring
-  form for `def` — is not honored on clz**: it silently treats the
-  doc-string as the var's VALUE and drops the real init form entirely
-  (verified empirically: `(def x "doc" {:a 1})` makes `x` the string `"doc"`
-  on clz, not `{:a 1}`). `examples/anthropic/visualize_demo.clj`'s fixture `def`s use a
-  `;;` comment above the `def` instead — the portable equivalent. No
-  existing `def` elsewhere in this library used the docstring arity, so this
-  was previously latent, not previously triggered.
-
-**Four more bugs found by adversarial review and fixed:**
-
-- `render-code-execution-result`'s `return_code` and `usage-suffix`'s token
-  counts both used `(get m k default)`, whose default only substitutes when
-  the key is ABSENT, not when present with an explicit JSON `null` (e.g. a
-  killed/timed-out execution with no real exit code) — crashing `(zero?
-  nil)` / `(+ nil n)` with an unhandled `NullPointerException`. Fixed with
-  `(or (get m k) default)`, which correctly falls through `nil` (a genuine
-  `0` still passes through unchanged, since `0` is truthy in Clojure).
-- `render-text-content` read a `"text"` content block's `"text"` field with
-  no type guard, unlike `tools.agents.anthropic`'s own `output-text`, which
-  explicitly validates the identical field. A non-string value crashed
-  `(seq 42)`. Fixed by coercing via `(str v)` instead of throwing — this
-  renderer's job is display, so it follows `render-tool-result`'s own
-  established precedent elsewhere in this file rather than raising.
-- `pretty-json`'s map-key handling reimplemented a fragment of
-  `write-json`'s key coercion (`(if (string? k) k (name k))`) instead of
-  delegating to its typed `json-key->str` (now public), so a non-
-  string/keyword/symbol key threw a raw `ClassCastException` instead of the
-  contracted `:tools.agents.anthropic.error/json-encode` ex-info.
-- `split-lines` emitted a spurious trailing empty-string line for any text
-  ending in `\n` — a line TERMINATOR, not a separator introducing one more
-  (empty) line (`"42\n"` is one line, not two, matching
-  `clojure.string/split-lines`). Every stdout/stderr/text block ending in a
-  newline — the common case for command output — got a stray blank tree
-  node.
-
 See `test/tools/agents/anthropic/visualize_test.cljc` for the full behavioral
 coverage (every content-type renderer, truncation, color on/off, panel-border
 alignment, thousands-separator grouping) and `examples/anthropic/visualize_demo.clj`
 for a runnable, fixture-based (no network) 3-turn tool-calling demo.
 
 ### Optional `clojure.spec.alpha` definitions
-
-`src/tools/agents/anthropic/spec.clj` — JVM Clojure + Babashka **only**, not
-clz (clz has no `clojure.spec.alpha` implementation at all; verified
-empirically against clz v43). A plain `.clj` file, never required by
-`tools.agents.anthropic.cljc` itself and never named on `clz test`'s command
-line, so it has zero effect on clz — `require` it explicitly yourself:
-
 ```clojure
 (require '[tools.agents.anthropic.spec :as spec]
          '[clojure.spec.alpha :as s])
@@ -565,50 +486,8 @@ of its own) and fixed:
 `:stream true` throws `{:type :tools.agents.anthropic.error/streaming-unsupported}`
 immediately, before any network request, rather than being silently ignored
 or hanging. This is a genuine platform gap, not an oversight:
-
-- clz's only HTTPS-capable HTTP request builtin, `clojure.http/request`, does
-  not stream — it returns a single buffered `{:status :headers :body}` map.
-- clz's streaming builtin, `clojure.http/request-stream`, explicitly does
-  **not** support TLS (`error.TlsNotSupported` at port 443 —
-  see `src/net/http_builtins.zig`'s `request-stream` implementation in clz).
-  Re-verified empirically on clz v44, 2026-08-30: `request-stream` gained the
-  same seventh `tls?` argument as `request`, and calling it with `tls? true`
-  still throws `TlsNotSupported`. The flag reached the buffered builtin only.
-  This is a live, re-checked blocker, not a stale TODO.
 - `api.anthropic.com` is HTTPS-only.
 
-Put together: true SSE streaming against the real Anthropic API cannot be
-implemented in clz today. Rather than build a JVM/Babashka-only streaming path
-that silently degrades to a hard error on clz, this library rejects `:stream
-true` uniformly on all three runtimes — the same contract everywhere is more
-valuable than partial platform-specific streaming support here. A future
-`messages-stream` could be added once clz's HTTP stack supports TLS on the
-streaming builtin.
-
-### Resolved on clz v44: `https://` on a non-standard port
-
-Until clz v44, `clojure.http/request` — the only TLS-capable HTTP client
-available to clz — decided whether to negotiate TLS purely by checking
-`port == 443`, with no awareness of the URL scheme. An `https://` `:base-url`
-on any other port (an entirely ordinary setup for a gateway, reverse proxy, or
-load balancer) would have fallen through to a **plaintext** TCP connection,
-leaking `x-api-key` / `Authorization` and the full request body on the wire
-with no error and no observable difference from a genuinely encrypted request.
-This library refused such requests outright, before any bytes were sent, with
-`{:type :tools.agents.anthropic.error/tls-port-unsupported}`.
-
-clz v44 gives the builtin a seventh argument, an explicit `tls?` boolean, so
-the scheme decides and the port no longer does. The leaf now passes
-`(= proto "https")` and the refusal — along with the error type — is gone.
-Verified directly against clz v44 on 2026-08-30: port 443 with `true` and
-port 80 with `false` both complete, and port 80 with `true` fails inside the
-TLS handshake, which is what proves the flag rather than the port drives TLS.
-An `https://` `:base-url` on a non-443 port is now handled the same way on all
-three runtimes.
-
-Note the arity change is not backward compatible: on clz older than v44 this
-leaf throws `clojure.http/request: ArityMismatch` on every request. Six-arity
-clz is no longer supported.
 
 ### Platform quirk: `clz test`'s namespace resolution for `examples/`
 
@@ -628,43 +507,13 @@ which resolves `examples.anthropic.basic-chat` →
 
 ### JSON: a small hand-rolled codec, not a dependency
 
-There is no JSON library available on all three runtimes without adding a
-dependency (clz and Babashka both bundle one; JVM Clojure does not — no
-`clojure.data.json`/cheshire without `deps.edn` additions). `write-json`/
-`read-json` in `tools/agents/anthropic.cljc` are a small hand-written codec in
+`write-json`/`read-json` in `tools/agents/anthropic.cljc` are a small hand-written codec in
 the same data-transparency spirit as the original Zig builtin's own recursive
 `std.json` ↔ `CljVal` conversion. It supports exactly what the Messages API
 needs (nil/bool/number/string/keyword/vector/map) and decodes JSON objects
 into maps with **string** keys (matching the original builtin's contract).
 Known gap: control characters other than `\n \r \t` and backspace/form-feed
 are not `\u00XX`-escaped on output — vanishingly rare in real message text.
-
-### Isolating runtime-specific I/O
-
-Following `corevector.relational.durability`'s leaf-I/O pattern: exactly two
-functions in `tools/agents/anthropic.cljc` are runtime-specific, each a
-`#?(:clz ... :bb ... :clj ...)` reader conditional —
-
-- `http-post!` — the actual network POST. clz uses `clojure.http/request`
-  (via `clz.url/parse`, mirroring `clojure.http.clj`'s own `post` helper).
-  Babashka uses `babashka.http-client` (bundled by default; verified
-  empirically that it works, and that `com.sun.net.httpserver.HttpServer` is
-  **not** resolvable under bb's native image — see the mock-server note
-  below). JVM Clojure uses `java.net.http.HttpClient` (built into the JDK
-  since 11 — zero added dependency).
-- `getenv` — env-var access (`sys/getenv` on clz, `System/getenv` on
-  bb/clj).
-
-Everything else — URL/header building, the JSON codec, credential
-resolution, error typing, `output-text` extraction, the message-list
-helpers, retries/backoff (`Thread/sleep` and `Math/pow` behave identically on
-all three runtimes — verified empirically — so no reader conditional was
-needed there either) — is plain, portable `clojure.core`, exercised
-identically by all three test runners.
-
-`tools.agents.anthropic.visualize` goes one step further: it has NO
-runtime-specific leaf at all, not even these two — see Response
-visualization above.
 
 ## Testing
 
@@ -674,9 +523,7 @@ DSL, tool-calling helpers, `request-with-retries!`'s count/backoff/Retry-After
 selection via a fake attempt-fn, `:stream true` rejection, client fail-fast)
 — zero I/O, zero network, identical on all three runtimes.
 
-`test/tools/agents/anthropic/live_test.cljc` reproduces the original Zig
-builtin's mock-server test matrix (`test/anthropic_test.zig` in clz) against
-a local mock server on all three runtimes: request line and required headers,
+`test/tools/agents/anthropic/live_test.cljc`: request line and required headers,
 outbound JSON preserving `messages`/`max_tokens` verbatim, credentials never
 leaking into the outbound body, successful nested-map/vector decoding,
 `output-text` extraction, non-2xx with status+body context (both the
@@ -704,8 +551,7 @@ empirically against clz v43 — unlike JVM Clojure/Babashka, an unlisted-tag
 form is NOT elided there), so an explicit `:clz nil` clause is required to
 actually suppress a test on clz, not just omitting a `:clz` branch.
 
-`test/tools/agents/anthropic/spec_test.clj` — JVM Clojure + Babashka only, see
-Optional `clojure.spec.alpha` definitions above — asserts each spec both
+`test/tools/agents/anthropic/spec_test.clj` — asserts each spec both
 accepts a valid value and REJECTS a malformed one (including the exact
 string-vs-keyword-key trap the wire-shaped specs exist to catch, and
 regression guards for the two spec-correctness bugs above:
@@ -744,9 +590,6 @@ uses `com.sun.net.httpserver.HttpServer` (built into the JDK, zero deps).
 ```
 ./script/test-all.sh
 ```
-
-Runs the suite on JVM Clojure (`clojure -M:test-anthropic`), Babashka (`bb test`), and
-clz (`clz test`), and fails loudly if any of the three is red.
 
 ## License
 
