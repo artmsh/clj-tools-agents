@@ -11,7 +11,8 @@
    divergences from the other two providers.
 
    Runs unmodified on JVM Clojure and Babashka. The 'client object' here is a
-   plain map built by `client`.
+   `GeminiClient` record built by `client`; it retains Clojure's map-style
+   keyword lookup and immutable update semantics on both runtimes.
 
    PORTABILITY: exactly one function does real network I/O — the private leaf
    `http-post!` below, isolated with a #?(:bb ... :clj ...) reader conditional,
@@ -85,6 +86,8 @@
 ;; first attempt" too, this is deliberately the same convention (a count of
 ;; RETRIES, not attempts), so default-max-retries = 4 here, not 5.
 (def default-max-retries 4)
+
+(defrecord GeminiClient [api-key base-url api-version max-retries])
 
 ;; ---------------------------------------------------------------------------
 ;; JSON codec — pure, portable, zero dependencies. Byte-for-byte the same
@@ -391,7 +394,7 @@
                                {:type :tools.agents.gemini/missing-credentials}))))))
 
 (defn client
-  "Build a client config map — the 'client object' analogue of Python's
+  "Build a GeminiClient record — the 'client object' analogue of Python's
    genai.Client(api_key=...) constructor. Resolves credentials eagerly (fails
    fast with a catchable ex-info BEFORE any network request).
 
@@ -410,12 +413,13 @@
   ([] (client {}))
   ([opts]
    (let [creds (resolve-credentials opts getenv)]
-     (merge {:base-url    (or (:base-url opts) (getenv "GOOGLE_GEMINI_BASE_URL") default-base-url)
-             :api-version (or (:api-version opts) default-api-version)
-             :max-retries (if (number? (:max-retries opts))
-                            (max 0 (long (:max-retries opts)))
-                            default-max-retries)}
-            creds))))
+     (map->GeminiClient
+      (merge {:base-url    (or (:base-url opts) (getenv "GOOGLE_GEMINI_BASE_URL") default-base-url)
+              :api-version (or (:api-version opts) default-api-version)
+              :max-retries (if (number? (:max-retries opts))
+                             (max 0 (long (:max-retries opts)))
+                             default-max-retries)}
+             creds)))))
 
 ;; ---------------------------------------------------------------------------
 ;; Error typing

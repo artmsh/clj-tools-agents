@@ -82,7 +82,8 @@
 (s/def ::client-opts
   (s/keys :opt-un [::api-key ::auth-token ::base-url ::max-retries]))
 
-;; The map `client` RETURNS — unlike ::client-opts, credential resolution has
+;; The AnthropicClient record `client` RETURNS — unlike ::client-opts,
+;; credential resolution has
 ;; already run by this point, so exactly one of :api-key/:auth-token is
 ;; guaranteed present (resolve-credentials' whole contract). The xor
 ;; predicate is load-bearing: `s/or` alone only enforces "at least one" (a

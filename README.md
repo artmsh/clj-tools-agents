@@ -3,7 +3,7 @@
 Pure-Clojure libraries for talking to LLMs — three provider API clients and
 one Model Context Protocol implementation — under one shared base namespace
 `tools.agents`. Each is ergonomically modeled on that vendor's own official
-Python SDK (`client` config map standing in for the SDK's constructor,
+Python SDK (`client` value standing in for the SDK's constructor,
 resource methods matching its `create(**params)` calls, a typed `ex-info`
 error hierarchy matching its exception classes) and runs unmodified on **JVM
 Clojure** and **Babashka**.

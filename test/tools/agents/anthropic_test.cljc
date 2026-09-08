@@ -331,6 +331,12 @@
 ;; client construction — fail fast
 ;; ---------------------------------------------------------------------------
 
+(deftest client-returns-anthropic-client-record
+  (let [client (a/client {:api-key "k"})]
+    (is (record? client))
+    (is (= "k" (:api-key client)))
+    (is (record? (assoc client :base-url "http://example.test")))))
+
 (deftest client-uses-explicit-api-key
   (is (= "explicit" (:api-key (a/client {:api-key "explicit" :base-url "http://x"})))))
 
