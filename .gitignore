@@ -1,6 +1,7 @@
 .cpcache/
-.clzc/
-*.clzc
 .DS_Store
 target/
 .agents
+.claude/
+.clj-kondo/
+.lsp/
