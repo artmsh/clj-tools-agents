@@ -3,7 +3,7 @@
 A pure-Clojure client for [OpenAI's Responses and Chat Completions
 APIs](https://platform.openai.com/docs/api-reference/), ergonomically modeled
 on the official [openai-python](https://github.com/openai/openai-python)
-client: a `client` config map standing in for `OpenAI(...)`,
+client: an `OpenAIClient` record standing in for `OpenAI(...)`,
 `responses-create` / `chat-completions-create` standing in for
 `client.responses.create(**params)` / `client.chat.completions.create(**params)`,
 and a typed error hierarchy matching the SDK's exception classes.
@@ -73,7 +73,7 @@ yourself, exactly as the Python README's own example does:
 
 | openai-python | tools.agents.openai | Notes |
 |---|---|---|
-| `OpenAI(api_key=..., organization=..., project=..., base_url=...)` | `(client {:api-key ... :organization ... :project ... :base-url ...})` | Returns a plain config map. |
+| `OpenAI(api_key=..., organization=..., project=..., base_url=...)` | `(client {:api-key ... :organization ... :project ... :base-url ...})` | Returns an `OpenAIClient` record with map-style keyword access. |
 | `client.responses.create(**params)` | `(responses-create client params)` | `params` is a plain map passed through to JSON almost verbatim. |
 | `client.chat.completions.create(**params)` | `(chat-completions-create client params)` | Same contract, `/chat/completions` path. |
 | `response.output_text` | `(output-text response)` | Direct port of the SDK property, **including its empty-string-when-absent contract** — see below. |
@@ -82,9 +82,9 @@ yourself, exactly as the Python README's own example does:
 | `openai.APIError` / `.APIStatusError` / `.RateLimitError` / `.ConflictError` / etc. | `ex-info` with `:type` in `ex-data` | See the error-hierarchy table below — one exception constructor discriminated by `:type`, rather than a Python-style class hierarchy (there is no `class` in Clojure to mirror it with). |
 | `OPENAI_API_KEY` / `OPENAI_ORG_ID` / `OPENAI_PROJECT_ID` / `OPENAI_BASE_URL` | same env vars, same precedence | Explicit arg wins over env in every case. |
 | `OpenAI-Organization` / `OpenAI-Project` headers | same headers | Emitted **only** when set — the SDK sends `Omit()` for them otherwise, and so does this library (absent, never present-and-empty). |
-| `client.with_options(...)` (general form) | `(assoc client ...)` | Per-request override without mutating the client. `client` is a plain map, so callers just `(assoc client :base-url ...)` / `(assoc client :max-retries 5)` themselves. |
+| `client.with_options(...)` (general form) | `(assoc client ...)` | Per-request override without mutating the client. `OpenAIClient` supports associative updates, so callers use `(assoc client :base-url ...)` / `(assoc client :max-retries 5)` themselves. |
 | `OpenAI(max_retries=2)` / automatic backoff | `(client {:max-retries 2})`, default `default-max-retries` = 2 | Implemented — connection failures, 408, 409, 429 and 5xx are retried with the SDK's exact backoff, jitter and `Retry-After` handling. See Retries below. |
-| `client.with_options(max_retries=5)` | `(assoc client :max-retries 5)` | The client is a plain map, so the per-call override needs no dedicated API. |
+| `client.with_options(max_retries=5)` | `(assoc client :max-retries 5)` | The client record is associative, so the per-call override needs no dedicated API. |
 | `timeout` (default 10 min) / `APITimeoutError` | *(not implemented)* | Each runtime's HTTP leaf uses its own default timeout; a timeout surfaces as `:tools.agents.openai/api-connection-error` (which is also where Python's `APITimeoutError` sits in the hierarchy, as a subclass of `APIConnectionError`) and is retried like any other transport failure, exactly as the SDK does. |
 | `client.responses.create(..., stream=True)` / `client.responses.stream(...)` | **rejected outright** | See Streaming below. |
 | `client.embeddings.*` / `.images.*` / `.files.*` / `.batches.*` / `.fine_tuning.*` / Assistants / Realtime / webhooks | *(not implemented)* | Only the two text-generation resource methods are in scope for this port. `post-json!` is the shared transport, so adding another POST resource is a two-line change. |

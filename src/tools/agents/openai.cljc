@@ -10,8 +10,9 @@
    the openai-python parity and the (few) deliberate divergences from
    tools.agents.anthropic.
 
-   Runs unmodified on JVM Clojure and Babashka. The 'client object' here is a
-   plain map built by `client`.
+   Runs unmodified on JVM Clojure and Babashka. The 'client object' here is an
+   `OpenAIClient` record built by `client`; it retains Clojure's map-style
+   keyword lookup and immutable update semantics on both runtimes.
 
    PORTABILITY: exactly one function does real network I/O — the private leaf
    `http-post!` below, isolated with a #?(:bb ... :clj ...) reader conditional.
@@ -54,6 +55,11 @@
 ;; (the analogue of `OpenAI(max_retries=n)` / `with_options(max_retries=n)`).
 ;; The rest of the retry policy lives further down, next to `should-retry?`.
 (def default-max-retries 2)
+
+;; :organization and :project are deliberately omitted when unset. Keeping
+;; only invariant keys as fields lets the record preserve that `contains?`
+;; contract through its extension map.
+(defrecord OpenAIClient [api-key base-url max-retries])
 
 ;; ---------------------------------------------------------------------------
 ;; JSON codec — pure, portable, zero dependencies.
@@ -360,7 +366,7 @@
                          {:type :tools.agents.openai/missing-credentials}))))))
 
 (defn client
-  "Build a client config map — the 'client object' analogue of Python's
+  "Build an OpenAIClient record — the 'client object' analogue of Python's
    OpenAI(...) constructor. Resolves credentials eagerly (fails fast with a
    catchable ex-info BEFORE any network request).
 
@@ -379,19 +385,20 @@
                    (`default-max-retries`, openai-python's own default). 0
                    disables retries. The Python `with_options(max_retries=n)`
                    per-call override is just `(assoc client :max-retries n)`
-                   here, since the client is a plain map."
+                   here, since the client record is associative."
   ([] (client {}))
   ([opts]
    (let [creds (resolve-credentials opts getenv)
          org   (or (:organization opts) (getenv "OPENAI_ORG_ID"))
          proj  (or (:project opts) (getenv "OPENAI_PROJECT_ID"))]
-     (cond-> (merge {:base-url    (or (:base-url opts) (getenv "OPENAI_BASE_URL") default-base-url)
-                     :max-retries (if (number? (:max-retries opts))
-                                    (max 0 (long (:max-retries opts)))
-                                    default-max-retries)}
-                    creds)
-       (seq org)  (assoc :organization org)
-       (seq proj) (assoc :project proj)))))
+     (map->OpenAIClient
+      (cond-> (merge {:base-url    (or (:base-url opts) (getenv "OPENAI_BASE_URL") default-base-url)
+                      :max-retries (if (number? (:max-retries opts))
+                                     (max 0 (long (:max-retries opts)))
+                                     default-max-retries)}
+                     creds)
+        (seq org)  (assoc :organization org)
+        (seq proj) (assoc :project proj))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Error typing

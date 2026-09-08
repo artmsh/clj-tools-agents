@@ -3,7 +3,7 @@
 A pure-Clojure client for the [Gemini Developer
 API](https://ai.google.dev/gemini-api/docs), ergonomically modeled on the
 official [python-genai](https://github.com/googleapis/python-genai) client: a
-`client` config map standing in for `genai.Client(api_key=...)`,
+`GeminiClient` record standing in for `genai.Client(api_key=...)`,
 `generate-content` / `count-tokens` standing in for
 `client.models.generate_content(model=..., contents=..., config=...)` /
 `client.models.count_tokens(...)`, and a typed error hierarchy matching the
@@ -73,7 +73,7 @@ model id) is used verbatim.
 
 | python-genai | tools.agents.gemini | Notes |
 |---|---|---|
-| `genai.Client(api_key=..., http_options=...)` | `(client {:api-key ... :base-url ... :api-version ... :max-retries ...})` | Returns a plain config map. |
+| `genai.Client(api_key=..., http_options=...)` | `(client {:api-key ... :base-url ... :api-version ... :max-retries ...})` | Returns a `GeminiClient` record with map-style keyword access. |
 | `client.models.generate_content(model=model, contents=..., config=request)` | `(generate-content client model request)` | `request` is a plain map passed through to JSON almost verbatim; `model` is a separate argument (see above), not a request key. |
 | `client.models.count_tokens(model=model, contents=...)` | `(count-tokens client model request)` | Same contract, `:countTokens` path. |
 | `response.text` | `(output-text response)` | Port of the SDK property: join every string `"text"` across `candidates[0].content.parts`, skipping `"thought"` parts. Returns `nil` (matching Python's `None`) rather than throwing when there's nothing to join — see below. |

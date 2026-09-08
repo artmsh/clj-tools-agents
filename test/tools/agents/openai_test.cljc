@@ -384,6 +384,12 @@
   ;; negative is clamped, not honored
   (is (= 0 (:max-retries (oai/client {:api-key "k" :base-url "http://x/v1" :max-retries -3})))))
 
+(deftest client-returns-openai-client-record
+  (let [client (oai/client {:api-key "k" :base-url "http://x/v1"})]
+    (is (record? client))
+    (is (= "k" (:api-key client)))
+    (is (record? (assoc client :base-url "http://example.test/v1")))))
+
 ;; ---------------------------------------------------------------------------
 ;; Message-list helpers
 ;; ---------------------------------------------------------------------------

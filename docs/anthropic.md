@@ -2,7 +2,7 @@
 
 A pure-Clojure client for [Anthropic's Messages API](https://docs.anthropic.com/),
 ergonomically modeled on the official [anthropic-sdk-python](https://github.com/anthropics/anthropic-sdk-python)
-client: a `client` config map standing in for `Anthropic(...)`, `messages-create` standing in for
+client: an `AnthropicClient` record standing in for `Anthropic(...)`, `messages-create` standing in for
 `client.messages.create(**params)`, and a typed error hierarchy matching the
 SDK's exception classes. Also includes automatic retries with backoff,
 `count-tokens`, tool-calling ergonomics, a small message content-block DSL, a
@@ -55,12 +55,12 @@ Programmatic Tool Calling below.
 
 | Python SDK | tools.agents.anthropic | Notes |
 |---|---|---|
-| `Anthropic(api_key=..., auth_token=..., base_url=...)` | `(client {:api-key ... :auth-token ... :base-url ... :max-retries ...})` | Returns a plain config map, not an object. |
+| `Anthropic(api_key=..., auth_token=..., base_url=...)` | `(client {:api-key ... :auth-token ... :base-url ... :max-retries ...})` | Returns an `AnthropicClient` record with map-style keyword access. |
 | `client.messages.create(**params)` | `(messages-create client params)` | `params` is a plain map passed through to JSON almost verbatim. |
 | `message.content[0].text` | `(output-text response)` | Concatenates ALL `"text"` blocks (not just the first) — matches the original Zig builtin's contract; throws instead of ever returning `nil`. |
 | dict key `"max_tokens"` | map key `"max_tokens"` or `:max_tokens` | Both string and keyword keys are accepted and encoded **verbatim** via `name` — no kebab-case↔snake_case conversion. Write `:max_tokens`, not `:max-tokens`. **Resolved, kept as-is:** this is a deliberate data-transparency contract (matches the original Zig builtin and the Python SDK's own literal dict keys), not a gap — converting to kebab-only would be a breaking design change in the wrong direction. If you want kebab-case authoring, use the message content-block DSL below, which is sugar *on top of* the verbatim wire format rather than a replacement for it. |
 | `anthropic.APIError` / `.APIStatusError` / `.RateLimitError` / etc. | `ex-info` with `:type` in `ex-data` | See the error-hierarchy table below — one exception constructor, discriminated by `:type`, rather than a Python-style class hierarchy (there is no `class` in Clojure to mirror it with). |
-| `client.with_options(...)` | *(not implemented)* | Per-request override without mutating the client. Out of scope for this port; `client` is a plain map, so callers can just `(assoc client :base-url ...)` themselves. |
+| `client.with_options(...)` | *(not implemented)* | Per-request override without mutating the client. Out of scope for this port; `AnthropicClient` supports associative updates, so callers can use `(assoc client :base-url ...)` themselves. |
 | `max_retries` / automatic backoff | `:max-retries` client opt, default 2 | **Resolved, implemented.** See Retries below. |
 | `client.messages.stream(...)` / `stream=True` | **rejected outright** | Not resolved — this is  an open TODO. |
 | `client.messages.count_tokens(...)` | `(count-tokens client request)` | **Resolved, implemented** — same request shape as `messages-create` minus `max_tokens`, same retry policy and error hierarchy, POSTs to `/v1/messages/count_tokens`. |
@@ -90,7 +90,7 @@ Precedence, first match wins: explicit `:api-key` → explicit `:auth-token` →
   `["advanced-tool-use-2025-11-20"]` for Programmatic Tool Calling), sent as
   a comma-joined `anthropic-beta` header. Analogous to the Python SDK's
   per-call `betas=[...]` kwarg on `client.beta.messages.create`, set once
-  here on the client config map since this library has no separate `.beta`
+  here on the client record since this library has no separate `.beta`
   resource namespace. **Combined, never clobbered:** an `:auth-token`
   client's own required `oauth-2025-04-20` flag is joined with any `:betas`
   you add (`"oauth-2025-04-20,advanced-tool-use-2025-11-20"`), not replaced
@@ -404,7 +404,7 @@ unrecognized type as a raw-JSON fallback).
 | `parse_content_block(block)` | `(parse-content-block block)` | Collapsed to ONE code path — see below. |
 | `format_json(data, max_length=500)` | `(format-json data)` / `(format-json data max-length)` | Pretty-printed + truncated, same defaults. |
 | `visualize_message(message, console=None)` | `(render-message message opts)` (pure, returns a string) + `(visualize-message message opts)` (prints it) | Split in two, unlike the Python original, specifically so the renderer itself is unit-testable with zero I/O — see `test/tools/agents/anthropic/visualize_test.cljc`. |
-| `class visualize` (context manager) | `(visualizer opts)` — a plain map holding an atom, plus `capture!`/`show-all!` | Same "no OO here" translation this library already applies to `client` (see the parity table above): a plain map, not a stateful object. |
+| `class visualize` (context manager) | `(visualizer opts)` — a plain map holding an atom, plus `capture!`/`show-all!` | A plain map is sufficient here because the visualizer's identity is carried by its atom; unlike the API client, it has no dedicated record type. |
 | `show_response(response)` | `(show-response response)` / `(show-response response opts)` | |
 | `rich.tree.Tree` / `rich.panel.Panel` / `rich.syntax.Syntax` (Rich, an added dependency) | hand-rolled ANSI tree/panel renderer, zero dependencies | No `rich`-equivalent is available on both runtimes without adding one — same zero-dependency, data-transparency spirit as this library's own hand-rolled JSON codec. |
 | `Syntax(..., theme="monokai")` per-token highlighting | single ANSI color per block | No syntax highlighter is being ported, just Rich's structural coloring (role/type/status labels). |

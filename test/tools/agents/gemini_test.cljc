@@ -99,6 +99,12 @@
     (is (some? e))
     (is (= :tools.agents.gemini/missing-credentials (:type (ex-data e))))))
 
+(deftest client-returns-gemini-client-record
+  (let [client (g/client {:api-key "k"})]
+    (is (record? client))
+    (is (= "k" (:api-key client)))
+    (is (record? (assoc client :base-url "http://example.test")))))
+
 ;; ---------------------------------------------------------------------------
 ;; output-text
 ;; ---------------------------------------------------------------------------

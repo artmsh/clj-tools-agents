@@ -3,9 +3,9 @@
    the official anthropic-sdk-python client (Anthropic(...) constructor,
    client.messages.create(**params) resource method, typed error hierarchy).
 
-   Runs unmodified on JVM Clojure and Babashka. The 'client object' here is a
-   plain map built by `client` rather than a record, so it has the same shape
-   on both runtimes.
+   Runs unmodified on JVM Clojure and Babashka. The 'client object' here is an
+   `AnthropicClient` record built by `client`; it retains Clojure's map-style
+   keyword lookup and immutable update semantics on both runtimes.
 
    PORTABILITY: exactly one function does real network I/O — the private leaf
    `http-post!` below, isolated with a #?(:bb ... :clj ...) reader conditional.
@@ -36,6 +36,11 @@
 ;; anthropic-sdk-python's and anthropic-sdk-typescript's shared default —
 ;; DEFAULT_MAX_RETRIES = 2 in both SDKs.
 (def default-max-retries 2)
+
+;; Only keys present on every resolved client are record fields. Credentials
+;; are mutually exclusive and :betas is optional, so map->AnthropicClient keeps
+;; them in the record's extension map and preserves the old `contains?` shape.
+(defrecord AnthropicClient [base-url max-retries])
 
 ;; ---------------------------------------------------------------------------
 ;; JSON codec — pure, portable, zero dependencies.
@@ -356,7 +361,7 @@
                          {:type :tools.agents.anthropic.error/missing-credentials}))))))
 
 (defn client
-  "Build a client config map — the 'client object' analogue of Python's
+  "Build an AnthropicClient record — the 'client object' analogue of Python's
    Anthropic(...) constructor. Resolves credentials eagerly (fails fast with
    a catchable ex-info BEFORE any network request, matching the original
    builtin's contract) unless :api-key/:auth-token/env vars are present.
@@ -372,7 +377,7 @@
                    calling), sent as a comma-joined `anthropic-beta` header —
                    analogous to the Python SDK's per-call `betas=[...]` kwarg
                    on `client.beta.messages.create`, but set once here on the
-                   client config map since this library has no separate
+                   client record since this library has no separate
                    `.beta` resource namespace. Combined with, never replacing,
                    the OAuth path's own required `oauth-2025-04-20` flag when
                    :auth-token is in use — see auth-headers.
@@ -397,10 +402,11 @@
        (throw (ex-info (str "tools.agents.anthropic/client: :max-retries must be a non-negative "
                              "integer, got: " (pr-str max-retries))
                         {:type :tools.agents.anthropic.error/invalid-max-retries})))
-     (cond-> (merge {:base-url (or (:base-url opts) (getenv "ANTHROPIC_BASE_URL") default-base-url)
-                     :max-retries max-retries}
-                    creds)
-       (seq (:betas opts)) (assoc :betas (vec (:betas opts)))))))
+     (map->AnthropicClient
+      (cond-> (merge {:base-url (or (:base-url opts) (getenv "ANTHROPIC_BASE_URL") default-base-url)
+                      :max-retries max-retries}
+                     creds)
+        (seq (:betas opts)) (assoc :betas (vec (:betas opts))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Error typing
