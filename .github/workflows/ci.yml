@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Test on every supported runtime
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install JVM Clojure and Babashka
+        uses: DeLaGuardo/setup-clojure@13.4
+        with:
+          cli: latest
+          bb: latest
+
+      - name: Show runtime versions
+        run: |
+          clojure -Sdescribe | head -3
+          bb --version
+
+      - name: Suite on JVM Clojure and Babashka
+        run: ./script/test-all.sh
