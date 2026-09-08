@@ -3,13 +3,10 @@
 A pure-Clojure client for [OpenAI's Responses and Chat Completions
 APIs](https://platform.openai.com/docs/api-reference/), ergonomically modeled
 on the official [openai-python](https://github.com/openai/openai-python)
-client: a `client` config map standing in for `OpenAI(...)` (clz has no
-classes — a plain map is the idiomatic "client object" here),
+client: a `client` config map standing in for `OpenAI(...)`,
 `responses-create` / `chat-completions-create` standing in for
 `client.responses.create(**params)` / `client.chat.completions.create(**params)`,
 and a typed error hierarchy matching the SDK's exception classes.
-
-Runs unmodified on **JVM Clojure**, **Babashka**, and **[clz](https://forgejo.lan/art/clz)**.
 
 Sibling of [tools.agents.anthropic](anthropic.md) in this same repo — same
 architecture (single leaf for network I/O, hand-rolled portable JSON codec,
@@ -76,13 +73,13 @@ yourself, exactly as the Python README's own example does:
 
 | openai-python | tools.agents.openai | Notes |
 |---|---|---|
-| `OpenAI(api_key=..., organization=..., project=..., base_url=...)` | `(client {:api-key ... :organization ... :project ... :base-url ...})` | Returns a plain config map, not an object — clz has no classes. |
+| `OpenAI(api_key=..., organization=..., project=..., base_url=...)` | `(client {:api-key ... :organization ... :project ... :base-url ...})` | Returns a plain config map. |
 | `client.responses.create(**params)` | `(responses-create client params)` | `params` is a plain map passed through to JSON almost verbatim. |
 | `client.chat.completions.create(**params)` | `(chat-completions-create client params)` | Same contract, `/chat/completions` path. |
 | `response.output_text` | `(output-text response)` | Direct port of the SDK property, **including its empty-string-when-absent contract** — see below. |
 | `completion.choices[0].message.content` | `(completion-text completion)` | Not an SDK method (Python spells it as attribute access) — just the shortest portable spelling of the same traversal. Returns `nil` when `content` is JSON `null` (tool-call / refusal responses), matching `.content` being `None` there. |
 | dict key `"max_output_tokens"` | map key `"max_output_tokens"` or `:max_output_tokens` | Both string and keyword keys are accepted and encoded **verbatim** via `name` — no kebab-case↔snake_case conversion. Write `:max_output_tokens`, not `:max-output-tokens`. |
-| `openai.APIError` / `.APIStatusError` / `.RateLimitError` / `.ConflictError` / etc. | `ex-info` with `:type` in `ex-data` | See the error-hierarchy table below — one exception constructor discriminated by `:type`, rather than a Python-style class hierarchy (there is no `class` in Clojure/clz to mirror it with). |
+| `openai.APIError` / `.APIStatusError` / `.RateLimitError` / `.ConflictError` / etc. | `ex-info` with `:type` in `ex-data` | See the error-hierarchy table below — one exception constructor discriminated by `:type`, rather than a Python-style class hierarchy (there is no `class` in Clojure to mirror it with). |
 | `OPENAI_API_KEY` / `OPENAI_ORG_ID` / `OPENAI_PROJECT_ID` / `OPENAI_BASE_URL` | same env vars, same precedence | Explicit arg wins over env in every case. |
 | `OpenAI-Organization` / `OpenAI-Project` headers | same headers | Emitted **only** when set — the SDK sends `Omit()` for them otherwise, and so does this library (absent, never present-and-empty). |
 | `client.with_options(...)` (general form) | `(assoc client ...)` | Per-request override without mutating the client. `client` is a plain map, so callers just `(assoc client :base-url ...)` / `(assoc client :max-retries 5)` themselves. |
@@ -224,54 +221,14 @@ purpose. If you use both, these are the places not to assume symmetry:
 | invalid `:max-retries` | **throws** `:invalid-max-retries` — must be a non-negative integer | **never throws** — negatives clamp to `0`, fractions truncate, non-numbers fall back to the default `2`; see Retries above |
 
 Everything else — the JSON codec, the leaf-I/O split, `ex-info` typing style,
-message-list helpers, the `:stream true` refusal, the clz TLS-port refusal,
-and the three-runtime test harness — is intentionally identical.
+message-list helpers, the `:stream true` refusal, and the three-runtime test harness — is intentionally identical.
 
 ### Platform limitation: streaming is not supported
 
 `:stream true` throws `{:type :tools.agents.openai/streaming-unsupported}`
 immediately, before any network request, rather than being silently ignored
 or hanging. This is a genuine platform gap, not an oversight:
-
-- clz's only HTTPS-capable HTTP request builtin, `clojure.http/request`, does
-  not stream — it returns a single buffered `{:status :headers :body}` map.
-- clz's streaming builtin, `clojure.http/request-stream`, explicitly does
-  **not** support TLS (`error.TlsNotSupported` — see
-  `src/net/http_builtins.zig`'s `request-stream` implementation in clz).
-  Re-verified empirically on clz v44, 2026-08-30: it takes v44's seventh
-  `tls?` argument like `request` does, and throws `TlsNotSupported` anyway.
 - `api.openai.com` is HTTPS-only.
-
-Put together: true SSE streaming against the real OpenAI API cannot be
-implemented in clz today. Rather than build a JVM/Babashka-only streaming path
-that silently degrades to a hard error on clz, this library rejects
-`:stream true` uniformly on all three runtimes — the same contract everywhere
-is more valuable than partial platform-specific streaming support here.
-
-### Resolved on clz v44: `https://` on a non-standard port
-
-Until clz v44, `clojure.http/request` — the only TLS-capable HTTP client
-available to clz — decided whether to negotiate TLS purely by checking
-`port == 443`, with no awareness of the URL scheme. An `https://` `:base-url`
-on any other port (an entirely ordinary setup for a gateway, reverse proxy, or
-load balancer) would have fallen through to a **plaintext** TCP connection,
-leaking the `Authorization: Bearer` header and the full request body on the
-wire with no error and no observable difference from a genuinely encrypted
-request. This library refused such requests outright, before any bytes were
-sent, with `{:type :tools.agents.openai/tls-port-unsupported}`.
-
-clz v44 gives the builtin a seventh argument, an explicit `tls?` boolean, so
-the scheme decides and the port no longer does. The leaf now passes
-`(= proto "https")` and the refusal — along with the error type — is gone.
-Verified directly against clz v44 on 2026-08-30: port 443 with `true` and
-port 80 with `false` both complete, and port 80 with `true` fails inside the
-TLS handshake, which is what proves the flag rather than the port drives TLS.
-An `https://` `:base-url` on a non-443 port is now handled the same way on all
-three runtimes.
-
-Note the arity change is not backward compatible: on clz older than v44 this
-leaf throws `clojure.http/request: ArityMismatch` on every request. Six-arity
-clz is no longer supported.
 
 ### Platform quirk: `clz test`'s namespace resolution for `examples/`
 
@@ -291,10 +248,7 @@ which resolves `examples.openai.basic-chat` →
 
 ### JSON: a small hand-rolled codec, not a dependency
 
-There is no JSON library available on all three runtimes without adding a
-dependency (clz and Babashka both bundle one; JVM Clojure does not — no
-`clojure.data.json`/cheshire without `deps.edn` additions). `write-json`/
-`read-json` in `tools/agents/openai.cljc` are a small hand-written codec. It
+`write-json`/`read-json` in `tools/agents/openai.cljc` are a small hand-written codec. It
 supports exactly what these APIs need (nil/bool/number/string/keyword/vector/
 map) and decodes JSON objects into maps with **string** keys. Known gap:
 control characters other than `\n \r \t` and backspace/form-feed are not
@@ -336,38 +290,6 @@ Both JVM-backed leaves therefore pin HTTP/1.1 explicitly
 Over `https://` ALPN would have negotiated safely either way, and this client
 issues one request at a time, so HTTP/2 bought it nothing — pinning keeps all
 three runtimes on the same wire protocol.
-
-### clz gotchas this code works around
-
-Found while porting; all verified empirically on clz v43. Worth knowing before
-editing this file:
-
-- `(def name "docstring" value)` binds the **docstring** as the var's value.
-  Every `def` here is therefore docstring-free with a preceding comment;
-  `defn` docstrings work correctly and are used throughout.
-- `keep-indexed` is not available — `parse-http-date-ms` finds its month token
-  with an explicit `loop`.
-- `nth`'s 3-arity default is ignored (returns `nil` instead of the default),
-  so bounds are checked by hand.
-- `Math/pow` and `Math/round` are not available — the backoff curve doubles in
-  a loop and all delay math is integer milliseconds.
-- **`apply` overflows the stack past a few hundred arguments.** This one is a
-  correctness bug, not an ergonomic wrinkle: the JSON parser originally built
-  one piece per character and joined with `(apply str pieces)`, so any response
-  containing a string longer than roughly 500 characters — that is, essentially
-  every real model reply — died with `Runtime error: StackOverflow` on clz while
-  passing on JVM Clojure and Babashka. `str/join` has no such limit (verified
-  into the hundreds of thousands of pieces). `parse-string` now also takes a
-  fast path that returns one `subs` for an escape-free string and accumulates
-  whole literal runs rather than characters in the escaped path, so piece count
-  tracks escapes rather than length. `tools.agents.openai-test` pins this at 600,
-  5 000 and 50 000 characters on all three runtimes.
-- The string reader does not decode `\b` / `\f` escapes (they stay as literal
-  two-character sequences), so the JSON codec builds those two via `(char 8)`
-  / `(char 12)`.
-- `clojure.http/request` returns response headers in their **wire casing**
-  (`"Retry-After"`), unlike `java.net.http` and `babashka.http-client` which
-  lower-case theirs — hence the case-insensitive `header-value` lookup.
 
 ## Testing
 
@@ -424,37 +346,6 @@ touching the environment.
 ```
 ./script/test-all.sh
 ```
-
-Runs the suite on JVM Clojure (`clojure -M:test-openai`), Babashka (`bb test`), and
-clz (`clz test`), and fails loudly if any of the three is red. It is hermetic
-— mock servers only, no outbound network.
-
-### Live smoke check
-
-The suite above proves internal consistency against a mock this repo wrote;
-it does not prove conformance to a live endpoint. `script/live-check.sh` is
-the manual counterpart — one real Chat Completions round-trip (plus a
-non-fatal Responses-API probe) on all three runtimes:
-
-```
-OPENAI_API_KEY=... ./script/live-check.sh
-OPENAI_API_KEY=... OPENAI_BASE_URL=https://api.openai.com/v1 OPENAI_MODEL=gpt-5.5 ./script/live-check.sh
-```
-
-It defaults to the homelab OmniRoute gateway (`http://omniroute.lan/v1`).
-Deliberately not wired into CI: it needs a credential and costs tokens.
-
-Verified green on all three runtimes against OmniRoute (2026-08-05,
-`OPENAI_MODEL=auto/fast`) — both `POST /chat/completions` and
-`POST /responses`, with `output-text` / `completion-text` extracting the reply
-on each. Two gateway quirks the script accounts for, neither a client bug:
-
-- OmniRoute streams `auto/*` model ids as SSE unless the request says
-  `"stream": false`, and a streamed body reaches this non-streaming client as
-  `data: {...}` chunks that fail to parse. The script sends `"stream" false`
-  explicitly; it is valid OpenAI and a no-op against api.openai.com.
-- The gateway is intermittently slow to first byte (~25s) and occasionally
-  answers `502`, which the retry policy absorbs.
 
 ## License
 
