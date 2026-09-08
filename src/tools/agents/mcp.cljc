@@ -40,7 +40,8 @@
    protocol value' and 'this is your program'.
 
    JSON: a hand-written codec, as in the sibling libraries — there is no
-   JSON library available on both runtimes without adding a dependency. It diverges from theirs in one deliberate way: `write-json`
+   JSON library available on both runtimes without adding a dependency. It
+   diverges from theirs in one deliberate way: `write-json`
    here \\u00XX-escapes EVERY control character below 0x20, not just the
    five with short escapes. That gap is cosmetic for an HTTP request body
    but load-bearing here, because the stdio transport's framing contract is
@@ -117,9 +118,6 @@
         b (logging-level-rank minimum)]
     (boolean (and a b (>= a b)))))
 
-(def ^:private BACKSPACE "\b")
-(def ^:private FORM-FEED "\f")
-
 ;; ---------------------------------------------------------------------------
 ;; JSON codec — pure, portable, zero dependencies.
 ;; ---------------------------------------------------------------------------
@@ -156,8 +154,8 @@
                     (str/replace "\n" "\\n")
                     (str/replace "\r" "\\r")
                     (str/replace "\t" "\\t")
-                    (str/replace BACKSPACE "\\b")
-                    (str/replace FORM-FEED "\\f"))]
+                    (str/replace "\b" "\\b")
+                    (str/replace "\f" "\\f"))]
     (str "\""
          (if (some control-char? escaped) (json-escape-controls escaped) escaped)
          "\"")))
@@ -255,8 +253,8 @@
                 (= esc "n")  (recur (+ j 2) (conj pieces "\n"))
                 (= esc "r")  (recur (+ j 2) (conj pieces "\r"))
                 (= esc "t")  (recur (+ j 2) (conj pieces "\t"))
-                (= esc "b")  (recur (+ j 2) (conj pieces BACKSPACE))
-                (= esc "f")  (recur (+ j 2) (conj pieces FORM-FEED))
+                (= esc "b")  (recur (+ j 2) (conj pieces "\b"))
+                (= esc "f")  (recur (+ j 2) (conj pieces "\f"))
                 (= esc "u")
                 (do
                   (when (> (+ j 6) n) (json-parse-error! "unterminated unicode escape"))
@@ -362,7 +360,7 @@
 ;; JSON-RPC framing
 ;; ---------------------------------------------------------------------------
 
-(defn- prune
+(defn prune
   "Drop keys whose value is nil. Optional protocol fields are omitted, never
    sent as JSON null — `\"title\": null` is not the same as an absent title
    to a validator, and several MCP fields are typed `string | undefined`."

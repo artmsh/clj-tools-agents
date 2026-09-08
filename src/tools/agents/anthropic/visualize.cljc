@@ -19,9 +19,8 @@
    data-transparency spirit as tools.agents.anthropic's own JSON codec.
 
    NO RUNTIME-SPECIFIC LEAF AT ALL: rendering text to a string and
-   `println`-ing it needs neither an HTTP client nor env-var access, so
-   unlike tools.agents.anthropic (http-post!, getenv) this file has no reader
-   conditional anywhere.
+   `println`-ing it needs no HTTP client, so unlike tools.agents.anthropic
+   (whose `http-post!` is a reader conditional) this file has none.
 
    PLAIN ASCII (`+`, `-`, `|`, backtick) for all structural drawing —
    classic `tree`-CLI style, not Rich's rounded Unicode boxes. Every
@@ -82,7 +81,15 @@
             (recur end pieces))
           (recur (inc i) (conj pieces (subs s i (inc i)))))))))
 
-(defn- visible-length [s] (count (strip-ansi s)))
+(defn- visible-length
+  "Width of s once SGR sequences are discounted. The `index-of` guard is the
+   whole `{:color? false}` path — the one the docstring recommends for CI
+   output and log files — which would otherwise rebuild every line
+   character-by-character only to measure it."
+  [s]
+  (if (str/index-of s ESC)
+    (count (strip-ansi s))
+    (count s)))
 
 ;; ---------------------------------------------------------------------------
 ;; Small portable helpers — truncation, thousands-separator, line splitting.
@@ -188,19 +195,22 @@
   "Wrap lines (already-rendered tree lines) in an ASCII box titled title."
   [root title]
   (let [lines (tree-lines root)
+        ;; Measured once and carried: padding below needs the same width the
+        ;; box was sized from, and measuring an ANSI-coloured line is a scan.
+        widths (mapv visible-length lines)
         ;; `reduce`, not `(apply max 0 ...)`: apply spreads every line as a
         ;; separate argument, and a long render has thousands of them.
-        content-w (reduce max 0 (map visible-length lines))
+        content-w (reduce max 0 widths)
         title-bar (str " " title " ")
         inner-w (+ 2 (max content-w (count title-bar)))
         top-fill (max 0 (- inner-w 2 (count title-bar)))
         top (str "+--" title-bar (repeat-str top-fill "-") "+")
         bottom (str "+" (repeat-str inner-w "-") "+")
-        pad-line (fn [line]
+        pad-line (fn [line w]
                    (str "| " line
-                        (repeat-str (max 0 (- inner-w 2 (visible-length line))) " ")
+                        (repeat-str (max 0 (- inner-w 2 w)) " ")
                         " |"))]
-    (str/join "\n" (concat [top] (map pad-line lines) [bottom]))))
+    (str/join "\n" (concat [top] (map pad-line lines widths) [bottom]))))
 
 ;; ---------------------------------------------------------------------------
 ;; JSON pretty-printer — tools.agents.anthropic/write-json is deliberately

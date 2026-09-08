@@ -172,8 +172,7 @@
    "idempotentHint" true "openWorldHint" false})
 
 (defn- getenv-map
-  "Every environment variable, as the reference server's get-env returns.
-   The one runtime-specific call in this file."
+  "Every environment variable, as the reference server's get-env returns."
   []
   (into {} (System/getenv)))
 

@@ -13,12 +13,13 @@
    THE SERVER MAPPING IS PURE AND PORTABLE; the HOST is not. `handle-http`
    turns {method, headers, body-string} into {status, headers, body} using
    nothing but clojure.core, so it runs on both runtimes and is tested as
-   plain data. Actually binding a socket needs something the runtime
-   provides: `serve!` below uses the JDK's built-in
-   `com.sun.net.httpserver` (still zero dependencies) and is therefore JVM
-   Clojure only — Babashka does not ship that module. On Babashka, host
-   `handle-http` in whatever server you already have; that is the whole
-   integration.
+   plain data. Actually binding a socket needs a server: `serve!` below uses
+   the JDK's built-in `com.sun.net.httpserver` (still zero dependencies) and
+   is therefore JVM Clojure only, since Babashka does not ship that module.
+   That is a choice of implementation, not a capability limit — hosting under
+   bb would need a bb-only server dependency, which this namespace avoids. On
+   Babashka, host `handle-http` in whatever server you already have; that is
+   the whole integration.
 
    THE CLIENT SIDE runs on both runtimes, behind the same single-leaf
    `http-post!` pattern tools.agents.anthropic uses.
@@ -28,9 +29,10 @@
    mirror body fields so intermediaries can route without parsing the body,
    and the server MUST reject any mismatch with -32020 and HTTP 400. Values
    that cannot be carried as plain ASCII use the `=?base64?...?=` sentinel,
-   which is implemented here from arithmetic rather than from
-   `java.util.Base64` so it stays dependency-free and identical on both
-   runtimes."
+   implemented here from arithmetic rather than `java.util.Base64` so that a
+   malformed sentinel fails as this library's own typed `ex-info` — which the
+   -32020 path depends on — rather than as an opaque IllegalArgumentException
+   from the JDK."
   (:require [clojure.string :as str]
             [tools.agents.mcp :as mcp]
             [tools.agents.mcp.server :as server]
@@ -54,9 +56,10 @@
 
 (defn utf8-bytes
   "UTF-8 code units of a string, as a vector of integers 0-255. Written from
-   code points rather than `(.getBytes s \"UTF-8\")` so it stays free of Java
-   interop and behaves identically under Babashka. A surrogate pair is
-   recombined into the single code point it encodes."
+   code points rather than `(.getBytes s \"UTF-8\")` so the encoder and the
+   Base64 codec below share one representation — a vector of ints — and both
+   halves of the sentinel round-trip through the same code. A surrogate pair
+   is recombined into the single code point it encodes."
   [s]
   (loop [cs (seq s) out []]
     (if-not cs
@@ -114,7 +117,12 @@
                  (conj out (char cp))))))))
 
 (defn base64-encode
-  "Standard Base64 (RFC 4648) of a string's UTF-8 bytes, with padding."
+  "Standard Base64 (RFC 4648) of a string's UTF-8 bytes, with padding.
+
+   Sized for header values, not for large blobs: this allocates per output
+   character, which is free at the ~100-byte sentinel values it exists for
+   and roughly linear-with-a-large-constant beyond that. A megabyte-scale
+   `mcp/blob-contents` payload is better encoded by the caller."
   [s]
   (chars->str
    (mapcat (fn [group]
@@ -457,13 +465,24 @@
 ;; Leaf I/O — the only runtime-specific function in this file.
 ;; ---------------------------------------------------------------------------
 
+;; One HTTP client per process, built lazily, so a retry does not allocate a
+;; fresh selector thread (java.net.http.HttpClient had no close() before Java
+;; 21). Both are pinned to HTTP/1.1 — see http-post!'s :clj branch below.
+#?(:bb  (def ^:private bb-http-client
+          (delay (bb-http/client (assoc bb-http/default-client-opts :version :http1.1))))
+   :clj (def ^:private jvm-http-client
+          (delay (-> (java.net.http.HttpClient/newBuilder)
+                     (.version java.net.http.HttpClient$Version/HTTP_1_1)
+                     (.build)))))
+
 (defn- http-post!
   "POST body to url with headers. Returns {:status int :headers map :body
    string} on ANY HTTP response. Throws only on a genuine transport failure.
    Same shape as tools.agents.anthropic's own leaf."
   [url headers body]
   #?(:bb
-     (let [resp (bb-http/post url {:headers headers :body body :throw false})]
+     ;; :version :http1.1 for the same reason as the :clj leaf below.
+     (let [resp (bb-http/post url {:client @bb-http-client :headers headers :body body :throw false})]
        {:status (:status resp) :headers (:headers resp) :body (:body resp)})
 
      :clj
@@ -477,7 +496,7 @@
                    (.version java.net.http.HttpClient$Version/HTTP_1_1)
                    (.POST (java.net.http.HttpRequest$BodyPublishers/ofString body))
                    (.build))
-           resp (.send (java.net.http.HttpClient/newHttpClient) req
+           resp (.send @jvm-http-client req
                        (java.net.http.HttpResponse$BodyHandlers/ofString))]
        {:status (.statusCode resp)
         :headers (into {} (map (fn [[k vs]] [k (first vs)]) (.map (.headers resp))))
@@ -546,10 +565,11 @@
   "Bind an HTTP endpoint and host `handle-http` on it, using the JDK's
    built-in com.sun.net.httpserver — still zero external dependencies.
 
-   JVM CLOJURE ONLY. Babashka does not ship the jdk.httpserver module; there,
-   call `handle-http` from whatever server you already run. That is the
-   entire integration surface — it is a pure function from an HTTP request
-   map to an HTTP response map.
+   JVM CLOJURE ONLY: Babashka does not ship the jdk.httpserver module, and
+   this namespace will not take a bb-only server dependency to work around
+   that. Under bb, call `handle-http` from whatever server you already run —
+   that is the entire integration surface, a pure function from an HTTP
+   request map to an HTTP response map.
 
    Binds 127.0.0.1 by default: the spec SHOULDs localhost-only for a local
    server, because binding 0.0.0.0 exposes it to the network. Returns a map

@@ -1,13 +1,8 @@
 (ns tools.agents.gemini.live-test
-  "Mock-server / transport-level coverage. `start-server!` is the ONLY
-   runtime-specific piece (two tiny leaves, same pattern as
-   tools.agents.gemini's own `http-post!`, tools.agents.anthropic/
-   tools.agents.openai's own live-test namespaces): Babashka uses
-   org.httpkit.server (com.sun.net.httpserver.HttpServer is NOT resolvable
-   under bb's native image), and JVM Clojure uses
-   com.sun.net.httpserver.HttpServer (built into the JDK, zero deps). Every
-   test above `start-server!` exercises identical handler logic and identical
-   assertions on both runtimes.
+  "Mock-server / transport-level coverage. The mock server itself lives in
+   tools.agents.test-support, shared with the anthropic and openai suites —
+   it is the only runtime-specific piece in any of them. Everything here is
+   identical handler logic and identical assertions on both runtimes.
 
    Every retry test binds `g/*sleep-fn*` to a no-op — the real backoff floor
    is 1 SECOND (python-genai's tenacity initial=1.0), unlike tools.agents.
@@ -20,47 +15,7 @@
             [examples.gemini.basic-chat :as ex-basic]
             [examples.gemini.count-tokens :as ex-count]
             [examples.gemini.custom-gateway :as ex-gateway]
-            #?@(:bb [[org.httpkit.server :as hk]] :clj [])))
-
-;; ---------------------------------------------------------------------------
-;; Mock-server leaf
-;; ---------------------------------------------------------------------------
-
-(defn- start-server!
-  "route: the exact path the mock will answer on, e.g.
-   \"/v1beta/models/gemini-2.5-flash:generateContent\". handler: (fn [{:keys
-   [method path headers body]}]) -> {:status :headers :body}. Returns
-   {:port port :stop! (fn [])}."
-  [port route handler]
-  #?(:bb
-     (let [server (hk/run-server
-                    (fn [req]
-                      (let [body (when (:body req) (slurp (:body req)))]
-                        (handler {:method (str/upper-case (name (:request-method req))) :path (:uri req)
-                                  :headers (:headers req) :body (or body "")})))
-                    {:port port :legacy-return-value? false})]
-       {:port port :stop! (fn [] (hk/server-stop! server))})
-
-     :clj
-     (let [server (com.sun.net.httpserver.HttpServer/create
-                    (java.net.InetSocketAddress. "127.0.0.1" port) 0)]
-       (.createContext server route
-         (reify com.sun.net.httpserver.HttpHandler
-           (handle [_ exchange]
-             (let [body    (String. (.readAllBytes (.getRequestBody exchange)) "UTF-8")
-                   headers (into {} (map (fn [[k vs]] [(str/lower-case k) (first vs)])
-                                         (.getRequestHeaders exchange)))
-                   req     {:method (.getRequestMethod exchange)
-                             :path (.getPath (.getRequestURI exchange))
-                             :headers headers :body body}
-                   {:keys [status headers body]} (handler req)
-                   resp-bytes (.getBytes (or body "") "UTF-8")]
-               (doseq [[k v] headers] (.set (.getResponseHeaders exchange) k v))
-               (.sendResponseHeaders exchange status (count resp-bytes))
-               (with-open [os (.getResponseBody exchange)] (.write os resp-bytes))))))
-       (.setExecutor server nil)
-       (.start server)
-       {:port port :stop! (fn [] (.stop server 0))})))
+            [tools.agents.test-support :refer [start-server!]]))
 
 (defn- base-url [port] (str "http://127.0.0.1:" port))
 
@@ -337,7 +292,7 @@
         {:keys [port stop!]} (start-server! 18997 "/v1beta/models/gemini-2.5-flash:generateContent"
                                 (fn [req] (reset! captured req)
                                   {:status 200
-                                   :body (str "{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"{}\"}]}}]}")}))]
+                                   :body "{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"{}\"}]}}]}"}))]
     (try
       (let [client (g/client {:api-key "gw-key" :base-url (base-url port)})
             result (ex-gateway/run-example client)]

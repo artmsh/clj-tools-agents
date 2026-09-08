@@ -1,13 +1,10 @@
 (ns tools.agents.anthropic.live-test
-  "Mock-server / transport-level coverage — reproduces test/anthropic_test.zig's
-   original mock-server matrix from the hardcoded Zig builtin this library
-   replaces. `start-server!` is the ONLY runtime-specific piece (two tiny
-   leaves, same pattern as tools.agents.anthropic's own `http-post!`):
-   Babashka uses org.httpkit.server (verified empirically — com.sun.net.
-   httpserver.HttpServer is NOT resolvable under bb's native image), and JVM
-   Clojure uses com.sun.net.httpserver.HttpServer (built into the JDK, zero
-   deps). Every test above `start-server!` exercises identical handler logic
-   and identical assertions on both runtimes."
+  "Mock-server / transport-level coverage — reproduces the mock-server matrix
+   of test/anthropic_test.zig, the test suite of the hardcoded Zig builtin
+   this library replaced (that file is not part of this repository). The mock server itself lives in tools.agents.test-support,
+   shared with the openai and gemini suites — it is the only
+   runtime-specific piece in any of them. Everything here is identical
+   handler logic and identical assertions on both runtimes."
   (:require [clojure.test :refer [deftest is]]
             [clojure.string :as str]
             [tools.agents.anthropic :as a]
@@ -16,46 +13,7 @@
             [examples.anthropic.custom-gateway :as ex-gateway]
             [examples.anthropic.tool-use :as ex-tool]
             [examples.anthropic.ptc-demo :as ex-ptc]
-            #?@(:bb [[org.httpkit.server :as hk]] :clj [])))
-
-;; ---------------------------------------------------------------------------
-;; Mock-server leaf
-;; ---------------------------------------------------------------------------
-
-(defn- start-server!
-  "handler: (fn [{:keys [method path headers body]}]) -> {:status :headers :body}.
-   headers (in and out) are string-keyed, lower-case names. Returns
-   {:port port :stop! (fn [])}."
-  [port handler]
-  #?(:bb
-     (let [server (hk/run-server
-                    (fn [req]
-                      (let [body (when (:body req) (slurp (:body req)))]
-                        (handler {:method (str/upper-case (name (:request-method req))) :path (:uri req)
-                                  :headers (:headers req) :body (or body "")})))
-                    {:port port :legacy-return-value? false})]
-       {:port port :stop! (fn [] (hk/server-stop! server))})
-
-     :clj
-     (let [server (com.sun.net.httpserver.HttpServer/create
-                    (java.net.InetSocketAddress. "127.0.0.1" port) 0)]
-       (.createContext server "/v1/messages"
-         (reify com.sun.net.httpserver.HttpHandler
-           (handle [_ exchange]
-             (let [body    (String. (.readAllBytes (.getRequestBody exchange)) "UTF-8")
-                   headers (into {} (map (fn [[k vs]] [(str/lower-case k) (first vs)])
-                                         (.getRequestHeaders exchange)))
-                   req     {:method (.getRequestMethod exchange)
-                             :path (.getPath (.getRequestURI exchange))
-                             :headers headers :body body}
-                   {:keys [status headers body]} (handler req)
-                   resp-bytes (.getBytes (or body "") "UTF-8")]
-               (doseq [[k v] headers] (.set (.getResponseHeaders exchange) k v))
-               (.sendResponseHeaders exchange status (count resp-bytes))
-               (with-open [os (.getResponseBody exchange)] (.write os resp-bytes))))))
-       (.setExecutor server nil)
-       (.start server)
-       {:port port :stop! (fn [] (.stop server 0))})))
+            [tools.agents.test-support :refer [start-server!]]))
 
 (defn- canned-response []
   "{\"id\":\"msg_1\",\"content\":[{\"type\":\"text\",\"text\":\"hello back\"}],\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}")
@@ -66,7 +24,7 @@
 
 (deftest posts-to-v1-messages-with-required-headers
   (let [captured (atom nil)
-        {:keys [port stop!]} (start-server! 18930
+        {:keys [port stop!]} (start-server! 18930 "/v1/messages"
                                 (fn [req] (reset! captured req) {:status 200 :body (canned-response)}))]
     (try
       (let [client (a/client {:api-key "test-key" :base-url (str "http://127.0.0.1:" port)})
@@ -88,7 +46,7 @@
       (finally (stop!)))))
 
 (deftest messages-create-carries-request-id-header-as-metadata
-  (let [{:keys [port stop!]} (start-server! 18947
+  (let [{:keys [port stop!]} (start-server! 18947 "/v1/messages"
                                 (fn [_] {:status 200 :headers {"request-id" "req_abc123"}
                                          :body (canned-response)}))]
     (try
@@ -105,7 +63,7 @@
 
 (deftest auth-token-sends-bearer-and-oauth-beta-header
   (let [captured (atom nil)
-        {:keys [port stop!]} (start-server! 18931
+        {:keys [port stop!]} (start-server! 18931 "/v1/messages"
                                 (fn [req] (reset! captured req) {:status 200 :body (canned-response)}))]
     (try
       (let [client (a/client {:auth-token "tok-abc" :base-url (str "http://127.0.0.1:" port)})]
@@ -118,7 +76,7 @@
 
 (deftest api-key-client-with-betas-sends-comma-joined-beta-header
   (let [captured (atom nil)
-        {:keys [port stop!]} (start-server! 18972
+        {:keys [port stop!]} (start-server! 18972 "/v1/messages"
                                 (fn [req] (reset! captured req) {:status 200 :body (canned-response)}))]
     (try
       (let [client (a/client {:api-key "k" :betas ["advanced-tool-use-2025-11-20"]
@@ -132,7 +90,7 @@
   ;; would drop oauth-2025-04-20 the moment :betas was also set, silently
   ;; breaking OAuth auth — see beta-header-value's docstring.
   (let [captured (atom nil)
-        {:keys [port stop!]} (start-server! 18973
+        {:keys [port stop!]} (start-server! 18973 "/v1/messages"
                                 (fn [req] (reset! captured req) {:status 200 :body (canned-response)}))]
     (try
       (let [client (a/client {:auth-token "tok-abc" :betas ["advanced-tool-use-2025-11-20"]
@@ -144,7 +102,7 @@
 
 (deftest base-url-with-trailing-slash-still-builds-correct-path
   (let [captured (atom nil)
-        {:keys [port stop!]} (start-server! 18932
+        {:keys [port stop!]} (start-server! 18932 "/v1/messages"
                                 (fn [req] (reset! captured req) {:status 200 :body (canned-response)}))]
     (try
       (let [client (a/client {:api-key "k" :base-url (str "http://127.0.0.1:" port "/")})]
@@ -157,7 +115,7 @@
 ;; ---------------------------------------------------------------------------
 
 (deftest decodes-nested-response-into-maps-and-vectors
-  (let [{:keys [port stop!]} (start-server! 18933
+  (let [{:keys [port stop!]} (start-server! 18933 "/v1/messages"
                                 (fn [_] {:status 200
                                          :body "{\"id\":\"msg_2\",\"model\":\"claude\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"}],\"usage\":{\"input_tokens\":1,\"output_tokens\":1},\"nested\":{\"a\":[1,2,3]}}"}))]
     (try
@@ -175,7 +133,7 @@
 ;; ---------------------------------------------------------------------------
 
 (deftest non-2xx-throws-with-status-and-extracted-message
-  (let [{:keys [port stop!]} (start-server! 18934
+  (let [{:keys [port stop!]} (start-server! 18934 "/v1/messages"
                                 (fn [_] {:status 429 :body "{\"error\":{\"type\":\"rate_limit_error\",\"message\":\"slow down\"}}"}))]
     (try
       ;; :max-retries 0: 429 is retryable by default and this test is about
@@ -193,7 +151,7 @@
       (finally (stop!)))))
 
 (deftest non-2xx-without-json-error-shape-falls-back-to-raw-body
-  (let [{:keys [port stop!]} (start-server! 18935
+  (let [{:keys [port stop!]} (start-server! 18935 "/v1/messages"
                                 (fn [_] {:status 500 :body "internal explosion, not json"}))]
     (try
       ;; :max-retries 0 — see the comment on non-2xx-throws-with-status-and-
@@ -208,7 +166,7 @@
       (finally (stop!)))))
 
 (deftest malformed-json-response-throws-catchable-parse-error
-  (let [{:keys [port stop!]} (start-server! 18936 (fn [_] {:status 200 :body "{not valid json"}))]
+  (let [{:keys [port stop!]} (start-server! 18936 "/v1/messages" (fn [_] {:status 200 :body "{not valid json"}))]
     (try
       (let [client (a/client {:api-key "k" :base-url (str "http://127.0.0.1:" port)})
             e (try (a/messages-create client {"model" "m" "max_tokens" 1 "messages" []})
@@ -218,7 +176,7 @@
       (finally (stop!)))))
 
 (deftest content-less-response-makes-output-text-throw
-  (let [{:keys [port stop!]} (start-server! 18937
+  (let [{:keys [port stop!]} (start-server! 18937 "/v1/messages"
                                 (fn [_] {:status 200 :body "{\"content\":[{\"type\":\"tool_use\",\"id\":\"t1\"}]}"}))]
     (try
       (let [client (a/client {:api-key "k" :base-url (str "http://127.0.0.1:" port)})
@@ -243,7 +201,7 @@
 
 (deftest count-tokens-posts-to-count-tokens-path-and-decodes
   (let [captured (atom nil)
-        {:keys [port stop!]} (start-server! 18941
+        {:keys [port stop!]} (start-server! 18941 "/v1/messages"
                                 (fn [req] (reset! captured req) {:status 200 :body "{\"input_tokens\":42}"}))]
     (try
       (let [client   (a/client {:api-key "k" :base-url (str "http://127.0.0.1:" port)})
@@ -259,7 +217,7 @@
 ;; error wiring, would have passed the suite clean. Mirrors messages-
 ;; create's non-2xx-throws-with-status-and-extracted-message.
 (deftest count-tokens-non-2xx-throws-with-status-and-extracted-message
-  (let [{:keys [port stop!]} (start-server! 18944
+  (let [{:keys [port stop!]} (start-server! 18944 "/v1/messages"
                                 (fn [_] {:status 429 :body "{\"error\":{\"type\":\"rate_limit_error\",\"message\":\"slow down\"}}"}))]
     (try
       ;; :max-retries 0 -- same single-shot-mock-server reasoning as
@@ -276,7 +234,7 @@
 
 (deftest count-tokens-respects-client-max-retries-then-succeeds
   (let [attempts (atom 0)
-        {:keys [port stop!]} (start-server! 18945
+        {:keys [port stop!]} (start-server! 18945 "/v1/messages"
                                 (fn [_]
                                   (swap! attempts inc)
                                   (if (< @attempts 3)
@@ -297,7 +255,7 @@
 ;; request-with-retries! -> a second real HTTP round trip — actually fires.
 (deftest retries-then-succeeds-against-real-mock-server
   (let [attempts (atom 0)
-        {:keys [port stop!]} (start-server! 18942
+        {:keys [port stop!]} (start-server! 18942 "/v1/messages"
                                 (fn [_]
                                   (swap! attempts inc)
                                   (if (< @attempts 3)
@@ -319,7 +277,7 @@
 ;; then exhausted" together.
 (deftest non-2xx-after-retries-exhausted-still-carries-status-and-body
   (let [attempts (atom 0)
-        {:keys [port stop!]} (start-server! 18946
+        {:keys [port stop!]} (start-server! 18946 "/v1/messages"
                                 (fn [_]
                                   (swap! attempts inc)
                                   {:status 429 :body "{\"error\":{\"type\":\"rate_limit_error\",\"message\":\"still slow\"}}"}))]
@@ -341,7 +299,7 @@
 ;; ---------------------------------------------------------------------------
 
 (deftest example-a-basic-chat-runs-against-mock-server
-  (let [{:keys [port stop!]} (start-server! 18938
+  (let [{:keys [port stop!]} (start-server! 18938 "/v1/messages"
                                 (fn [_] {:status 200 :body (canned-response)}))]
     (try
       (let [client (a/client {:api-key "test-key" :base-url (str "http://127.0.0.1:" port)})]
@@ -355,7 +313,7 @@
 
 (deftest example-b-eval-harness-prefill-runs-against-mock-server
   (let [captured (atom nil)
-        {:keys [port stop!]} (start-server! 18939
+        {:keys [port stop!]} (start-server! 18939 "/v1/messages"
                                 (fn [req] (reset! captured req)
                                   {:status 200
                                    :body "{\"content\":[{\"type\":\"text\",\"text\":\"{\\\"a\\\":1,\\\"b\\\":2}\"}]}"}))]
@@ -371,7 +329,7 @@
 
 (deftest example-c-custom-gateway-auth-token-runs-against-mock-server
   (let [captured (atom nil)
-        {:keys [port stop!]} (start-server! 18940
+        {:keys [port stop!]} (start-server! 18940 "/v1/messages"
                                 (fn [req] (reset! captured req)
                                   {:status 200 :body "{\"content\":[{\"type\":\"text\",\"text\":\"{}\"}]}"}))]
     (try
@@ -385,7 +343,7 @@
 ;; Two sequential requests: a tool_use round, then the final text round.
 (deftest example-d-tool-use-runs-against-mock-server
   (let [requests (atom [])
-        {:keys [port stop!]} (start-server! 18943
+        {:keys [port stop!]} (start-server! 18943 "/v1/messages"
                                 (fn [req]
                                   (swap! requests conj req)
                                   (if (= 1 (count @requests))
@@ -432,7 +390,7 @@
                     "\"content\":[{\"type\":\"code_execution_tool_result\","
                     "\"content\":{\"stdout\":\"done\",\"return_code\":0}},"
                     "{\"type\":\"text\",\"text\":\"ENG002 exceeded the standard budget but is within their custom limit.\"}]}")
-        {:keys [port stop!]} (start-server! 18974
+        {:keys [port stop!]} (start-server! 18974 "/v1/messages"
                                 (fn [req]
                                   (swap! requests conj req)
                                   {:status 200
@@ -473,7 +431,7 @@
 
 (deftest example-f-baseline-without-ptc-runs-against-mock-server
   (let [requests (atom [])
-        {:keys [port stop!]} (start-server! 18975
+        {:keys [port stop!]} (start-server! 18975 "/v1/messages"
                                 (fn [req]
                                   (swap! requests conj req)
                                   (if (= 1 (count @requests))

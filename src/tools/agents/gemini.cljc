@@ -19,8 +19,9 @@
    Everything above it — URL/header building, the hand-rolled JSON codec,
    error typing, credential resolution, the retry policy, output-text
    extraction — is plain, portable clojure.core exercised identically by both
-   test runners. Only two other leaves exist: `getenv` (env-var access) and
-   `sleep!` (retry backoff).
+   test runners. `getenv` (env-var access) and `sleep!` (retry backoff) touch
+   the process too, but need no reader conditional — they are testability
+   seams, not runtime-specific leaves.
 
    AUTH: unlike anthropic-sdk-python's api_key/auth_token split and
    openai-python's single Bearer token, the Gemini Developer API authenticates
@@ -85,9 +86,6 @@
 ;; RETRIES, not attempts), so default-max-retries = 4 here, not 5.
 (def default-max-retries 4)
 
-(def ^:private BACKSPACE "\b")
-(def ^:private FORM-FEED "\f")
-
 ;; ---------------------------------------------------------------------------
 ;; JSON codec — pure, portable, zero dependencies. Byte-for-byte the same
 ;; algorithm as tools.agents.anthropic/tools.agents.openai's own codecs
@@ -114,8 +112,8 @@
            (str/replace "\n" "\\n")
            (str/replace "\r" "\\r")
            (str/replace "\t" "\\t")
-           (str/replace BACKSPACE "\\b")
-           (str/replace FORM-FEED "\\f"))
+           (str/replace "\b" "\\b")
+           (str/replace "\f" "\\f"))
        "\""))
 
 (defn write-json
@@ -211,8 +209,8 @@
                 (= esc "n")  (recur (+ j 2) (conj pieces "\n"))
                 (= esc "r")  (recur (+ j 2) (conj pieces "\r"))
                 (= esc "t")  (recur (+ j 2) (conj pieces "\t"))
-                (= esc "b")  (recur (+ j 2) (conj pieces BACKSPACE))
-                (= esc "f")  (recur (+ j 2) (conj pieces FORM-FEED))
+                (= esc "b")  (recur (+ j 2) (conj pieces "\b"))
+                (= esc "f")  (recur (+ j 2) (conj pieces "\f"))
                 (= esc "u")
                 (do
                   (when (> (+ j 6) n) (json-parse-error! "unterminated unicode escape"))
@@ -309,7 +307,10 @@
                        {:type :tools.agents.gemini/json-parse-error})))))
 
 ;; ---------------------------------------------------------------------------
-;; Leaf I/O — the only runtime-specific function in this file.
+;; I/O leaves — `http-post!` is the only runtime-specific function in this
+;; file; `getenv`, `sleep!` and `now-ms` are here beside it because they are
+;; the other side of the process boundary, not because they need a reader
+;; conditional.
 ;; ---------------------------------------------------------------------------
 
 (defn- getenv [name]
@@ -517,7 +518,12 @@
 
 (defn- own-error?
   "True for an already-typed tools.agents.gemini/* ex-info — an SDK-side
-   permanent error, which it would be pointless as well as noisy to retry."
+   permanent error, which it would be pointless as well as noisy to retry.
+
+   Matches the namespace EXACTLY: moving these keywords under a `.error`
+   sub-namespace (as tools.agents.anthropic spells its own) would silently
+   make this false for every one of them. See docs/gemini.md's
+   error-hierarchy note."
   [e]
   (let [data (ex-data e)]
     (boolean (and data (keyword? (:type data)) (= "tools.agents.gemini" (namespace (:type data)))))))

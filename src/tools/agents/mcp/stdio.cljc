@@ -56,9 +56,6 @@
     (println (apply str parts))
     (flush)))
 
-(defn- new-lock []
-  (Object.))
-
 (defn- write-line!
   "Write one framed message. Serialized against concurrent writers, because a
    `subscriptions/listen` stream is pushed from another thread while request
@@ -78,7 +75,7 @@
    stdout, and the lock that keeps concurrent writes from interleaving."
   ([srv] (connection srv nil))
   ([srv {:keys [write-fn]}]
-   (let [lock (new-lock)
+   (let [lock (Object.)
          write! (or write-fn (fn [s] (write-line! lock s)))]
      {:server srv
       :subscriptions (atom {})

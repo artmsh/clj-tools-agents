@@ -9,6 +9,11 @@ SDK's exception classes. Also includes automatic retries with backoff,
 terminal response visualizer, and optional `clojure.spec.alpha` definitions
 — see Design notes below.
 
+Several notes below justify a decision by "the original builtin". That was a
+hardcoded Anthropic client written in Zig, which this library replaced; it is
+not part of this repository. Those references are provenance — why a contract
+is shaped the way it is — not something a reader here can check.
+
 ## Usage
 
 ```clojure
@@ -409,8 +414,8 @@ unrecognized type as a raw-JSON fallback).
 
 **No runtime-specific leaf at all:** this file needs no `#?(:bb ... :clj
 ...)` reader conditional anywhere. `tools.agents.anthropic` itself isolates
-exactly two leaves (`http-post!`, `getenv`); rendering text to a string and
-`println`-ing it needs neither.
+exactly one (`http-post!`); rendering text to a string and `println`-ing it
+needs no HTTP client.
 
 **Plain ASCII** (`+`, `-`, `|`, `` ` ``) for all structural drawing —
 classic `tree`-CLI style rather than Rich's rounded Unicode boxes. Every
@@ -470,7 +475,7 @@ of its own) and fixed:
   (`s/keys` conforms as identity, so a predicate right after it still sees
   the real map).
 
-### Platform limitation: streaming is not supported
+### Streaming is not supported
 
 `:stream true` throws `{:type :tools.agents.anthropic.error/streaming-unsupported}`
 immediately, before any network request, rather than being silently ignored
@@ -480,8 +485,8 @@ or hanging. SSE streaming is simply not implemented by this client.
 
 `examples/*.clj` is requireable from
 `test/tools/agents/anthropic/live_test.cljc` because the repo root (`.`) is
-on the `:test-anthropic`/`:test-openai` aliases' extra paths (`deps.edn` /
-`bb.edn`), which resolves `examples.anthropic.basic-chat` →
+on every test alias's extra paths in `deps.edn`, and on `bb.edn`'s global
+`:paths`. That resolves `examples.anthropic.basic-chat` →
 `./examples/anthropic/basic_chat.clj`.
 
 ### JSON: a small hand-rolled codec, not a dependency
@@ -546,8 +551,8 @@ returned/atom state, not by capturing stdout — `visualize-message` just
 `println`s `render-message`'s return value, so there's nothing that needs
 `with-out-str`).
 
-Mock server per runtime (two tiny leaves, same shape as `http-post!`):
-Babashka uses `org.httpkit.server` — verified empirically that
+The mock server is `tools.agents.test-support/start-server!`, shared by all three provider suites — two tiny leaves, same shape as
+`http-post!`. Babashka uses `org.httpkit.server` — verified empirically that
 `com.sun.net.httpserver.HttpServer` is not resolvable under bb's native
 image, so this is a deliberate fallback, not a default choice. JVM Clojure
 uses `com.sun.net.httpserver.HttpServer` (built into the JDK, zero deps).

@@ -18,8 +18,9 @@
    Everything above it — URL/header building, the hand-rolled JSON codec,
    error typing, credential resolution, the retry policy, output-text
    extraction — is plain, portable clojure.core exercised identically by both
-   test runners. Only two other leaves exist: `getenv` (env-var access) and
-   `sleep!` (retry backoff).
+   test runners. `getenv` (env-var access) and `sleep!` (retry backoff) touch
+   the process too, but need no reader conditional — they are testability
+   seams, not runtime-specific leaves.
 
    RETRIES: on by default (:max-retries, default 2) and a direct port of
    openai-python's _base_client policy — transport failures always retried,
@@ -54,9 +55,6 @@
 ;; The rest of the retry policy lives further down, next to `should-retry?`.
 (def default-max-retries 2)
 
-(def ^:private BACKSPACE "\b")
-(def ^:private FORM-FEED "\f")
-
 ;; ---------------------------------------------------------------------------
 ;; JSON codec — pure, portable, zero dependencies.
 ;; ---------------------------------------------------------------------------
@@ -80,8 +78,8 @@
            (str/replace "\n" "\\n")
            (str/replace "\r" "\\r")
            (str/replace "\t" "\\t")
-           (str/replace BACKSPACE "\\b")
-           (str/replace FORM-FEED "\\f"))
+           (str/replace "\b" "\\b")
+           (str/replace "\f" "\\f"))
        "\""))
 
 (defn write-json
@@ -177,8 +175,8 @@
                 (= esc "n")  (recur (+ j 2) (conj pieces "\n"))
                 (= esc "r")  (recur (+ j 2) (conj pieces "\r"))
                 (= esc "t")  (recur (+ j 2) (conj pieces "\t"))
-                (= esc "b")  (recur (+ j 2) (conj pieces BACKSPACE))
-                (= esc "f")  (recur (+ j 2) (conj pieces FORM-FEED))
+                (= esc "b")  (recur (+ j 2) (conj pieces "\b"))
+                (= esc "f")  (recur (+ j 2) (conj pieces "\f"))
                 (= esc "u")
                 (do
                   (when (> (+ j 6) n) (json-parse-error! "unterminated unicode escape"))
@@ -275,7 +273,10 @@
                        {:type :tools.agents.openai/json-parse-error})))))
 
 ;; ---------------------------------------------------------------------------
-;; Leaf I/O — the only runtime-specific function in this file.
+;; I/O leaves — `http-post!` is the only runtime-specific function in this
+;; file; `getenv`, `sleep!` and `now-ms` are here beside it because they are
+;; the other side of the process boundary, not because they need a reader
+;; conditional.
 ;; ---------------------------------------------------------------------------
 
 (defn- getenv [name]
@@ -620,7 +621,13 @@
                      {:type :tools.agents.openai/streaming-unsupported}))))
 
 (defn- own-error?
-  "True for an already-typed tools.agents.openai/* ex-info. openai-python
+  "True for an already-typed tools.agents.openai/* ex-info. Matches the
+   namespace EXACTLY: moving these keywords under a `.error` sub-namespace
+   (as tools.agents.anthropic spells its own) would silently make this
+   false for every one of them, and the retry loop would then retry
+   permanent refusals. See docs/openai.md's error-hierarchy note.
+
+   openai-python
    re-raises OpenAIError subclasses out of the send path as-is, without
    retrying or rewrapping them, and retrying such a refusal would be pointless
    as well as noisy."
@@ -659,7 +666,7 @@
           (if (< retries-taken max-retries)
             (do (sleep! (retry-delay-ms retries-taken nil (now-ms)))
                 (recur (inc retries-taken)))
-            (throw (ex-info (str "tools.agents.openai/" fn-name ": connection failed: " (str (:error outcome)))
+            (throw (ex-info (str "tools.agents.openai/" fn-name ": connection failed: " (:error outcome))
                              {:type :tools.agents.openai/api-connection-error :status nil :body nil
                               :retries-taken retries-taken})))
           (let [resp      (:resp outcome)

@@ -138,6 +138,12 @@ Non-status error types:
 | response has no `"output"` / `"choices"` array, or an empty `"choices"` | `:tools.agents.openai/invalid-response` |
 | structurally wrong content (non-array `"content"`, non-string `"text"`, non-string non-null `"content"`) | `:tools.agents.openai/invalid-content-shape` |
 
+These keywords sit directly under `:tools.agents.openai/…`, not under a
+`.error` sub-namespace the way `tools.agents.anthropic` and
+`tools.agents.mcp` spell theirs. That is a frozen spelling, not an
+oversight — renaming it would break every `catch` that matches on `:type`,
+and there is nothing to gain by it.
+
 When the response body matches OpenAI's `{"error":{"message":"..."}}` shape,
 that human-readable message is extracted and appended to the thrown message
 (`"HTTP 429 Rate limit reached"`); otherwise the raw body is appended
@@ -220,9 +226,10 @@ purpose. If you use both, these are the places not to assume symmetry:
 | invalid `:max-retries` | **throws** `:invalid-max-retries` — must be a non-negative integer | **never throws** — negatives clamp to `0`, fractions truncate, non-numbers fall back to the default `2`; see Retries above |
 
 Everything else — the JSON codec, the leaf-I/O split, `ex-info` typing style,
-message-list helpers, the `:stream true` refusal, and the two-runtime test harness — is intentionally identical.
+message-list helpers, the `:stream true` refusal, and the two-runtime test
+harness — is intentionally identical.
 
-### Platform limitation: streaming is not supported
+### Streaming is not supported
 
 `:stream true` throws `{:type :tools.agents.openai/streaming-unsupported}`
 immediately, before any network request, rather than being silently ignored
@@ -232,8 +239,8 @@ or hanging. SSE streaming is simply not implemented by this client.
 
 `examples/*.clj` is requireable from
 `test/tools/agents/openai/live_test.cljc` because the repo root (`.`) is on
-the `:test-anthropic`/`:test-openai` aliases' extra paths (`deps.edn` /
-`bb.edn`), which resolves `examples.openai.basic-chat` →
+every test alias's extra paths in `deps.edn`, and on `bb.edn`'s global
+`:paths`. That resolves `examples.openai.basic-chat` →
 `./examples/openai/basic_chat.clj`.
 
 ### JSON: a small hand-rolled codec, not a dependency
@@ -299,10 +306,11 @@ retried then typed — all with `retry-after-ms: 1` so they cost no measurable
 wall-clock), and all three `examples/*.clj` ports run end-to-end against the
 mock server.
 
-Mock server per runtime (two tiny leaves, same shape as `http-post!`):
-Babashka uses `org.httpkit.server` (`com.sun.net.httpserver.HttpServer` is not
-resolvable under bb's native image). JVM Clojure uses
-`com.sun.net.httpserver.HttpServer` (built into the JDK, zero deps). Mock
+The mock server is `tools.agents.test-support/start-server!`, shared by all three provider suites — two tiny leaves, same shape as
+`http-post!`. Babashka uses `org.httpkit.server`
+(`com.sun.net.httpserver.HttpServer` is not resolvable under bb's native
+image). JVM Clojure uses `com.sun.net.httpserver.HttpServer` (built into the
+JDK, zero deps). Mock
 ports are `18950`–`18964`, chosen not to collide with
 tools.agents.anthropic's `18930`–`18946`, and `18965`–`18971` for the retry
 tests. Port `18999` is additionally used by the three tests that deliberately

@@ -85,10 +85,13 @@ map — `mcp/tool-result`, `mcp/tool-error` and `mcp/text`/`mcp/image`/
 (:stop! endpoint)
 ```
 
-On Babashka there is no bundled HTTP *server* — `http/handle-http` is a pure
-function from an HTTP request map to an HTTP response map, so hosting it in
-whatever server you already run is the whole integration. The HTTP *client*
-half works on both runtimes.
+`serve!` is JVM Clojure only, because it hosts on the JDK's
+`com.sun.net.httpserver` and Babashka does not ship that module. Hosting
+under bb would need a bb-only server dependency, which this namespace
+deliberately avoids: `http/handle-http` is a pure function from an HTTP
+request map to an HTTP response map, so plugging it into whatever server you
+already run is the whole integration. The HTTP *client* half works on both
+runtimes.
 
 ### Examples
 
@@ -364,7 +367,7 @@ What it does, all in the transport layer, none of it in the protocol core:
   the whole map instead would silently drop `progressToken`, which
   `server/handle` correlates progress notifications by.
 
-The four pieces are individually public — `legacy-initialize-response`,
+The three pieces are individually public — `legacy-initialize-response`,
 `legacy-stamp-meta`, and the line-level dispatcher `handle-line-legacy!` —
 for a caller building its own loop instead of using `serve!` directly (e.g.
 one layering additional interception, the way a private deployment's TLS
@@ -455,9 +458,11 @@ suite can assert byte-exact output rather than shapes.
 | HTTP `connect!` | ✓ | ✓ |
 | HTTP `serve!` | ✓ | ✗ no `com.sun.net.httpserver` |
 
-The `serve!` gap throws `::error/unsupported-runtime` with the workaround in
-the message: host `http/handle-http` in whatever server you already run, or
-use stdio.
+The `serve!` gap is a choice of implementation, not a capability limit — bb
+can bind a socket, just not through the JDK module this namespace uses, and
+adding a bb-only server dependency would cost more than it buys. It throws
+`::error/unsupported-runtime` with the workaround in the message: host
+`http/handle-http` in whatever server you already run, or use stdio.
 
 ## Testing
 
@@ -505,8 +510,9 @@ this repo's own weather server.
   `com.sun.net.httpserver` and delegates every request to `handle-http`;
   `connect!` is the private `http-post!` leaf (`java.net.http.HttpClient` on
   JVM, `babashka.http-client` on bb) plus `parse-sse` — and testing either
-  means binding a port, which this repo's other suites have already shown to
-  be the one thing that makes a run non-hermetic. The logic underneath both
+  means binding a fixed port, which is a host-state assumption the
+  anthropic/openai/gemini suites accept and this one chose not to take on.
+  The logic underneath both
   is tested; the socket wiring is not. A change to either leaf therefore has
   to be checked out of band, and the anthropic and openai suites — which do
   exercise their own identical leaf — are the tripwire that catches it.

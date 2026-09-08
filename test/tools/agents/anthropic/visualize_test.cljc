@@ -5,7 +5,7 @@
    show-response / capture! / show-all! just println it — no need for
    with-out-str anywhere)."
   (:require [clojure.string :as str]
-            [clojure.test :refer [deftest is testing]]
+            [clojure.test :refer [deftest is]]
             [tools.agents.anthropic.visualize :as viz]))
 
 (defn- long-str

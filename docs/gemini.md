@@ -112,6 +112,11 @@ the calling function (`"tools.agents.gemini/generate-content: "` /
 `{:type <keyword> :status <http-status-or-nil> :body <raw-body-or-nil>
 :retries-taken <int>}`:
 
+As in `tools.agents.openai`, these keywords sit directly under
+`:tools.agents.gemini/…` rather than under a `.error` sub-namespace the way
+`tools.agents.anthropic` and `tools.agents.mcp` spell theirs. Frozen
+spelling, not an oversight.
+
 | HTTP status | `:type` | python-genai class |
 |---|---|---|
 | 400 | `:tools.agents.gemini/invalid-argument-error` | `ClientError` (400 `INVALID_ARGUMENT`) |
@@ -217,17 +222,16 @@ happened."
 | `Retry-After`-equivalent header | clamped `[0, 60]`s, private | `retry-after-ms`/`Retry-After` **and** `x-should-retry`, public, honored | **not implemented** — no such header found in python-genai's retry predicate |
 | request-key casing | snake_case verbatim (`max_tokens`) | snake_case verbatim (`max_output_tokens`) | **camelCase** verbatim (`maxOutputTokens`) — matches the REST API's own field names |
 
-Everything else — the JSON codec, the leaf-I/O split, `ex-info` typing style, and the two-runtime test harness — is
+Everything else — the JSON codec, the leaf-I/O split, `ex-info` typing
+style, and the two-runtime test harness — is
 intentionally identical.
 
-### Platform limitation: streaming is not supported
+### Streaming is not supported
 
 There is no `stream-generate-content`/`:stream true` flag to reject here, the
 way the two siblings each reject one — Gemini's REST streaming variant
 (`:streamGenerateContent`) is a **separate endpoint**, not a request-body
-flag, so there is simply no streaming function offered at all. The underlying
-platform reason is the same as both siblings':
-- `generativelanguage.googleapis.com` is HTTPS-only.
+flag, so there is simply no streaming function offered at all.
 
 ### JSON: a small hand-rolled codec, not a dependency
 
@@ -273,9 +277,9 @@ no-op so they cost no measurable wall-clock, since — unlike
 trick available to shrink the real ~1s-per-retry floor). All three
 `examples/gemini/*.clj` ports run end-to-end against the mock server too.
 
-Mock server per runtime: same two leaves (Babashka `org.httpkit.server`, JVM
-Clojure `com.sun.net.httpserver.HttpServer`) as the two siblings' live-test
-namespaces. Mock ports are `18980`–`18997`, kept disjoint from
+The mock server is `tools.agents.test-support/start-server!`, shared by all three provider suites: two leaves, Babashka
+`org.httpkit.server` and JVM Clojure `com.sun.net.httpserver.HttpServer`.
+Mock ports are `18980`–`18997`, kept disjoint from
 `tools.agents.anthropic`'s `18930`–`18946` and `tools.agents.openai`'s
 `18950`–`18971` as a matter of hygiene. Port `18999` is additionally used by
 the tests that deliberately start *no* server (missing credentials and the

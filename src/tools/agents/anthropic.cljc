@@ -37,9 +37,6 @@
 ;; DEFAULT_MAX_RETRIES = 2 in both SDKs.
 (def default-max-retries 2)
 
-(def ^:private BACKSPACE "\b")
-(def ^:private FORM-FEED "\f")
-
 ;; ---------------------------------------------------------------------------
 ;; JSON codec — pure, portable, zero dependencies.
 ;; ---------------------------------------------------------------------------
@@ -72,8 +69,8 @@
            (str/replace "\n" "\\n")
            (str/replace "\r" "\\r")
            (str/replace "\t" "\\t")
-           (str/replace BACKSPACE "\\b")
-           (str/replace FORM-FEED "\\f"))
+           (str/replace "\b" "\\b")
+           (str/replace "\f" "\\f"))
        "\""))
 
 (defn write-json
@@ -169,8 +166,8 @@
                 (= esc "n")  (recur (+ j 2) (conj pieces "\n"))
                 (= esc "r")  (recur (+ j 2) (conj pieces "\r"))
                 (= esc "t")  (recur (+ j 2) (conj pieces "\t"))
-                (= esc "b")  (recur (+ j 2) (conj pieces BACKSPACE))
-                (= esc "f")  (recur (+ j 2) (conj pieces FORM-FEED))
+                (= esc "b")  (recur (+ j 2) (conj pieces "\b"))
+                (= esc "f")  (recur (+ j 2) (conj pieces "\f"))
                 (= esc "u")
                 (do
                   (when (> (+ j 6) n) (json-parse-error! "unterminated unicode escape"))
@@ -269,11 +266,25 @@
                        {:type :tools.agents.anthropic.error/json-parse})))))
 
 ;; ---------------------------------------------------------------------------
-;; Leaf I/O — the only runtime-specific function in this file.
+;; I/O leaves — `http-post!` is the only runtime-specific function in this
+;; file; `getenv` is here beside it because it is the other side of the
+;; process boundary, not because it needs a reader conditional.
 ;; ---------------------------------------------------------------------------
 
 (defn- getenv [name]
   (System/getenv name))
+
+;; One HTTP client per process, built lazily — anthropic-sdk-python likewise
+;; reuses a single httpx.Client across attempts. Building one per call would
+;; allocate a fresh selector thread for every retry (java.net.http.HttpClient
+;; had no close() before Java 21). Both are pinned to HTTP/1.1 for the reason
+;; spelled out in http-post!'s :clj branch below.
+#?(:bb  (def ^:private bb-http-client
+          (delay (http/client (assoc http/default-client-opts :version :http1.1))))
+   :clj (def ^:private jvm-http-client
+          (delay (-> (java.net.http.HttpClient/newBuilder)
+                     (.version java.net.http.HttpClient$Version/HTTP_1_1)
+                     (.build)))))
 
 (defn- http-post!
   "POST body to url with headers. Returns {:status int :headers map :body
@@ -282,7 +293,10 @@
    refused, TLS handshake failure, timeout — no response at all)."
   [url headers body]
   #?(:bb
-     (let [resp (http/post url {:headers headers :body body :throw false})]
+     ;; :version :http1.1 for the same reason as the :clj leaf below —
+     ;; babashka.http-client wraps java.net.http and inherits its HTTP_2
+     ;; default, which breaks against a plain HTTP/1.1 proxy over cleartext.
+     (let [resp (http/post url {:client @bb-http-client :headers headers :body body :throw false})]
        {:status (:status resp) :headers (:headers resp) :body (:body resp)})
 
      :clj
@@ -308,8 +322,7 @@
                         (.version java.net.http.HttpClient$Version/HTTP_1_1)
                         (.POST (java.net.http.HttpRequest$BodyPublishers/ofString body))
                         (.build))
-           client   (java.net.http.HttpClient/newHttpClient)
-           resp     (.send client req (java.net.http.HttpResponse$BodyHandlers/ofString))]
+           resp     (.send @jvm-http-client req (java.net.http.HttpResponse$BodyHandlers/ofString))]
        {:status  (.statusCode resp)
         :headers (into {} (map (fn [[k vs]] [k (first vs)]) (.map (.headers resp))))
         :body    (.body resp)})))
@@ -628,6 +641,17 @@
   [caller-name url headers body-str]
   (decode-or-throw! caller-name (post-json! caller-name url headers body-str)))
 
+(defn- post-request!
+  "Shared body of every resource method: build URL + headers, encode the
+   request, POST it under the client's retry policy. caller-name prefixes
+   any error message; path is appended to the client's base-url."
+  [client caller-name path request]
+  (let [url      (api-url (:base-url client) path)
+        headers  (auth-headers client)
+        body-str (write-json request)]
+    (request-with-retries! (or (:max-retries client) default-max-retries)
+                           #(attempt-request! caller-name url headers body-str))))
+
 (defn messages-create
   "POST request (a plain map, passed through to JSON almost verbatim — model,
    max_tokens, messages, system, temperature, stop_sequences, thinking, tools,
@@ -655,12 +679,7 @@
     (throw (ex-info (str "tools.agents.anthropic/messages-create: :stream true is not supported — "
                           "SSE streaming is not implemented by this client. See README.")
                      {:type :tools.agents.anthropic.error/streaming-unsupported})))
-  (let [caller-name "tools.agents.anthropic/messages-create"
-        url         (api-url (:base-url client) "/v1/messages")
-        headers     (auth-headers client)
-        body-str    (write-json request)]
-    (request-with-retries! (or (:max-retries client) default-max-retries)
-                            #(attempt-request! caller-name url headers body-str))))
+  (post-request! client "tools.agents.anthropic/messages-create" "/v1/messages" request))
 
 (defn count-tokens
   "POST request (same shape as messages-create's request map — model,
@@ -671,12 +690,7 @@
 
    Same retry policy, error hierarchy and ex-data shape as messages-create."
   [client request]
-  (let [caller-name "tools.agents.anthropic/count-tokens"
-        url         (api-url (:base-url client) "/v1/messages/count_tokens")
-        headers     (auth-headers client)
-        body-str    (write-json request)]
-    (request-with-retries! (or (:max-retries client) default-max-retries)
-                            #(attempt-request! caller-name url headers body-str))))
+  (post-request! client "tools.agents.anthropic/count-tokens" "/v1/messages/count_tokens" request))
 
 (defn request-id
   "The `request-id` response header for a successful messages-create/

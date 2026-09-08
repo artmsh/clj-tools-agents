@@ -5,7 +5,7 @@
 
    `handle` is a pure function of (server, message), so every clause below is
    asserted on real wire values with no transport, no subprocess and no mock:
-   the same three-runtime data-in/data-out shape the rest of this repo uses.
+   the same data-in/data-out shape the rest of this repo uses.
    That is not a testing trick — it is what revision 2026-07-28 made possible
    by deleting the handshake and the session."
   (:require [clojure.string :as str]
