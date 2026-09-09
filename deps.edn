@@ -8,4 +8,6 @@
   :test-gemini    {:extra-paths ["test" "."]
                    :main-opts   ["-m" "tools.agents.gemini.test-runner"]}
   :test-mcp       {:extra-paths ["test" "."]
-                   :main-opts   ["-m" "tools.agents.mcp.test-runner"]}}}
+                   :main-opts   ["-m" "tools.agents.mcp.test-runner"]}
+  :test-converge  {:extra-paths ["test" "."]
+                   :main-opts   ["-m" "tools.agents.converge.test-runner"]}}}

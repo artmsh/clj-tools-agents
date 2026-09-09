@@ -20,6 +20,7 @@ one `tools.agents.*` namespace root instead of two `corevector.*` ones.
 | OpenAI Responses & Chat Completions APIs | `tools.agents.openai` | [docs/openai.md](docs/openai.md) |
 | Gemini Developer API | `tools.agents.gemini` | [docs/gemini.md](docs/gemini.md) |
 | Model Context Protocol, revision 2026-07-28 — server, client, stdio & Streamable HTTP | `tools.agents.mcp` (+ `.server`, `.client`, `.stdio`, `.http`) | [docs/mcp.md](docs/mcp.md) |
+| Multi-provider orchestration — call providers concurrently, converge successful texts | `tools.agents.converge` | [docs/converge.md](docs/converge.md) |
 
 Each doc covers that library's usage, full API parity table against its
 vendor SDK, error hierarchy, retries, and platform notes (streaming, HTTP
@@ -74,10 +75,11 @@ against the reference `everything` server.
             :handler (fn [ctx args] (fetch-alerts (get args "state")))}]}))
 ```
 
-See `examples/anthropic/`, `examples/openai/`, `examples/gemini/` and
-`examples/mcp/` for complete, runnable ports of real usage shapes from each
-vendor SDK and from the MCP reference servers — see each doc's Usage section
-for the full list.
+See `examples/anthropic/`, `examples/openai/`, `examples/gemini/`,
+`examples/mcp/` and `examples/converge/` for complete, runnable ports of real
+usage shapes from each vendor SDK, the MCP reference servers, and
+multi-provider orchestration — see each doc's Usage section for the full
+list.
 
 ## Testing
 
@@ -85,12 +87,12 @@ for the full list.
 ./script/test-all.sh
 ```
 
-Runs all four suites (anthropic + openai + gemini + mcp) on JVM Clojure
-(`clojure -M:test-anthropic` / `-M:test-openai` / `-M:test-gemini` /
-`-M:test-mcp`) and Babashka (`bb test`), and fails loudly if either runtime
-is red for any suite. Hermetic — mock servers and in-process loopbacks only,
-no outbound network. See each doc's Testing section for what each suite
-covers.
+Runs all five suites (anthropic + openai + gemini + mcp + converge) on JVM
+Clojure (`clojure -M:test-anthropic` / `-M:test-openai` / `-M:test-gemini` /
+`-M:test-mcp` / `-M:test-converge`) and Babashka (`bb test`), and fails
+loudly if either runtime is red for any suite. Hermetic — mock servers and
+in-process loopbacks only, no outbound network. See each doc's Testing
+section for what each suite covers.
 
 `script/live-check.sh` is OpenAI's manual, non-CI live smoke check against a
 real endpoint — see docs/openai.md's Live smoke check section.
