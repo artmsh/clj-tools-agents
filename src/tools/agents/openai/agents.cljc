@@ -300,7 +300,9 @@
   "DELETE {base-url}/agents/sessions/{session-id} — removes the session from
    the API; physical sandbox cleanup may continue asynchronously. This does
    NOT stop provider compute for a self-hosted environment (per OpenAI's own
-   docs) and has no corresponding webhook. To stop the current turn while
+   docs) and has no corresponding webhook. It may fail with HTTP 409
+   (`:tools.agents.openai/conflict-error`) — seen live on a session that is
+   not yet \"durably idle\" (e.g. just after a turn ended). To stop the current turn while
    KEEPING the session and its history, use `cancel-turn` instead."
   [client session-id]
   (send-request! client "sessions-delete" :delete (str "/agents/sessions/" (path-segment session-id)) nil))
@@ -466,10 +468,12 @@
   (contains? finished-turn-statuses (get turn "status")))
 
 (defn latest-root-turn
-  "The first root-agent turn (\"subagent_id\" nil) in a `sessions-turns-list`
-   response's \"data\", or nil when there is none. Relies on the list being
-   newest first — the API default; do not pass {\"order\" \"asc\"} here.
-   Subagent turns are skipped: they do not decide the session's outcome.
+  "The newest root-agent turn (\"subagent_id\" nil) in a `sessions-turns-list`
+   response's \"data\", or nil when there is none. Newest is the greatest
+   numeric \"created_at\"; turns tied on it, or lacking it, keep list order,
+   first wins — so with the API's default newest-first order a tie within the
+   same second still picks the newer turn. Subagent turns are skipped: they
+   do not decide the session's outcome.
 
    After polling a session out of \"created\"/\"in_progress\", this is the
    turn that just ran: check `turn-finished?`, its \"status\", and its
@@ -480,7 +484,13 @@
     (when-not (vector? data)
       (throw (ex-info "tools.agents.openai.agents/latest-root-turn: response has no \"data\" array"
                        {:type :tools.agents.openai/invalid-response :status nil :body nil})))
-    (some (fn [turn] (when (and (map? turn) (nil? (get turn "subagent_id"))) turn)) data)))
+    (let [created-at (fn [turn] (let [t (get turn "created_at")] (if (number? t) t ##-Inf)))]
+      (reduce (fn [best turn]
+                (if (and (map? turn) (nil? (get turn "subagent_id"))
+                         (or (nil? best) (> (created-at turn) (created-at best))))
+                  turn
+                  best))
+              nil data))))
 
 ;; ---------------------------------------------------------------------------
 ;; Public API — environments (OpenAI-hosted sandbox status)

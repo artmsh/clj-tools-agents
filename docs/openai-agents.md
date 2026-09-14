@@ -56,18 +56,18 @@ way.
      "environment" {"type" "openai_hosted"}
      "input" "Create tree.py, a script that prints a directory tree. Run it."}))
 
-;; No streaming (see below) — poll until the turn leaves "created"/"in_progress".
-(defn wait-until-done [client session-id]
+;; No streaming (see below) — poll the turn, not the session: a failed turn
+;; also leaves the session "idle", and the session can settle before the turn
+;; list shows a finished turn. (A turn "waiting" on a function result never
+;; finishes on its own; see the example's poll-until-done for that case.)
+(defn wait-for-turn [client session-id]
   (loop []
-    (let [session (agents/sessions-retrieve client session-id)]
-      (if (contains? #{"created" "in_progress"} (get session "status"))
-        (do (Thread/sleep 500) (recur))
-        session))))
+    (let [turn (agents/latest-root-turn (agents/sessions-turns-list client session-id))]
+      (if (agents/turn-finished? turn)
+        turn
+        (do (Thread/sleep 500) (recur))))))
 
-(wait-until-done client (get session "id"))
-
-;; "idle" does not mean success: the outcome is on the turn.
-(let [turn (agents/latest-root-turn (agents/sessions-turns-list client (get session "id")))]
+(let [turn (wait-for-turn client (get session "id"))]
   (when-not (= "completed" (get turn "status"))
     (throw (ex-info "turn did not complete" {:turn turn}))))
 
