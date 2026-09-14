@@ -13,9 +13,12 @@
 
 (defn start-server!
   "Bind `port` and answer requests with `handler`, a
-   (fn [{:keys [method path headers body]}]) -> {:status :headers :body}.
-   Headers, in and out, are string-keyed with lower-case names. Returns
-   {:port port :stop! (fn [])}.
+   (fn [{:keys [method path query headers body]}]) -> {:status :headers :body}.
+   Headers, in and out, are string-keyed with lower-case names. `query` is the
+   raw query string with no leading `?` (nil when the request has none) —
+   both runtimes strip it from `path` (java.net.URI/.getPath and httpkit's
+   `:uri` both exclude it), so a suite asserting `?limit=20`-style params
+   needs this key rather than `path`. Returns {:port port :stop! (fn [])}.
 
    `route` is the path the mock answers on. The two branches treat it
    differently and deliberately: httpkit answers on every path and ignores
@@ -29,6 +32,7 @@
                     (fn [req]
                       (let [body (when (:body req) (slurp (:body req)))]
                         (handler {:method (str/upper-case (name (:request-method req))) :path (:uri req)
+                                  :query (:query-string req)
                                   :headers (:headers req) :body (or body "")})))
                     {:port port :legacy-return-value? false})]
        {:port port :stop! (fn [] (hk/server-stop! server))})
@@ -44,6 +48,7 @@
                                          (.getRequestHeaders exchange)))
                    req     {:method (.getRequestMethod exchange)
                             :path (.getPath (.getRequestURI exchange))
+                            :query (.getQuery (.getRequestURI exchange))
                             :headers headers :body body}
                    {:keys [status headers body]} (handler req)
                    resp-bytes (.getBytes (or body "") "UTF-8")]

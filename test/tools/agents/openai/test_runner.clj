@@ -2,11 +2,15 @@
   "Entry point for `clojure -M:test-openai` and `bb test-openai`."
   (:require [clojure.test :as t]
             tools.agents.openai-test
-            tools.agents.openai.live-test))
+            tools.agents.openai.live-test
+            tools.agents.openai.agents-test
+            tools.agents.openai.agents.live-test))
 
 (def suites
   ['tools.agents.openai-test
-   'tools.agents.openai.live-test])
+   'tools.agents.openai.live-test
+   'tools.agents.openai.agents-test
+   'tools.agents.openai.agents.live-test])
 
 (defn -main [& _]
   (let [{:keys [fail error]} (apply t/run-tests suites)]
