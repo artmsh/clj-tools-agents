@@ -87,6 +87,34 @@
     (is (= :tools.agents.openai/invalid-content-shape (:type (ex-data e))))))
 
 ;; ---------------------------------------------------------------------------
+;; latest-root-turn / turn-finished?
+;; ---------------------------------------------------------------------------
+
+(defn- turn [id status subagent-id]
+  {"id" id "object" "agent.session.turn" "status" status "subagent_id" subagent-id})
+
+(deftest latest-root-turn-takes-the-first-root-turn-skipping-subagent-turns
+  (let [turns {"data" [(turn "turn_sub" "in_progress" "subagent_1")
+                       (turn "turn_2" "failed" nil)
+                       (turn "turn_1" "completed" nil)]}]
+    (is (= "turn_2" (get (agents/latest-root-turn turns) "id")))))
+
+(deftest latest-root-turn-is-nil-without-a-root-turn
+  (is (nil? (agents/latest-root-turn {"data" []})))
+  (is (nil? (agents/latest-root-turn {"data" [(turn "turn_sub" "completed" "subagent_1")]}))))
+
+(deftest latest-root-turn-throws-on-a-missing-data-array
+  (let [e (try (agents/latest-root-turn {}) nil (catch Exception e e))]
+    (is (= :tools.agents.openai/invalid-response (:type (ex-data e))))))
+
+(deftest turn-finished-on-terminal-statuses-only
+  (doseq [s ["completed" "failed" "cancelled"]]
+    (is (agents/turn-finished? {"status" s}) s))
+  (doseq [s ["queued" "in_progress" "waiting" nil]]
+    (is (not (agents/turn-finished? {"status" s})) (str s)))
+  (is (not (agents/turn-finished? nil))))
+
+;; ---------------------------------------------------------------------------
 ;; self-hosted-executor-command
 ;; ---------------------------------------------------------------------------
 

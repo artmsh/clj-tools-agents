@@ -43,7 +43,8 @@
      - Turn input: send a message, steer or cancel the active turn, return a
        pending function-tool result.
      - Reading saved work: list a session's items (saved messages and tool
-       calls) and pull assistant text out of them.
+       calls) and pull assistant text out of them; list or retrieve its
+       turns, which carry each turn's status and error.
      - OpenAI-hosted sandbox status: poll an environment's provisioning state.
      - Self-hosted sandboxes: `sessions-create` passes `environment.type`
        \"self_hosted\" straight through like any other field, and
@@ -56,10 +57,12 @@
    `:stream true` refusal: `sessions-create` throws
    `:tools.agents.openai/streaming-unsupported` immediately rather than
    opening an SSE connection. There is also no GET .../events long-poll here.
-   Follow a turn by polling `sessions-retrieve` (its `\"status\"`) and
-   `sessions-items-list` instead — see docs/openai-agents.md's
-   \"No streaming — poll instead\" section for the trade-off and a worked
-   polling loop (`examples/openai/agents_sandbox_task.clj`).
+   Follow a turn by polling `sessions-retrieve` (its `\"status\"`), then read
+   the outcome off the turn (`sessions-turns-list` + `latest-root-turn`) and
+   the output off `sessions-items-list`. The session alone does not carry
+   the outcome: \"idle\" means ready for input, not that the turn succeeded.
+   See docs/openai-agents.md's \"Streaming is not supported — poll instead\"
+   section and `examples/openai/agents_sandbox_task.clj`.
 
    PORTABILITY: exactly one function does real network I/O — the private leaf
    `http-request!` below, isolated with a #?(:bb ... :clj ...) reader
@@ -264,8 +267,8 @@
    `:stream true` / `\"stream\" true` throws immediately, before any network
    request — see the ns docstring's streaming note. The returned session's
    first turn (when `input` was given) keeps running asynchronously on
-   OpenAI's side; poll `sessions-retrieve` or `sessions-items-list` for its
-   outcome.
+   OpenAI's side; poll `sessions-retrieve` until it settles, then read the
+   outcome from `sessions-turns-list` (`latest-root-turn`).
 
    Throws ex-info on any failure — `:type` is one of
    tools.agents.openai's error-hierarchy keywords (see docs/openai.md), plus
@@ -321,9 +324,11 @@
 (defn send-message
   "Send a follow-up `text` message to `session-id` — an
    `agent.session.input.message` event. Steers the active turn if one is
-   running; starts a new turn on an idle session. Subscribe to the session's
-   state (poll `sessions-retrieve`) before calling this if you need to
-   observe the turn's very first state change."
+   running; starts a new turn on an idle session. When polling, an idle
+   session can still read \"idle\" just after this returns, before the new
+   turn starts. Note `latest-root-turn`'s \"id\" before sending and wait for a
+   newer root turn to be `turn-finished?`, rather than trusting the
+   session's status."
   [client session-id text]
   (sessions-events-create client session-id
                            {"events" [{"type" "agent.session.input.message"
@@ -419,6 +424,64 @@
                  acc))
              []
              data))))
+
+;; ---------------------------------------------------------------------------
+;; Public API — turns
+;; ---------------------------------------------------------------------------
+
+(defn sessions-turns-list
+  "GET {base-url}/agents/sessions/{session-id}/turns — the session's turns,
+   newest first by default; the analogue of
+   `client.beta.agents.sessions.turns.list(session_id, **params)`. `params`,
+   if given, is a plain map of query parameters, e.g. {\"order\" \"asc\"
+   \"limit\" 20}; page with \"after\" = the previous page's \"last_id\" while
+   \"has_more\" is true.
+
+   This is where a polled turn's outcome lives. A session whose turn failed
+   goes back to \"idle\" with a nil \"error\", and its items hold only the
+   input — the failure is recorded only on the turn: \"status\" \"failed\"
+   and \"error\" {\"code\" ... \"message\" ...} (e.g.
+   \"credit_balance_exhausted\"). See `latest-root-turn`."
+  ([client session-id] (sessions-turns-list client session-id nil))
+  ([client session-id params]
+   (send-request! client "sessions-turns-list" :get
+                  (str "/agents/sessions/" (path-segment session-id) "/turns" (query-string params)) nil)))
+
+(defn sessions-turns-retrieve
+  "GET {base-url}/agents/sessions/{session-id}/turns/{turn-id} — one turn's
+   \"status\" (\"queued\", \"in_progress\", \"waiting\", \"completed\",
+   \"failed\", \"cancelled\"), timestamps, \"usage\" and \"error\"; the
+   analogue of `client.beta.agents.sessions.turns.retrieve(turn_id, session_id=...)`.
+   A turn id is the \"turn_id\" on the session's items or on a
+   `required_actions` entry."
+  [client session-id turn-id]
+  (send-request! client "sessions-turns-retrieve" :get
+                 (str "/agents/sessions/" (path-segment session-id) "/turns/" (path-segment turn-id)) nil))
+
+(def ^:private finished-turn-statuses #{"completed" "failed" "cancelled"})
+
+(defn turn-finished?
+  "True when `turn` has reached a terminal status: \"completed\", \"failed\"
+   or \"cancelled\"."
+  [turn]
+  (contains? finished-turn-statuses (get turn "status")))
+
+(defn latest-root-turn
+  "The first root-agent turn (\"subagent_id\" nil) in a `sessions-turns-list`
+   response's \"data\", or nil when there is none. Relies on the list being
+   newest first — the API default; do not pass {\"order\" \"asc\"} here.
+   Subagent turns are skipped: they do not decide the session's outcome.
+
+   After polling a session out of \"created\"/\"in_progress\", this is the
+   turn that just ran: check `turn-finished?`, its \"status\", and its
+   \"error\". Throws `:tools.agents.openai/invalid-response` when \"data\" is
+   not an array."
+  [turns-response]
+  (let [data (get turns-response "data")]
+    (when-not (vector? data)
+      (throw (ex-info "tools.agents.openai.agents/latest-root-turn: response has no \"data\" array"
+                       {:type :tools.agents.openai/invalid-response :status nil :body nil})))
+    (some (fn [turn] (when (and (map? turn) (nil? (get turn "subagent_id"))) turn)) data)))
 
 ;; ---------------------------------------------------------------------------
 ;; Public API — environments (OpenAI-hosted sandbox status)
