@@ -99,6 +99,18 @@
                        (turn "turn_1" "completed" nil)]}]
     (is (= "turn_2" (get (agents/latest-root-turn turns) "id")))))
 
+(deftest latest-root-turn-picks-by-created-at-not-list-order
+  ;; created_at values from a live two-turn session.
+  (let [older (assoc (turn "turn_1" "failed" nil) "created_at" 1789413451)
+        newer (assoc (turn "turn_2" "in_progress" nil) "created_at" 1789413482)]
+    (is (= "turn_2" (get (agents/latest-root-turn {"data" [newer older]}) "id")))
+    (is (= "turn_2" (get (agents/latest-root-turn {"data" [older newer]}) "id")))))
+
+(deftest latest-root-turn-ties-keep-list-order
+  (let [a (assoc (turn "turn_a" "failed" nil) "created_at" 100)
+        b (assoc (turn "turn_b" "failed" nil) "created_at" 100)]
+    (is (= "turn_a" (get (agents/latest-root-turn {"data" [a b]}) "id")))))
+
 (deftest latest-root-turn-is-nil-without-a-root-turn
   (is (nil? (agents/latest-root-turn {"data" []})))
   (is (nil? (agents/latest-root-turn {"data" [(turn "turn_sub" "completed" "subagent_1")]}))))

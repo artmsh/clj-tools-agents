@@ -445,6 +445,38 @@
         (is (= "credit_balance_exhausted" (get-in result [:turn "error" "code"]))))
       (finally (stop!)))))
 
+(deftest example-sandbox-task-waits-for-the-turn-when-the-session-settles-first
+  ;; Session already "idle", but the turn list is empty, then in progress,
+  ;; then failed — polling must not stop on the session status alone.
+  (let [turn-hits (atom 0)
+        {:keys [port stop!]}
+        (start-server! 19024 "/v1/agents/sessions"
+          (fn [{:keys [method path]}]
+            (cond
+              (and (= method "POST") (= path "/v1/agents/sessions"))
+              {:status 200 :body (canned-session "sess_1" "in_progress")}
+
+              (and (= method "GET") (= path "/v1/agents/sessions/sess_1"))
+              {:status 200 :body (canned-session "sess_1" "idle")}
+
+              (and (= method "GET") (= path "/v1/agents/sessions/sess_1/turns"))
+              {:status 200 :body (canned-turns (case (swap! turn-hits inc)
+                                                 1 []
+                                                 2 [(canned-turn "turn_1" "in_progress" nil)]
+                                                 [(canned-turn "turn_1" "failed" credit-error)]))}
+
+              (and (= method "GET") (= path "/v1/agents/sessions/sess_1/items"))
+              {:status 200 :body "{\"object\":\"list\",\"data\":[],\"has_more\":false}"}
+
+              :else {:status 404 :body "{}"})))]
+    (try
+      (let [client (oai/client {:api-key "k" :base-url (base-url port)})
+            result (ex-task/run-example client {:interval-ms 1 :max-attempts 10 :sleep-fn (fn [_] nil)})]
+        (is (= 3 @turn-hits))
+        (is (= "turn_1" (get-in result [:turn "id"])))
+        (is (= "failed" (get-in result [:turn "status"]))))
+      (finally (stop!)))))
+
 (deftest example-sandbox-task-poll-timeout-throws
   (let [{:keys [port stop!]}
         (start-server! 19018 "/v1/agents/sessions"
