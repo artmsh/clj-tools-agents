@@ -431,8 +431,8 @@
 
 (defn sessions-turns-list
   "GET {base-url}/agents/sessions/{session-id}/turns — the session's turns,
-   newest first by default; the analogue of
-   `client.beta.agents.sessions.turns.list(session_id, **params)`. `params`,
+   newest first by default (confirmed against the live API; OpenAI's events
+   guide links it only through the API reference). `params`,
    if given, is a plain map of query parameters, e.g. {\"order\" \"asc\"
    \"limit\" 20}; page with \"after\" = the previous page's \"last_id\" while
    \"has_more\" is true.
@@ -450,8 +450,7 @@
 (defn sessions-turns-retrieve
   "GET {base-url}/agents/sessions/{session-id}/turns/{turn-id} — one turn's
    \"status\" (\"queued\", \"in_progress\", \"waiting\", \"completed\",
-   \"failed\", \"cancelled\"), timestamps, \"usage\" and \"error\"; the
-   analogue of `client.beta.agents.sessions.turns.retrieve(turn_id, session_id=...)`.
+   \"failed\", \"cancelled\"), timestamps, \"usage\" and \"error\".
    A turn id is the \"turn_id\" on the session's items or on a
    `required_actions` entry."
   [client session-id turn-id]

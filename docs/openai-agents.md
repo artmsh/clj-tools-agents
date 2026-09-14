@@ -26,7 +26,10 @@ several internally-contradictory claims (`/v1/agents/sessions` vs
 literal one the docs' own `curl` examples show) that only the raw source
 resolved. Every endpoint implemented here is one shown verbatim in a `curl`
 example or literal endpoint text on an OpenAI doc page; nothing is guessed
-from an SDK method's name alone.
+from an SDK method's name alone. The one exception to "a guide's `curl`
+example" is turns (`GET .../sessions/{id}/turns[/{turn_id}]`): the events
+guide links them only through the API reference, so their shape and default
+newest-first order were confirmed against the live API.
 
 Two things the docs show only as SDK method calls, with no literal REST path
 or JSON schema anywhere — saved/reusable `agent` CRUD
@@ -93,8 +96,8 @@ test suite runs it instantly against a mock server) and
 | … `events=[{"type": "agent.session.input.cancel"}]` | `(cancel-turn client session-id)` | Session and prior work remain available. |
 | … `events=[{"type": "agent.session.input.tool_result", ...}]` | `(send-tool-result client session-id {:turn-id .. :call-id .. :success .. :output/:error ..})` | Copy `:turn-id`/`:call-id` from the matching `required_actions` entry. |
 | `client.beta.agents.sessions.items.list(id, **params)` | `(sessions-items-list client session-id params)` | Saved messages and tool calls, including completed turns' output. |
-| `client.beta.agents.sessions.turns.list(id, **params)` | `(sessions-turns-list client session-id params)` / `(sessions-turns-list client session-id)` | Newest first by default. Each turn carries `"status"` and `"error"` — the only pollable record of a failed turn. |
-| `client.beta.agents.sessions.turns.retrieve(turn_id, session_id=id)` | `(sessions-turns-retrieve client session-id turn-id)` | |
+| `GET /v1/agents/sessions/{id}/turns` (API reference; verified live) | `(sessions-turns-list client session-id params)` / `(sessions-turns-list client session-id)` | Newest first by default. Each turn carries `"status"` and `"error"` — the only pollable record of a failed turn. |
+| `GET /v1/agents/sessions/{id}/turns/{turn_id}` (API reference; verified live) | `(sessions-turns-retrieve client session-id turn-id)` | |
 | *(no SDK helper)* | `(latest-root-turn turns-response)` / `(turn-finished? turn)` | Pure: newest turn with `"subagent_id"` nil; terminal status check. See Streaming below. |
 | `item.content[…].text` traversal (no single SDK helper — see below) | `(items-output-text items-response)` | Concatenates every assistant `output_text` block, oldest-first when called with `{"order" "asc"}`. See its own docstring for one deliberate divergence from `tools.agents.openai/output-text`'s stricter contract. |
 | `GET /v1/agents/environments/{id}` (literal endpoint text, not an SDK example) | `(environments-retrieve client environment-id)` | Poll an `openai_hosted` sandbox's provisioning state: `"provisioning"` → `"connected"`/`"failed"`. |
