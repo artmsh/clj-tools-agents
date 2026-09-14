@@ -63,6 +63,11 @@ way.
 
 (wait-until-done client (get session "id"))
 
+;; "idle" does not mean success: the outcome is on the turn.
+(let [turn (agents/latest-root-turn (agents/sessions-turns-list client (get session "id")))]
+  (when-not (= "completed" (get turn "status"))
+    (throw (ex-info "turn did not complete" {:turn turn}))))
+
 ;; Pull the assistant's final text out of the session's saved items.
 (-> (agents/sessions-items-list client (get session "id") {"order" "asc"})
     (agents/items-output-text))
@@ -88,6 +93,9 @@ test suite runs it instantly against a mock server) and
 | … `events=[{"type": "agent.session.input.cancel"}]` | `(cancel-turn client session-id)` | Session and prior work remain available. |
 | … `events=[{"type": "agent.session.input.tool_result", ...}]` | `(send-tool-result client session-id {:turn-id .. :call-id .. :success .. :output/:error ..})` | Copy `:turn-id`/`:call-id` from the matching `required_actions` entry. |
 | `client.beta.agents.sessions.items.list(id, **params)` | `(sessions-items-list client session-id params)` | Saved messages and tool calls, including completed turns' output. |
+| `client.beta.agents.sessions.turns.list(id, **params)` | `(sessions-turns-list client session-id params)` / `(sessions-turns-list client session-id)` | Newest first by default. Each turn carries `"status"` and `"error"` — the only pollable record of a failed turn. |
+| `client.beta.agents.sessions.turns.retrieve(turn_id, session_id=id)` | `(sessions-turns-retrieve client session-id turn-id)` | |
+| *(no SDK helper)* | `(latest-root-turn turns-response)` / `(turn-finished? turn)` | Pure: newest turn with `"subagent_id"` nil; terminal status check. See Streaming below. |
 | `item.content[…].text` traversal (no single SDK helper — see below) | `(items-output-text items-response)` | Concatenates every assistant `output_text` block, oldest-first when called with `{"order" "asc"}`. See its own docstring for one deliberate divergence from `tools.agents.openai/output-text`'s stricter contract. |
 | `GET /v1/agents/environments/{id}` (literal endpoint text, not an SDK example) | `(environments-retrieve client environment-id)` | Poll an `openai_hosted` sandbox's provisioning state: `"provisioning"` → `"connected"`/`"failed"`. |
 | `codex exec-server --remote ... --environment-id ...` (shell, not an SDK call) | `(self-hosted-executor-command session)` | Pure function from a created self-hosted session to the executor's argv — see Self-hosted sandboxes below for what this library does and does not do here. |
@@ -129,13 +137,40 @@ gives, for the same reason: SSE is out of scope for a client built around one
 synchronous request/response leaf per call. There is also no
 `GET .../sessions/{id}/events` long-poll implemented.
 
-The trade-off this makes: a turn's *early* progress events (intermediate
-tool calls, partial text) are invisible to this client. What is NOT lost is
-the turn's *outcome* — poll `sessions-retrieve`'s `"status"` (leaves
-`"created"`/`"in_progress"` for `"idle"`, `"failed"`, or
-`"requires_action"`) and `sessions-items-list` for the saved result once it
-lands, exactly as `examples/openai/agents_sandbox_task.clj`'s
-`poll-until-done` does. For a session that needs a function result or a
+The trade-off this makes: a turn's progress events (intermediate tool calls,
+partial text) are invisible to this client. The turn's *outcome* is still
+readable, but not from the session. Poll `sessions-retrieve`'s `"status"`
+until it leaves `"created"`/`"in_progress"`, then read the turn:
+
+```clojure
+(-> (agents/sessions-turns-list client session-id)
+    (agents/latest-root-turn))
+;; => {"id" "turn_..." "status" "failed"
+;;     "error" {"code" "credit_balance_exhausted"
+;;              "message" "You have no credits remaining. ..."} ...}
+```
+
+A session is **not** evidence of success. Observed against the live API: a
+turn that failed on `credit_balance_exhausted` left the session `"idle"`
+with `"error"` nil, and its items held only the user's input message. OpenAI's
+own events guide says the same: `agent.session.idle` means the session is
+ready for more input, not that its last turn succeeded. The failure was
+recorded only on the turn (`"status" "failed"`, `"error"`), and on the SSE
+stream as `error` and `agent.session.turn.failed` events. The stream does not
+replay missed events.
+
+Two polling pitfalls follow:
+
+- **Check the turn, not just the session.** `turn-finished?` is true for
+  `"completed"`, `"failed"` and `"cancelled"`; only `"completed"` is success.
+  `examples/openai/agents_sandbox_task.clj`'s `run-example` returns the turn
+  with the output.
+- **Follow-up input races the status.** Right after `send-message`, an idle
+  session can still read `"idle"` before the new turn starts. Record
+  `latest-root-turn`'s `"id"` before sending, then poll `sessions-turns-list`
+  until a root turn with a different id is `turn-finished?`.
+
+Items (`sessions-items-list`) carry the output of a completed turn. For a session that needs a function result or a
 self-hosted environment connection mid-turn, `"requires_action"` plus the
 retrieved session's `"required_actions"` array carries everything
 `agent.session.requires_action` would have streamed, just pulled instead of
@@ -209,7 +244,9 @@ a request to a different endpoint.
 ## Testing
 
 `test/tools/agents/openai/agents_test.cljc` is pure logic — zero I/O — for
-this namespace's two genuinely pure public functions: `items-output-text`
+this namespace's pure public functions: `latest-root-turn`/`turn-finished?`
+(subagent turns skipped, no root turn yields nil, missing `"data"` throws,
+terminal statuses only) and `items-output-text`
 (message vs. non-message vs. non-assistant items, multi-turn concatenation, a
 tool-only turn yielding `""`, and every malformed-input throw, including an
 empty-string `environment.id`/`remote_url` on `self-hosted-executor-command`,
@@ -229,7 +266,7 @@ isolation.
 `test/tools/agents/openai/agents/live_test.cljc` runs the same local mock
 server the sibling suites share (`tools.agents.test-support`): request
 method/path/headers/body for every resource method, query-string building
-for `sessions-list`/`sessions-items-list` (compared as parsed params, not an
+for `sessions-list`/`sessions-items-list`/`sessions-turns-list` (compared as parsed params, not an
 exact string, since neither this library's `query-string` builder nor a
 Clojure map's own iteration order guarantees key order), the exact wire
 shape of `send-message`/`cancel-turn`/`send-tool-result`, non-2xx errors
@@ -238,7 +275,9 @@ loop actually firing through this namespace's own transport leaf, connection
 failures, `:stream true` rejected before any network activity (both string-
 and keyword-keyed), a missing-credentials guard on a hand-built client map,
 and both `examples/openai/agents_*.clj` files run end-to-end against the mock
-server — including the polling example's timeout path, with `sleep-fn`
+server — including the live no-credits shape (session `"idle"`, items holding
+only the input, the turn `"failed"` with `credit_balance_exhausted`) surfacing
+through `run-example`'s `:turn`, and the polling example's timeout path, with `sleep-fn`
 injected so none of it costs real wall-clock.
 
 Port range `19000`–`19039` — chosen not to collide with the sibling suites'

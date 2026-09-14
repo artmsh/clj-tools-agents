@@ -36,6 +36,16 @@
        "\"content\":[{\"type\":\"output_text\",\"text\":\"" assistant-text "\"}]}],"
        "\"has_more\":false}"))
 
+(def ^:private credit-error
+  "{\"code\":\"credit_balance_exhausted\",\"message\":\"You have no credits remaining.\"}")
+
+(defn- canned-turn [id status error-json]
+  (str "{\"id\":\"" id "\",\"object\":\"agent.session.turn\",\"session_id\":\"sess_1\","
+       "\"subagent_id\":null,\"status\":\"" status "\",\"error\":" (or error-json "null") "}"))
+
+(defn- canned-turns [turn-jsons]
+  (str "{\"object\":\"list\",\"data\":[" (str/join "," turn-jsons) "],\"has_more\":false}"))
+
 ;; ---------------------------------------------------------------------------
 ;; sessions-create
 ;; ---------------------------------------------------------------------------
@@ -229,6 +239,43 @@
       (finally (stop!)))))
 
 ;; ---------------------------------------------------------------------------
+;; sessions-turns-list / sessions-turns-retrieve
+;; ---------------------------------------------------------------------------
+
+(deftest sessions-turns-list-sends-query-and-decodes-the-failed-turn
+  (let [captured (atom nil)
+        {:keys [port stop!]} (start-server! 19021 "/v1/agents/sessions/sess_1/turns"
+                                (fn [req] (reset! captured req)
+                                  {:status 200 :body (canned-turns [(canned-turn "turn_2" "failed" credit-error)
+                                                                    (canned-turn "turn_1" "completed" nil)])}))]
+    (try
+      (let [client (oai/client {:api-key "k" :base-url (base-url port)})
+            turns  (agents/sessions-turns-list client "sess_1" {"limit" 2})
+            turn   (agents/latest-root-turn turns)]
+        (is (= "GET" (:method @captured)))
+        (is (= "/v1/agents/sessions/sess_1/turns" (:path @captured)))
+        (is (= "agents=v1" (get-in @captured [:headers "openai-beta"])))
+        (is (= {"limit" "2"} (parse-query (:query @captured))))
+        (is (= "turn_2" (get turn "id")))
+        (is (agents/turn-finished? turn))
+        (is (= "credit_balance_exhausted" (get-in turn ["error" "code"]))))
+      (finally (stop!)))))
+
+(deftest sessions-turns-retrieve-gets-by-id
+  (let [captured (atom nil)
+        {:keys [port stop!]} (start-server! 19022 "/v1/agents/sessions/sess_1/turns/turn_1"
+                                (fn [req] (reset! captured req)
+                                  {:status 200 :body (canned-turn "turn_1" "in_progress" nil)}))]
+    (try
+      (let [client (oai/client {:api-key "k" :base-url (base-url port)})
+            turn   (agents/sessions-turns-retrieve client "sess_1" "turn_1")]
+        (is (= "GET" (:method @captured)))
+        (is (= "/v1/agents/sessions/sess_1/turns/turn_1" (:path @captured)))
+        (is (= "in_progress" (get turn "status")))
+        (is (not (agents/turn-finished? turn))))
+      (finally (stop!)))))
+
+;; ---------------------------------------------------------------------------
 ;; environments-retrieve
 ;; ---------------------------------------------------------------------------
 
@@ -355,13 +402,47 @@
               (and (= method "GET") (= path "/v1/agents/sessions/sess_1/items"))
               {:status 200 :body (canned-items "here is your directory tree")}
 
+              (and (= method "GET") (= path "/v1/agents/sessions/sess_1/turns"))
+              {:status 200 :body (canned-turns [(canned-turn "turn_1" "completed" nil)])}
+
               :else {:status 404 :body "{}"})))]
     (try
       (let [client (oai/client {:api-key "k" :base-url (base-url port)})
             result (ex-task/run-example client {:interval-ms 1 :max-attempts 10 :sleep-fn (fn [_] nil)})]
         (is (= "idle" (:status result)))
+        (is (= "completed" (get-in result [:turn "status"])))
         (is (= "here is your directory tree" (:output result)))
         (is (= 3 @session-hits)))
+      (finally (stop!)))))
+
+(deftest example-sandbox-task-surfaces-a-failed-turn-behind-an-idle-session
+  ;; The live no-credits shape: session back to "idle" with no error, items
+  ;; holding only the user's input — the failure is only on the turn.
+  (let [{:keys [port stop!]}
+        (start-server! 19023 "/v1/agents/sessions"
+          (fn [{:keys [method path]}]
+            (cond
+              (and (= method "POST") (= path "/v1/agents/sessions"))
+              {:status 200 :body (canned-session "sess_1" "in_progress")}
+
+              (and (= method "GET") (= path "/v1/agents/sessions/sess_1"))
+              {:status 200 :body (canned-session "sess_1" "idle")}
+
+              (and (= method "GET") (= path "/v1/agents/sessions/sess_1/items"))
+              {:status 200 :body (str "{\"object\":\"list\",\"data\":[{\"type\":\"message\",\"role\":\"user\","
+                                      "\"content\":[{\"type\":\"input_text\",\"text\":\"task\"}]}],\"has_more\":false}")}
+
+              (and (= method "GET") (= path "/v1/agents/sessions/sess_1/turns"))
+              {:status 200 :body (canned-turns [(canned-turn "turn_1" "failed" credit-error)])}
+
+              :else {:status 404 :body "{}"})))]
+    (try
+      (let [client (oai/client {:api-key "k" :base-url (base-url port)})
+            result (ex-task/run-example client {:interval-ms 1 :max-attempts 10 :sleep-fn (fn [_] nil)})]
+        (is (= "idle" (:status result)))
+        (is (= "" (:output result)))
+        (is (= "failed" (get-in result [:turn "status"])))
+        (is (= "credit_balance_exhausted" (get-in result [:turn "error" "code"]))))
       (finally (stop!)))))
 
 (deftest example-sandbox-task-poll-timeout-throws

@@ -19,7 +19,9 @@ files in the current directory. Run it and show me the output.\",
    `run-example` instead creates the session with `stream` omitted, polls
    `sessions-retrieve` until the session leaves the two in-flight statuses
    OpenAI's docs name (\"created\", \"in_progress\"), and returns the
-   assistant's final text pulled from `sessions-items-list`."
+   turn that ran (from `sessions-turns-list`) with the assistant's final text
+   pulled from `sessions-items-list`. The turn is the outcome: a failed turn
+   leaves the session \"idle\"."
   (:require [tools.agents.openai :as oai]
             [tools.agents.openai.agents :as agents]))
 
@@ -75,15 +77,18 @@ files in the current directory. Run it and show me the output.\",
          :else (do (sleep-fn interval-ms) (recur (inc attempt))))))))
 
 (defn run-example
-  "Create the task session, poll it to completion, and return the assistant's
-   final text (via `items-output-text`) alongside the session's terminal
-   `\"status\"`."
+  "Create the task session, poll it to completion, and return the session's
+   terminal `\"status\"`, the root turn that ran (`:turn`, whose \"status\"
+   and \"error\" say whether it succeeded) and the assistant's final text
+   (via `items-output-text`)."
   ([client] (run-example client {}))
   ([client poll-opts]
    (let [session (create-task-session client)
          final   (poll-until-done client (get session "id") poll-opts)
+         turn    (agents/latest-root-turn (agents/sessions-turns-list client (get session "id")))
          items   (agents/sessions-items-list client (get session "id") {"order" "asc"})]
      {:status (get final "status")
+      :turn   turn
       :output (agents/items-output-text items)})))
 
 ;; JVM-only manual entry point (not exercised by the automated suite, and
@@ -92,6 +97,6 @@ files in the current directory. Run it and show me the output.\",
 ;; OpenAI-hosted sandbox costs real container time; run this deliberately,
 ;; e.g. `clojure -M -e "(require 'examples.openai.agents-sandbox-task) (examples.openai.agents-sandbox-task/-main)"`.
 (defn -main [& _]
-  (let [{:keys [status output]} (run-example (oai/client))]
-    (println "status:" status)
+  (let [{:keys [status turn output]} (run-example (oai/client))]
+    (println "status:" status "turn:" (get turn "status") (or (get turn "error") ""))
     (println output)))
