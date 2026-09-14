@@ -18,6 +18,7 @@ one `tools.agents.*` namespace root instead of two `corevector.*` ones.
 |---|---|---|
 | Anthropic Messages API | `tools.agents.anthropic` (+ `.visualize`, `.spec`) | [docs/anthropic.md](docs/anthropic.md) |
 | OpenAI Responses & Chat Completions APIs | `tools.agents.openai` | [docs/openai.md](docs/openai.md) |
+| OpenAI Agents API (beta) — managed sessions, turns, OpenAI-hosted & self-hosted sandboxes | `tools.agents.openai.agents` | [docs/openai-agents.md](docs/openai-agents.md) |
 | Gemini Developer API | `tools.agents.gemini` | [docs/gemini.md](docs/gemini.md) |
 | Model Context Protocol, revision 2026-07-28 — server, client, stdio & Streamable HTTP | `tools.agents.mcp` (+ `.server`, `.client`, `.stdio`, `.http`) | [docs/mcp.md](docs/mcp.md) |
 | Multi-provider orchestration — call providers concurrently, converge successful texts | `tools.agents.converge` | [docs/converge.md](docs/converge.md) |
@@ -49,6 +50,21 @@ against the reference `everything` server.
 (-> (oai/responses-create client
       {"model" "gpt-5.5" "input" "Say hello in one short sentence."})
     (oai/output-text))
+```
+
+```clojure
+(require '[tools.agents.openai :as oai]
+         '[tools.agents.openai.agents :as agents])
+
+(def client (oai/client {:api-key (System/getenv "OPENAI_API_KEY")}))  ;; same client, agents/* just adds "OpenAI-Beta: agents=v1"
+(def session (agents/sessions-create client
+               {"agent" {"model" "gpt-6-astra" "instructions" "Write clean code, run it, and report the actual output."}
+                "environment" {"type" "openai_hosted"}
+                "input" "Create tree.py and run it."}))
+;; No streaming — poll until the turn leaves "created"/"in_progress":
+(loop [] (if (#{"created" "in_progress"} (get (agents/sessions-retrieve client (get session "id")) "status"))
+           (do (Thread/sleep 500) (recur))
+           (agents/items-output-text (agents/sessions-items-list client (get session "id") {"order" "asc"}))))
 ```
 
 ```clojure

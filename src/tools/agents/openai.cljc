@@ -300,9 +300,15 @@
 ;; single httpx.Client across attempts. Building one per call would allocate a
 ;; fresh selector thread for every retry (java.net.http.HttpClient had no
 ;; close() before Java 21).
-#?(:bb  (def ^:private bb-http-client
+;;
+;; PUBLIC (not ^:private) so tools.agents.openai.agents' own http-request!
+;; leaf can share the SAME underlying client rather than opening a second one
+;; — that namespace's docs recommend building one tools.agents.openai/client
+;; and using it with both namespaces, which only avoids doubling the
+;; connection pool if the delay itself is shared too.
+#?(:bb  (def bb-http-client
           (delay (http/client (assoc http/default-client-opts :version :http1.1))))
-   :clj (def ^:private jvm-http-client
+   :clj (def jvm-http-client
           (delay (-> (java.net.http.HttpClient/newBuilder)
                      (.version java.net.http.HttpClient$Version/HTTP_1_1)
                      (.build)))))
@@ -404,7 +410,12 @@
 ;; Error typing
 ;; ---------------------------------------------------------------------------
 
-(defn- status->type [status]
+(defn status->type
+  "HTTP status -> this library's :type keyword. Public (not ^:private) so
+   tools.agents.openai.agents' own resource methods can throw the exact same
+   keywords for the exact same wire-error semantics, rather than maintaining
+   a second copy of this table that could silently drift from this one."
+  [status]
   (cond
     (= status 400) :tools.agents.openai/bad-request-error
     (= status 401) :tools.agents.openai/authentication-error
@@ -579,9 +590,11 @@
              jitter-num (- 1000 (long (* 250 (rand-fn))))]
          (max 0 (quot (* base jitter-num) 1000)))))))
 
-(defn- extract-error-message
+(defn extract-error-message
   "Best-effort extraction of OpenAI's {\"error\":{\"message\":\"...\"}} shape.
-   Returns nil (never throws) on any parse failure."
+   Returns nil (never throws) on any parse failure. Public (not ^:private) so
+   tools.agents.openai.agents reuses this verbatim rather than a second copy
+   — the Agents API's error bodies use the exact same shape."
   [body]
   (when (seq body)
     (try
@@ -597,13 +610,15 @@
 ;; Request plumbing
 ;; ---------------------------------------------------------------------------
 
-(defn- endpoint-url
+(defn endpoint-url
   "Join client's base-url with an endpoint path like \"/responses\".
 
    The base-url already carries `/v1` (openai-python's default is
    `https://api.openai.com/v1`), so this must NOT re-add it the way
    tools.agents.anthropic's messages-url does — that would produce
-   `.../v1/v1/responses`."
+   `.../v1/v1/responses`. Public (not ^:private) so
+   tools.agents.openai.agents reuses this join logic verbatim instead of a
+   second copy that could drift from it."
   [base-url path]
   (if (str/ends-with? base-url "/")
     (str base-url (subs path 1))

@@ -15,6 +15,12 @@ handful of places where the two libraries deliberately behave *differently*
 are called out in "Divergences from tools.agents.anthropic" below; they all come
 from following the respective vendor SDK rather than each other.
 
+For OpenAI's separate (beta) Agents API — managed sessions/turns and
+OpenAI-hosted or self-hosted sandboxes, distinct from the Responses/Chat
+Completions APIs this doc covers — see
+[tools.agents.openai.agents](openai-agents.md), which reuses the `client`
+built here as-is.
+
 ## Usage
 
 ```clojure
