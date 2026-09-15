@@ -6,6 +6,7 @@
             tools.agents.openai.agents-test
             tools.agents.openai.agents.live-test
             tools.agents.openai.embeddings-test
+            tools.agents.openai.files-test
             tools.agents.openai.webhooks-test
             tools.agents.openai.realtime-test))
 
@@ -15,6 +16,7 @@
    'tools.agents.openai.agents-test
    'tools.agents.openai.agents.live-test
    'tools.agents.openai.embeddings-test
+   'tools.agents.openai.files-test
    'tools.agents.openai.webhooks-test
    'tools.agents.openai.realtime-test])
 
