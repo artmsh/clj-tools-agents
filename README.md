@@ -124,7 +124,7 @@ openai (and so openai.agents) and gemini clients:
                {"agent" {"model" "gpt-6-astra" "instructions" "Write clean code, run it, and report the actual output."}
                 "environment" {"type" "openai_hosted"}
                 "input" "Create tree.py and run it."}))
-;; No streaming — poll until the turn leaves "created"/"in_progress":
+;; Poll until the session leaves "created"/"in_progress" (or stream: sessions-create-stream + await-root-turn):
 (loop [] (if (#{"created" "in_progress"} (get (agents/sessions-retrieve client (get session "id")) "status"))
            (do (Thread/sleep 500) (recur))
            (agents/items-output-text (agents/sessions-items-list client (get session "id") {"order" "asc"}))))

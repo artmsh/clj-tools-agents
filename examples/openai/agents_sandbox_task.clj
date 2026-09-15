@@ -2,8 +2,8 @@
   "Port of the Agents API quickstart's directory-tree task
    (https://developers.openai.com/api/docs/guides/agents-api/quickstart),
    using OpenAI-hosted-sandbox polling instead of the doc's SSE `stream: true`
-   — see tools.agents.openai.agents' ns docstring for why streaming is not
-   implemented here:
+   (the streaming equivalent is `(await-root-turn (sessions-create-stream
+   client request))`; this example shows the polling path):
 
      with client.beta.agents.sessions.create(
          agent={\"model\": \"gpt-6-astra\",

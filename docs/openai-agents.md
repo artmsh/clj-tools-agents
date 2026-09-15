@@ -73,6 +73,26 @@ environment-file token paging behaves on a real environment. The content
 reference page has a `curl` example but no Returns block; the SDK sends
 `Accept: application/octet-stream` and reads a binary response.
 
+Event streaming is implemented from two literal `curl` examples. The
+[events guide](https://developers.openai.com/api/docs/guides/agents-api/sessions/events.md)
+shows `curl -N ".../v1/agents/sessions/$session_id/events?stream=true" -H
+"OpenAI-Beta: agents=v1" -H "Accept: text/event-stream"` (a GET), and the
+[sessions guide](https://developers.openai.com/api/docs/guides/agents-api/sessions.md)
+shows `curl --no-buffer` POSTing `/v1/agents/sessions` with `"stream": true`
+("to receive events from the first turn in the same request"). The event
+union (30 types) comes from the
+[stream reference](https://developers.openai.com/api/reference/resources/beta/subresources/agents/subresources/sessions/subresources/events/methods/stream/index.md),
+which gives schemas but no example payloads. openai-python's
+`sessions/events.py` sends only `Accept: text/event-stream`; this client
+sends the header and `?stream=true`, as the guide does. The "invented
+`.../events` shape" mentioned above was an LLM summary's; the literal curl
+supersedes it. **Not yet verified live** (probe
+`session-event-streaming-against-the-real-api` has not run): whether frames
+carry an `event:` line or a `[DONE]` sentinel (both tolerated), and whether
+the server closes the events stream after a turn or keeps it open. The
+input-event POST in its streaming-guide form (`sessions.events.create`) is
+shown only as SDK code and is out of scope; `send-message` covers input.
+
 ## Usage
 
 ```clojure
@@ -89,10 +109,21 @@ reference page has a `curl` example but no Returns block; the SDK sends
      "environment" {"type" "openai_hosted"}
      "input" "Create tree.py, a script that prints a directory tree. Run it."}))
 
-;; No streaming (see below) — poll the turn, not the session: a failed turn
-;; also leaves the session "idle", and the session can settle before the turn
-;; list shows a finished turn. (A turn "waiting" on a function result never
-;; finishes on its own; see the example's poll-until-done for that case.)
+;; Streaming: subscribe, then send work, then wait for the ROOT turn.
+(let [sid (get session "id")
+      s   (agents/sessions-events-stream client sid)]
+  (agents/send-message client sid "Now add a --depth flag.")
+  (-> (agents/await-root-turn s {:on-event #(some-> (get % "delta") print)})
+      (get "turn")))                    ; throws on failed/cancelled/error/truncated
+
+;; Or create a session and stream its first turn in one request.
+(agents/await-root-turn
+  (agents/sessions-create-stream client {"environment" {"type" "none"} "input" "Say hi."}))
+
+;; Or poll the turn, not the session: a failed turn also leaves the session
+;; "idle", and the session can settle before the turn list shows a finished
+;; turn. (A turn "waiting" on a function result never finishes on its own;
+;; see the example's poll-until-done for that case.)
 (defn wait-for-turn [client session-id]
   (loop []
     (let [turn (agents/latest-root-turn (agents/sessions-turns-list client session-id))]
@@ -159,7 +190,7 @@ test suite runs it instantly against a mock server) and
 | `client.beta.agents.update(agent_id, **params)` — `POST /v1/agents/{agent_id}` | `(agents-update client agent-id request)` | Omitted fields unchanged; `nil` clears `name`/`instructions`; `"metadata"` replaces wholesale (`nil`/`{}` clears). |
 | `client.beta.agents.list(**params)` — `GET /v1/agents` | `(agents-list client params)` / `(agents-list client)` | Same cursor paging as `sessions-list`: `after`/`limit`/`order` (default `desc`); response has `first_id`/`last_id`/`has_more`. |
 | `client.beta.agents.delete(agent_id)` — `DELETE /v1/agents/{agent_id}` | `(agents-delete client agent-id)` | Returns `{"deleted" true "object" "agent.deleted"}`. Deleting an agent live sessions reference is undocumented. |
-| `client.beta.agents.sessions.create(**params)` | `(sessions-create client request)` | `request` passed through to JSON almost verbatim. Throws immediately on `stream: true` — see Streaming below. |
+| `client.beta.agents.sessions.create(**params)` | `(sessions-create client request)` | `request` passed through to JSON almost verbatim. Throws immediately on `stream: true`: use `sessions-create-stream`. |
 | `client.beta.agents.sessions.retrieve(id)` | `(sessions-retrieve client session-id)` | |
 | `client.beta.agents.sessions.list(**params)` | `(sessions-list client params)` / `(sessions-list client)` | `params` is a plain query-param map (`{"limit" 20 "order" "desc" "after" "sess_..."}`); page with `"after"` = the previous page's `"last_id"` while `"has_more"` is true. |
 | `client.beta.agents.sessions.delete(id)` | `(sessions-delete client session-id)` | Removes the session from the API; does not stop self-hosted provider compute (per OpenAI's own docs) and has no webhook. |
@@ -180,7 +211,10 @@ test suite runs it instantly against a mock server) and
 | `client.beta.agents.sessions.artifacts.delete(artifact_id, session_id=)` — `DELETE /v1/agents/sessions/{session_id}/artifacts/{artifact_id}` | `(sessions-artifacts-delete client session-id artifact-id)` | Deletes the published copy only. Returns `{"deleted" true "object" "agent.session.artifact.deleted"}`. |
 | `client.beta.agents.environments.files.list(environment_id, **params)` — `GET /v1/agents/environments/{environment_id}/files` | `(environments-files-list client environment-id params)` / `(environments-files-list client environment-id)` | **Token paging** (`SyncTokenPage`), not `after`: response `{"object" "page" "has_more" .. "next" ..}`; pass `"page"` = `"next"`, keeping `path`/`order`/`limit`. Connected environments only. Unverified live (P1). |
 | `client.beta.agents.environments.files.create(environment_id, type=, path=, data=/file_id=)` — `POST /v1/agents/environments/{environment_id}/files` | `(environments-files-create client environment-id request)` | JSON body, not multipart. `{"type" "inline" "path" .. "data" ..}` or `{"type" "file_id" "path" .. "file_id" ..}`. `"data"`: a base64 String is sent verbatim; `byte[]`/`File`/`Path` is read and std-base64-encoded. Inline ≤5 MiB before encoding (API-enforced). No delete/retrieve endpoint exists. |
-| `client.beta.agents.sessions.create(..., stream=True)` / `.events.stream(...)` | **rejected outright** / *(not implemented)* | See Streaming below. |
+| `client.beta.agents.sessions.create(..., stream=True)` — `POST /v1/agents/sessions` with `"stream": true` | `(sessions-create-stream client request)` | Sets `"stream" true`; returns a single-use reducible of decoded events for the first turn, starting with `agent.session.created`. See Streaming below. |
+| `client.beta.agents.sessions.events.stream(session_id)` — `GET /v1/agents/sessions/{session_id}/events?stream=true` | `(sessions-events-stream client session-id)` / `(sessions-events-stream client session-id params)` | `Accept: text/event-stream` + `?stream=true`. Request sent at call time; retries and HTTP errors before the first byte, typed as every other method. Events are the decoded JSON maps, verbatim (including `error` events). |
+| the events guide's `stream_session` helper (docs code, not an SDK method) | `(await-root-turn events)` / `(await-root-turn events {:on-event f})` | Reduces until the root turn's `agent.session.turn.completed` and returns that event; throws `turn-failed`, `turn-cancelled`, `session-failed`, `stream-error`, `stream-truncated`. |
+| *(no SDK helper)* | `(root-turn-finished? event)` | Pure: root (`subagent_id` nil) `turn.completed`/`.failed`/`.cancelled`. |
 
 ### Credentials & headers
 
@@ -194,7 +228,7 @@ methods, error keywords, streaming) is tabulated in
 
 ### Error hierarchy
 
-Every resource method here throws the exact same `:type` keywords
+Every request here throws the exact same `:type` keywords
 `tools.agents.openai`'s own resource methods do (see
 [docs/openai.md](openai.md)'s error-hierarchy table) — **not** a
 `.agents`-suffixed set. Two reasons: the wire error shape
@@ -206,23 +240,90 @@ failure surfaces with whatever `:type` that shared function already bakes in
 `catch` written against one namespace's errors composes with the other's for
 free.
 
+Streaming adds five keywords in the same namespace that
+`tools.agents.openai` itself never throws: `stream-error`, `session-failed`,
+`turn-failed`, `turn-cancelled` and `stream-truncated`. They are thrown while
+the events are reduced, never by a request, and are tabulated in "Streaming,
+or poll" below.
+
 The message prefix, however, IS this namespace's own —
 `"tools.agents.openai.agents/sessions-create: HTTP 429 ..."` — so you can
 still tell which library's resource method actually failed.
 
-### Streaming is not supported — poll instead
+### Streaming, or poll
 
-`sessions-create`'s `:stream true` / `"stream" true` throws
-`{:type :tools.agents.openai/streaming-unsupported}` immediately, before any
-network request — the same refusal `tools.agents.openai/responses-create`
-gives, for the same reason: SSE is out of scope for a client built around one
-synchronous request/response leaf per call. There is also no
-`GET .../sessions/{id}/events` long-poll implemented.
+Two endpoints stream Server-Sent Events, each through
+`tools.agents.stream/open-event-stream` with `tools.agents.openai/request!`
+(`:as :stream`) as the opening request:
 
-The trade-off this makes: a turn's progress events (intermediate tool calls,
-partial text) are invisible to this client. The turn's *outcome* is still
-readable, but not from the session. Poll `sessions-retrieve`'s `"status"`
-until it leaves `"created"`/`"in_progress"`, then read the turn:
+- `sessions-events-stream`: `GET .../sessions/{id}/events?stream=true`,
+  `Accept: text/event-stream`. Live events for an existing session.
+- `sessions-create-stream`: `POST .../sessions` with `"stream" true`. The
+  created session's first-turn events in the same response.
+  `sessions-create` keeps refusing `stream: true`
+  (`:tools.agents.openai/streaming-unsupported`), because its JSON transport
+  cannot read an SSE body.
+
+Contract, shared by both:
+
+- **Opened at call time.** Retries (openai's policy, the client's
+  `:max-retries`) and non-2xx errors (`not-found-error`, `rate-limit-error`,
+  ...) happen inside the call, before any event is handed out. Nothing is
+  retried once reading starts: the API does not replay missed events.
+- **Single-use reducible.** `reduce`/`into`/`run!`/`transduce` consume it once;
+  a second reduce throws `:tools.agents.stream/consumed`. The reduce closes
+  the connection on completion, early termination (`reduced`,
+  `(into [] (take n) s)`) and exceptions. A stream never reduced must be
+  released with `tools.agents.stream/close!`, which is also the cross-thread
+  cancel (Babashka's `reify` cannot also implement `java.io.Closeable`, so
+  `with-open` works only on the JVM).
+- **Events** are the decoded JSON maps exactly as sent, string keys, dispatched
+  on `"type"`. The 30 documented types and any new ones pass through. The SSE
+  frame name and id sit in metadata (`:tools.agents.sse/event`,
+  `:tools.agents.sse/id`). Blank keep-alive frames are dropped; a
+  `data: [DONE]` sentinel (not documented for this API) ends the stream.
+- **Errors while reading.** A connection failure mid-stream throws
+  `:tools.agents.openai/api-connection-error` (the IOException as cause). An
+  `error` event is an event, not an exception: the raw stream passes it
+  through (the guide's handler receives it) and `await-root-turn` raises.
+  Divergence: openai-python's `Stream` raises `APIError` on any data carrying
+  an `"error"` map.
+- **Truncation is not an error on the raw stream.** A body that simply ends
+  (the server closed, a proxy cut it) reduces like a complete one;
+  `(tools.agents.stream/outcome s)` is then `:eof`, versus `:reduced` when
+  the reducer stopped, `:cancelled` after `close!`, `:done` on `[DONE]`.
+  Whether the turn ended is known only from its events: `root-turn-finished?`.
+  `await-root-turn` turns an end before the root turn's terminal event into
+  `:tools.agents.openai/stream-truncated` (`:outcome` in `ex-data`).
+- **No read-idle timeout.** A stalled server blocks the reduce until someone
+  calls `close!`.
+
+`await-root-turn` ports the events guide's `stream_session` helper. It
+continues on `agent.session.idle` and every other event, ignores subagent
+turn events, returns the root `agent.session.turn.completed` event (its
+`"turn"` and `"usage"`), and throws ex-info carrying `:event`:
+
+| event | `:type` | extra `ex-data` |
+|---|---|---|
+| root `agent.session.turn.failed` | `:tools.agents.openai/turn-failed` | `:turn`, `:error` (turn.error) |
+| root `agent.session.turn.cancelled` | `:tools.agents.openai/turn-cancelled` | `:turn` |
+| `agent.session.failed`, `agent.session.environment.failed` | `:tools.agents.openai/session-failed` | `:error` |
+| `error` | `:tools.agents.openai/stream-error` | `:error` |
+| end of events first | `:tools.agents.openai/stream-truncated` | `:outcome` |
+
+**Subscribe before sending work.** Open `sessions-events-stream`, then
+`send-message`; a turn that finishes before the stream opens is never seen.
+A completed turn does not guarantee every tool succeeded: read the output.
+
+**Recovering a disconnected stream** (guide): open a new stream and buffer
+its events, read `sessions-retrieve` and `sessions-items-list` while it stays
+connected, restore state by `item_id`, apply buffered updates for items not
+yet final, then resume. `output_text.done` replaces a partial delta buffer.
+This library does not automate that.
+
+Polling remains available and needs no open connection. Poll
+`sessions-retrieve`'s `"status"` until it leaves `"created"`/`"in_progress"`,
+then read the turn:
 
 ```clojure
 (-> (agents/sessions-turns-list client session-id)
@@ -255,8 +356,7 @@ Two polling pitfalls follow:
 Items (`sessions-items-list`) carry the output of a completed turn. For a session that needs a function result or a
 self-hosted environment connection mid-turn, `"requires_action"` plus the
 retrieved session's `"required_actions"` array carries everything
-`agent.session.requires_action` would have streamed, just pulled instead of
-pushed.
+`agent.session.requires_action` streams, pulled instead of pushed.
 
 Webhooks (`agent.session.idle` etc.) are the other half of OpenAI's
 recommended non-streaming story, but they need an HTTP endpoint of your
@@ -356,7 +456,7 @@ shape of `send-message`/`cancel-turn`/`send-tool-result`, non-2xx errors
 mapping through the same status table `tools.agents.openai` uses, the retry
 loop actually firing through `send-request!` (the thin adapter over
 `tools.agents.openai/request!`), connection
-failures, `:stream true` rejected before any network activity (both string-
+failures, `:stream true` rejected by `sessions-create` before any network activity (both string-
 and keyword-keyed), a missing-credentials guard on a hand-built client map,
 and both `examples/openai/agents_*.clj` files run end-to-end against the mock
 server — including the live no-credits shape (session `"idle"`, items holding
@@ -386,6 +486,26 @@ connected it creates `/workspace/in.txt` and pages env files with `limit` 1;
 after the turn it lists, retrieves, downloads (byte-exact), and deletes the
 artifact, then expects a 404. Cleanup cancels and deletes the session,
 retrying a 409. It costs a short turn and **has not been run yet**.
+
+Event streaming (ports `19041`–`19048`): `sessions-events-stream` sends GET,
+`Accept: text/event-stream`, the beta header and `stream=true` alongside
+caller params; events reach the reducer while the server is still blocked
+(incremental delivery); the synthetic `test/resources/sse/agents-turn.sse`
+fixture decodes verbatim across its eleven event types; an `event:`/`id:` frame,
+a blank keep-alive and `[DONE]` are handled; `(into [] (take 2) s)` makes the
+server see a disconnect and a second reduce throws `consumed`; a 404 before
+the stream is `not-found-error` without retry; a 503 is retried before the
+first byte; a mid-stream abort is `api-connection-error`;
+`sessions-create-stream` POSTs `"stream": true`, and `await-root-turn`
+returns the completed turn and closes the still-open connection; a body
+ending before the terminal event is `stream-truncated` with `:outcome :eof`.
+`root-turn-finished?` and `await-root-turn`'s rules (root vs subagent,
+failed, cancelled, session/environment failed, `error`, truncation) are
+tested over plain collections.
+`session-event-streaming-against-the-real-api` (same gate; costs two short
+turns on an `environment: none` session) streams `sessions-create-stream`
+to completion, then opens `sessions-events-stream` before `send-message` and
+awaits the second turn. It **has not been run yet**.
 
 Port range `19000`–`19079` — chosen not to collide with the sibling suites'
 ranges (anthropic `18930`–`18975`, gemini `18980`–`18997`, openai

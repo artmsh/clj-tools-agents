@@ -6,13 +6,15 @@
 
    Port range 19000-19079 — chosen not to collide with the sibling suites'
    ranges (anthropic 18930-18975, gemini 18980-18997, openai 18950-18971)."
-  (:require [clojure.test :refer [deftest is]]
+  (:require [clojure.test :refer [deftest is testing]]
             [clojure.string :as str]
             [tools.agents.openai :as oai]
             [tools.agents.openai.agents :as agents]
+            [tools.agents.sse :as sse]
+            [tools.agents.stream :as stream]
             [examples.openai.agents-sandbox-task :as ex-task]
             [examples.openai.agents-self-hosted :as ex-self-hosted]
-            [tools.agents.test-support :refer [start-server! rotating-token-cache]]))
+            [tools.agents.test-support :refer [start-server! start-abort-server! rotating-token-cache]]))
 
 (defn- base-url [port] (str "http://127.0.0.1:" port "/v1"))
 
@@ -860,6 +862,270 @@
     (is (str/includes? (str (ex-message e)) "java.lang.Long"))))
 
 ;; ---------------------------------------------------------------------------
+;; Event streaming (#25): sessions-events-stream, sessions-create-stream,
+;; root-turn-finished?, await-root-turn. Ports 19041-19049.
+;; ---------------------------------------------------------------------------
+
+(def ^:private sse-headers {"content-type" "text/event-stream"})
+
+(def ^:private turn-fixture (slurp "test/resources/sse/agents-turn.sse"))
+
+(defn- fixture-frames
+  "The fixture's `data: ...` frames, each with its trailing blank line."
+  []
+  (mapv #(str % "\n\n") (re-seq #"(?m)^data: .*$" turn-fixture)))
+
+(defn- fixture-events [] (mapv (comp oai/read-json :data) (sse/parse-string turn-fixture)))
+
+(defn- until-gone!
+  "Streaming-body helper: SSE comments every 10 ms until the client
+   disconnects, then deliver `gone` true (false after ~5 s)."
+  [send! gone]
+  (loop [i 0]
+    (cond
+      (not (send! ": keep-alive\n\n")) (deliver gone true)
+      (> i 500)                        (deliver gone false)
+      :else                            (do (Thread/sleep 10) (recur (inc i))))))
+
+(defn- turn-event [type status subagent-id & {:as extra}]
+  (merge {"type" type "event_id" "evt_x" "session_id" "sess_1" "turn_id" "turn_9"
+          "turn" {"id" "turn_9" "object" "agent.session.turn" "subagent_id" subagent-id
+                  "status" status "error" (get extra "error")}}
+         (dissoc extra "error")))
+
+(deftest sessions-events-stream-gets-with-accept-and-stream-query-and-delivers-incrementally
+  (let [captured   (atom nil)
+        seen-first (promise)
+        server-saw (promise)
+        frames     (fixture-frames)
+        {:keys [port stop!]}
+        (start-server! 19041 "/v1/agents/sessions/sess_1/events"
+          (fn [req]
+            (reset! captured req)
+            {:status 200 :headers sse-headers
+             :body (fn [send!]
+                     (send! (first frames))
+                     ;; The rest goes out only once the reducer has seen event 1.
+                     (deliver server-saw (deref seen-first 5000 :timeout))
+                     (doseq [f (rest frames)] (send! f)))}))]
+    (try
+      (let [client (oai/client {:api-key "k" :base-url (base-url port)})
+            s      (agents/sessions-events-stream client "sess_1" {"limit" 5})
+            events (reduce (fn [acc ev]
+                             (deliver seen-first :seen)
+                             (conj acc ev))
+                           [] s)]
+        (is (= :seen @server-saw) "event 1 reached the reducer while the server was still blocked")
+        (let [req @captured]
+          (is (= "GET" (:method req)))
+          (is (= "/v1/agents/sessions/sess_1/events" (:path req)))
+          (is (= {"stream" "true" "limit" "5"} (parse-query (:query req))))
+          (is (= "text/event-stream" (get (:headers req) "accept")))
+          (is (= "agents=v1" (get (:headers req) "openai-beta")))
+          (is (= "Bearer k" (get (:headers req) "authorization"))))
+        (is (= (fixture-events) events) "decoded JSON maps, verbatim")
+        (is (= 12 (count events)))
+        (let [by-type (group-by #(get % "type") events)]
+          (is (= "in_progress" (get-in (first (by-type "agent.session.in_progress")) ["session" "status"])))
+          (is (= "queued" (get-in (first (by-type "agent.session.turn.created")) ["turn" "status"])))
+          (is (= "message" (get-in (first (by-type "agent.session.turn.item.added")) ["item" "type"])))
+          (is (= ["Acme competes" " on price and distribution."]
+                 (map #(get % "delta") (by-type "agent.session.turn.output_text.delta"))))
+          (is (= "Acme competes on price and distribution."
+                 (get (first (by-type "agent.session.turn.output_text.done")) "text")))
+          (is (= 821 (get-in (first (by-type "agent.session.turn.completed")) ["usage" "total_tokens"]))))
+        (is (= "message" (:tools.agents.sse/event (meta (first events)))) "SSE frame name kept as metadata")
+        (is (= :eof (stream/outcome s)))
+        (is (= 200 (:status (stream/response s)))))
+      (finally (deliver seen-first :cleanup) (stop!)))))
+
+(deftest sessions-events-stream-tolerates-event-lines-keep-alives-and-done
+  (let [{:keys [port stop!]}
+        (start-server! 19042 "/v1/agents/sessions/sess_1/events"
+          (fn [_] {:status 200 :headers sse-headers
+                   :body (fn [send!]
+                           (send! ": comment\n\n")
+                           (send! "event: agent.session.idle\nid: 7\ndata: {\"type\":\"agent.session.idle\",\"event_id\":\"evt_1\"}\n\n")
+                           (send! "data:\n\n")
+                           (send! "data: [DONE]\n\n")
+                           (send! "data: {\"type\":\"never\"}\n\n"))}))]
+    (try
+      (let [client (oai/client {:api-key "k" :base-url (base-url port)})
+            s      (agents/sessions-events-stream client "sess_1")
+            events (into [] s)]
+        (is (= [{"type" "agent.session.idle" "event_id" "evt_1"}] events))
+        (is (= {:tools.agents.sse/event "agent.session.idle" :tools.agents.sse/id "7"} (meta (first events))))
+        (is (= :done (stream/outcome s)) "[DONE] ends the stream without reaching the decoder"))
+      (finally (stop!)))))
+
+(deftest sessions-events-stream-early-termination-closes-the-connection
+  (let [gone   (promise)
+        frames (fixture-frames)
+        {:keys [port stop!]}
+        (start-server! 19043 "/v1/agents/sessions/sess_1/events"
+          (fn [_] {:status 200 :headers sse-headers
+                   :body (fn [send!]
+                           (doseq [f (take 3 frames)] (send! f))
+                           (until-gone! send! gone))}))]
+    (try
+      (let [client (oai/client {:api-key "k" :base-url (base-url port)})
+            s      (agents/sessions-events-stream client "sess_1")]
+        (is (= ["agent.session.in_progress" "agent.session.turn.created"]
+               (into [] (comp (take 2) (map #(get % "type"))) s)))
+        (is (true? (deref gone 5000 :timeout)) "server saw the client disconnect")
+        (is (= :reduced (stream/outcome s)))
+        (is (= :tools.agents.stream/consumed
+               (:type (ex-data (try (into [] s) nil (catch Exception e e)))))))
+      (finally (stop!)))))
+
+(deftest sessions-events-stream-http-error-before-the-stream-is-typed
+  (let [hits (atom 0)
+        {:keys [port stop!]}
+        (start-server! 19044 "/v1/agents/sessions/sess_missing/events"
+          (fn [_] (swap! hits inc)
+            {:status 404 :headers {"content-type" "application/json"}
+             :body "{\"error\":{\"message\":\"No session found\",\"type\":\"invalid_request_error\"}}"}))]
+    (try
+      (let [client (oai/client {:api-key "k" :base-url (base-url port)})
+            e      (try (agents/sessions-events-stream client "sess_missing") nil (catch Exception e e))]
+        (is (= :tools.agents.openai/not-found-error (:type (ex-data e))))
+        (is (= 404 (:status (ex-data e))))
+        (is (str/includes? (:body (ex-data e)) "No session found"))
+        (is (str/includes? (ex-message e) "tools.agents.openai.agents/sessions-events-stream: HTTP 404 No session found"))
+        (is (= 1 @hits) "a 404 is not retried"))
+      (finally (stop!)))))
+
+(deftest sessions-events-stream-retries-a-503-before-the-first-byte
+  (let [hits (atom 0)
+        {:keys [port stop!]}
+        (start-server! 19045 "/v1/agents/sessions/sess_1/events"
+          (fn [_]
+            (if (= 1 (swap! hits inc))
+              {:status 503 :headers {"retry-after-ms" "1"} :body "{\"error\":{\"message\":\"busy\"}}"}
+              {:status 200 :headers sse-headers :body (apply str (fixture-frames))})))]
+    (try
+      (let [client (oai/client {:api-key "k" :base-url (base-url port) :max-retries 1})
+            events (into [] (agents/sessions-events-stream client "sess_1"))]
+        (is (= 2 @hits))
+        (is (= (fixture-events) events)))
+      (finally (stop!)))))
+
+(deftest sessions-events-stream-mid-stream-abort-is-a-connection-error
+  (let [{:keys [port stop!]}
+        (start-abort-server! 19046 {:headers sse-headers :chunks (take 2 (fixture-frames))})]
+    (try
+      (let [client (oai/client {:api-key "k" :base-url (base-url port) :max-retries 0})
+            seen   (atom [])
+            e      (try (reduce (fn [_ ev] (swap! seen conj (get ev "type"))) nil
+                                (agents/sessions-events-stream client "sess_1"))
+                        nil (catch Exception e e))]
+        (is (= ["agent.session.in_progress" "agent.session.turn.created"] @seen))
+        (is (= :tools.agents.openai/api-connection-error (:type (ex-data e))))
+        (is (instance? java.io.IOException (ex-cause e))))
+      (finally (stop!)))))
+
+(deftest sessions-create-stream-posts-stream-true-and-awaits-the-root-turn
+  (let [captured (atom nil)
+        gone     (promise)
+        frames   (fixture-frames)
+        {:keys [port stop!]}
+        (start-server! 19047 "/v1/agents/sessions"
+          (fn [req]
+            (reset! captured req)
+            {:status 200 :headers sse-headers
+             :body (fn [send!]
+                     ;; Everything through turn.completed, then hold the
+                     ;; connection open: await-root-turn must close it.
+                     (doseq [f (take 11 frames)] (send! f))
+                     (until-gone! send! gone))}))]
+    (try
+      (let [client (oai/client {:api-key "k" :base-url (base-url port)})
+            s      (agents/sessions-create-stream client {"environment" {"type" "none"} "input" "hi"
+                                                          :stream false})
+            deltas (atom [])
+            done   (agents/await-root-turn s {:on-event #(some->> (get % "delta") (swap! deltas conj))})]
+        (let [req @captured]
+          (is (= "POST" (:method req)))
+          (is (= "/v1/agents/sessions" (:path req)))
+          (is (= "text/event-stream" (get (:headers req) "accept")))
+          (is (= "agents=v1" (get (:headers req) "openai-beta")))
+          (is (= {"environment" {"type" "none"} "input" "hi" "stream" true} (oai/read-json (:body req)))))
+        (is (= "agent.session.turn.completed" (get done "type")))
+        (is (= "completed" (get-in done ["turn" "status"])))
+        (is (agents/turn-finished? (get done "turn")))
+        (is (= ["Acme competes" " on price and distribution."] @deltas))
+        (is (true? (deref gone 5000 :timeout)) "the stream closed after the root turn completed")
+        (is (= :reduced (stream/outcome s))))
+      (finally (stop!)))))
+
+(deftest await-root-turn-over-a-truncated-stream-throws-stream-truncated
+  (let [{:keys [port stop!]}
+        (start-server! 19048 "/v1/agents/sessions/sess_1/events"
+          (fn [_] {:status 200 :headers sse-headers :body (apply str (take 8 (fixture-frames)))}))]
+    (try
+      (let [client (oai/client {:api-key "k" :base-url (base-url port)})
+            s      (agents/sessions-events-stream client "sess_1")
+            e      (try (agents/await-root-turn s) nil (catch Exception e e))]
+        (is (= :tools.agents.openai/stream-truncated (:type (ex-data e))))
+        (is (= :eof (:outcome (ex-data e))))
+        (is (= :eof (stream/outcome s))))
+      (finally (stop!)))))
+
+(deftest sessions-create-stream-still-leaves-sessions-create-refusing-stream
+  (let [client (oai/client {:api-key "k" :base-url "http://127.0.0.1:19999/v1"})
+        e      (try (agents/sessions-create client {"input" "hi" "stream" true}) nil (catch Exception e e))]
+    (is (= :tools.agents.openai/streaming-unsupported (:type (ex-data e))))
+    (is (str/includes? (ex-message e) "sessions-create-stream"))))
+
+(deftest root-turn-finished?-only-for-root-terminal-turn-events
+  (is (agents/root-turn-finished? (turn-event "agent.session.turn.completed" "completed" nil)))
+  (is (agents/root-turn-finished? (turn-event "agent.session.turn.failed" "failed" nil)))
+  (is (agents/root-turn-finished? (turn-event "agent.session.turn.cancelled" "cancelled" nil)))
+  (is (not (agents/root-turn-finished? (turn-event "agent.session.turn.completed" "completed" "sub_1"))))
+  (is (not (agents/root-turn-finished? (turn-event "agent.session.turn.in_progress" "in_progress" nil))))
+  (is (not (agents/root-turn-finished? {"type" "agent.session.idle"})))
+  (is (not (agents/root-turn-finished? nil)))
+  (is (= [false false false false false false false false false false true false]
+         (mapv agents/root-turn-finished? (fixture-events)))))
+
+(deftest await-root-turn-pure-rules
+  (let [events   (fixture-events)
+        sub-done (turn-event "agent.session.turn.completed" "completed" "sub_1")
+        thrown   (fn [evs] (try (agents/await-root-turn evs) nil (catch Exception e (ex-data e))))]
+    (testing "returns the root turn.completed event; later events are not read"
+      (let [seen (atom 0)]
+        (is (= (nth events 10) (agents/await-root-turn events {:on-event (fn [_] (swap! seen inc))})))
+        (is (= 11 @seen))))
+    (testing "idle and subagent turn events do not end the wait"
+      (is (= :tools.agents.openai/stream-truncated
+             (:type (thrown [{"type" "agent.session.idle"} sub-done
+                             (turn-event "agent.session.turn.failed" "failed" "sub_1")]))))
+      (is (nil? (:outcome (thrown [sub-done]))) "a plain collection has no stream outcome")
+      (is (= "completed" (get-in (agents/await-root-turn (into [sub-done] events)) ["turn" "status"]))))
+    (testing "root turn failed"
+      (let [err  {"code" "credit_balance_exhausted" "message" "You have no credits remaining."}
+            data (thrown [(turn-event "agent.session.turn.failed" "failed" nil "error" err)])]
+        (is (= :tools.agents.openai/turn-failed (:type data)))
+        (is (= err (:error data)))
+        (is (= "failed" (get-in data [:turn "status"])))))
+    (testing "root turn cancelled"
+      (is (= :tools.agents.openai/turn-cancelled
+             (:type (thrown [(turn-event "agent.session.turn.cancelled" "cancelled" nil)])))))
+    (testing "session and environment failures"
+      (is (= :tools.agents.openai/session-failed
+             (:type (thrown [{"type" "agent.session.failed" "session" {"status" "failed" "error" "boom"}}]))))
+      (let [data (thrown [{"type" "agent.session.environment.failed" "session_id" "sess_1"
+                           "environment" {"id" "env_1" "status" "failed"
+                                          "error" {"code" "sandbox_error" "message" "no capacity" "type" "x"}}}])]
+        (is (= :tools.agents.openai/session-failed (:type data)))
+        (is (= "sandbox_error" (get-in data [:error "code"])))))
+    (testing "error event"
+      (let [data (thrown [{"type" "error" "event_id" "evt_e" "session_id" "sess_1"
+                           "error" {"code" nil "message" "internal" "param" nil "type" "server_error"}}])]
+        (is (= :tools.agents.openai/stream-error (:type data)))
+        (is (= "internal" (get-in data [:error "message"])))))))
+
+;; ---------------------------------------------------------------------------
 ;; REAL-API saved-agent CRUD round trip — the one test in this file that
 ;; talks to OpenAI. Skipped (a single passing assertion) unless both
 ;; OPENAI_AGENTS_LIVE=1 and OPENAI_API_KEY are set, so a key merely present in
@@ -1011,3 +1277,39 @@
         (is (= [["Bearer tok-1" "agents=v1"] ["Bearer tok-2" "agents=v1"]] @auths))
         (is (= 2 @fetches)))
       (finally (stop!)))))
+
+;; ---------------------------------------------------------------------------
+;; REAL-API streaming probe (#25, P3). Same gate and env overrides as above.
+;; COSTS MONEY: one `environment: none` session and two short turns. Covers
+;; sessions-create-stream (first turn in the POST response) and
+;; sessions-events-stream opened before send-message (the guide's order).
+;; ---------------------------------------------------------------------------
+
+(deftest session-event-streaming-against-the-real-api
+  (if-let [api-key (and (= "1" (System/getenv "OPENAI_AGENTS_LIVE"))
+                       (not-empty (System/getenv "OPENAI_API_KEY")))]
+    (let [client     (oai/client {:api-key api-key
+                                  :base-url (env "OPENAI_AGENTS_BASE_URL" "https://api.openai.com/v1")})
+          model      (env "OPENAI_AGENTS_MODEL" "gpt-5.5")
+          session-id (atom nil)]
+      (try
+        (let [s    (agents/sessions-create-stream client
+                     {"agent" {"model" model "instructions" "Reply with exactly: OK"}
+                      "environment" {"type" "none"}
+                      "input" "Say OK."})
+              ;; capture the id from whichever event carries it first, so cleanup never leaks a paid session
+              done (agents/await-root-turn s {:on-event #(when-let [id (or (get-in % ["session" "id"])
+                                                                            (get % "session_id"))]
+                                                           (compare-and-set! session-id nil id))})]
+          (is (string? @session-id))
+          (is (= "completed" (get-in done ["turn" "status"])) (pr-str done)))
+        (when @session-id
+          (let [s    (agents/sessions-events-stream client @session-id)
+                _    (agents/send-message client @session-id "Say OK again.")
+                text (StringBuilder.)
+                done (agents/await-root-turn s {:on-event #(some->> (get % "delta") (.append text))})]
+            (is (= "completed" (get-in done ["turn" "status"])) (pr-str done))
+            (is (str/includes? (str text) "OK") (str text))))
+        (finally
+          (when @session-id (live-cleanup-session! client @session-id)))))
+    (is true "skipped: set OPENAI_AGENTS_LIVE=1 and OPENAI_API_KEY")))
