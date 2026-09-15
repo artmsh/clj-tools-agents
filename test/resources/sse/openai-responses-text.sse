@@ -1,0 +1,15 @@
+event: response.created
+data: {"type":"response.created","response":{"id":"resp_67ccfcdd16748190a91872c75d38539e09e4d4aac714747c","object":"response","created_at":1741487325,"status":"in_progress","model":"gpt-6-astra","output":[],"usage":null},"sequence_number":1}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","item_id":"msg_123","output_index":0,"content_index":0,"delta":"In","sequence_number":2}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","item_id":"msg_123","output_index":0,"content_index":0,"delta":" a shimmering","sequence_number":3}
+
+event: response.output_text.done
+data: {"type":"response.output_text.done","item_id":"msg_123","output_index":0,"content_index":0,"text":"In a shimmering","sequence_number":4}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_67ccfcdd16748190a91872c75d38539e09e4d4aac714747c","object":"response","created_at":1741487325,"status":"completed","model":"gpt-6-astra","output":[{"id":"msg_123","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"In a shimmering","annotations":[]}]}],"usage":{"input_tokens":37,"output_tokens":11,"total_tokens":48}},"sequence_number":5}
+

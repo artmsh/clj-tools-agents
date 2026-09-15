@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run all five suites (anthropic + openai + gemini + mcp + fusion) on every supported runtime.
+# Run all six suites (core + anthropic + openai + gemini + mcp + fusion) on every supported runtime.
 # Any failure fails the script.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -9,6 +9,7 @@ fail=0
 echo "── JVM Clojure ────────────────────────────"
 # `clojure`, not `clj`: the latter wraps the former in rlwrap, which aborts
 # with "My terminal reports width=0" when there is no TTY — i.e. under CI.
+clojure -M:test-core      || fail=1
 clojure -M:test-anthropic || fail=1
 clojure -M:test-openai    || fail=1
 clojure -M:test-gemini    || fail=1
