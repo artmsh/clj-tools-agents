@@ -58,6 +58,16 @@
                         "output" [{"id" "msg_1" "type" "message" "role" "assistant"
                                    "content" [{"type" "output_text" "text" text "annotations" []}]}]}})
 
+(defn- until-gone!
+  "Streaming-body helper: SSE comments every 10 ms until the client
+   disconnects, then deliver `gone` true (false after ~5 s)."
+  [send! gone]
+  (loop [i 0]
+    (cond
+      (not (send! ": ping\n\n")) (deliver gone true)
+      (> i 500)                  (deliver gone false)
+      :else                      (do (Thread/sleep 10) (recur (inc i))))))
+
 (defn- send-events! [send! events]
   (doseq [e events] (send! (sse (get e "type") (ev-json e)))))
 
@@ -143,11 +153,14 @@
 
 (deftest responses-error-event-throws-typed-after-earlier-events
   (let [hits (atom 0)
+        gone (promise)
         err  {"type" "error" "code" "ERR_SOMETHING" "message" "Something went wrong" "param" nil "sequence_number" 3}]
     (with-server r-route
       (fn [_] (swap! hits inc)
         {:status 200 :headers sse-headers
-         :body (fn [send!] (send-events! send! [r-created (text-delta "partial") err]))})
+         :body (fn [send!]
+                 (send-events! send! [r-created (text-delta "partial") err (text-delta "never")])
+                 (until-gone! send! gone))})
       (fn [client]
         (let [s    (oai/responses-stream client {"model" "m"})
               seen (atom [])
@@ -157,8 +170,10 @@
           (is (nil? (:status (ex-data e))))
           (is (= (ev-json err) (:body (ex-data e))))
           (is (= "ERR_SOMETHING" (get-in (ex-data e) [:error "code"])))
+          (is (= err (:event (ex-data e))))
           (is (= "tools.agents.openai/responses-stream: stream error: Something went wrong" (ex-message e)))
           (is (= :failed (stream/outcome s)))
+          (is (true? (deref gone 5000 :timeout)) "the server observed the disconnect")
           (is (= 1 @hits) "nothing is retried once the stream has started")))))
   (testing "any event with a top-level error object"
     (with-server r-route
@@ -452,21 +467,28 @@
 
 (deftest chat-error-chunk-mid-stream-throws-typed
   (let [hits (atom 0)
+        gone (promise)
         err  "{\"error\":{\"message\":\"The server had an error\",\"type\":\"server_error\",\"code\":null}}"]
     (with-server c-route
       (fn [_] (swap! hits inc)
         {:status 200 :headers sse-headers
-         :body (fn [send!] (send-chunks! send! [(first hello-chunks)] :done? false) (send! (sse err)))})
+         :body (fn [send!]
+                 (send-chunks! send! (take 2 hello-chunks) :done? false)
+                 (send! (sse err))
+                 (send-chunks! send! (drop 2 hello-chunks) :done? false)
+                 (until-gone! send! gone))})
       (fn [client]
         (let [s    (oai/chat-completions-stream client {"model" "m"})
               seen (atom 0)
               e    (thrown #(run! (fn [_] (swap! seen inc)) s))]
-          (is (= 1 @seen))
+          (is (= 2 @seen) "chunks before the error are delivered, none after")
           (is (= :tools.agents.openai/stream-error (:type (ex-data e))))
           (is (= err (:body (ex-data e))))
           (is (= "server_error" (get-in (ex-data e) [:error "type"])))
+          (is (= (oai/read-json err) (:event (ex-data e))))
           (is (= "tools.agents.openai/chat-completions-stream: stream error: The server had an error" (ex-message e)))
           (is (= :failed (stream/outcome s)))
+          (is (true? (deref gone 5000 :timeout)) "the server observed the disconnect")
           (is (= 1 @hits)))))))
 
 (deftest chat-opening-errors-retries-and-401

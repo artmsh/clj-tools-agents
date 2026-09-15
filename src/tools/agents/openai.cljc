@@ -819,15 +819,22 @@
         (or (string? v) (coll? v)) (boolean (seq v))
         :else                    true))
 
-(defn- stream-event-error
-  "The typed ex-info for an in-stream error event, or nil. Two shapes, both
-   :tools.agents.openai/stream-error with :status nil, :body the raw data
-   string (nil from a pure accumulator) and :error the error object:
+(defn stream-event-error
+  "The typed ex-info for an in-stream error event, or nil. Shared by every
+   openai stream (responses, chat completions, openai.agents sessions) and
+   their accumulators. Two shapes, both :tools.agents.openai/stream-error
+   with :status nil, :body the raw data string (nil from a pure
+   accumulator), :error the error object and :event the decoded event:
      - any data object with a truthy top-level \"error\" (openai-python
-       _streaming.py raises APIError for it);
+       _streaming.py `Stream.__stream__` raises APIError for it, whatever
+       the endpoint: the agents `error` event, AgentSessionErrorEvent, has
+       one);
      - the Responses `error` event {\"type\" \"error\" \"code\" \"message\"
        \"param\"}, which has no \"error\" key. openai-python yields that one
-       as a ResponseErrorEvent; this client throws it."
+       as a ResponseErrorEvent; this client throws it (docs/divergences.md,
+       in-stream errors).
+   `fn-name` is bare (qualified under tools.agents.openai) or already
+   qualified."
   [fn-name event raw]
   (when (map? event)
     (let [label (fn-label fn-name)
@@ -835,7 +842,8 @@
           fail  (fn [msg err]
                   (ex-info (str label ": stream error: "
                                 (if (and (string? msg) (seq msg)) msg "An error occurred during streaming"))
-                           {:type :tools.agents.openai/stream-error :status nil :body raw :error err}))]
+                           {:type :tools.agents.openai/stream-error :status nil :body raw :error err
+                            :event event}))]
       (cond
         (py-truthy? err)              (fail (when (map? err) (get err "message")) err)
         (= "error" (get event "type")) (fail (get event "message") (select-keys event ["code" "message" "param"]))))))
@@ -902,7 +910,9 @@
    which is also the cross-thread cancel.
 
    While reducing, throws :tools.agents.openai/stream-error for an `error`
-   event (or any event with a top-level \"error\" object),
+   event (or any event with a top-level \"error\" object; ex-data :status
+   nil, :body the raw data, :error, :event); events before it reach the
+   reducer, nothing after it does, and the connection is closed,
    :tools.agents.openai/api-connection-error for a mid-stream transport
    failure, :tools.agents.openai/json-parse-error for undecodable data.
 

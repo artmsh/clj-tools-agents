@@ -775,7 +775,9 @@
 
 (defn- stream-error
   "Typed ex-info for a decoded `error` event
-   {\"type\" \"error\" \"error\" {\"type\" t \"message\" m}}."
+   {\"type\" \"error\" \"error\" {\"type\" t \"message\" m}}: ex-data
+   :error the error object, :event the decoded event (nil when its data
+   was not JSON)."
   [caller-name ev body headers]
   (let [err  (get ev "error")
         et   (when (map? err) (get err "type"))
@@ -784,7 +786,7 @@
                   (when (string? et) (str " " et))
                   (when (string? msg) (str " " msg)))
              {:type (stream-error-type et) :status nil :body body :headers headers
-              :error-type et})))
+              :error-type et :error err :event ev})))
 
 (defn messages-stream
   "POST request (same map as messages-create) with \"stream\" true to
@@ -822,7 +824,10 @@
        :overloaded, rate_limit_error -> :rate-limit, api_error ->
        :internal-server, invalid_request_error -> :bad-request, ...; see
        docs/anthropic.md), :status nil, :body the raw data string, :error-type
-       the wire error.type; nothing further is delivered;
+       the wire error.type, :error the error object, :event the decoded event
+       (nil for non-JSON data, which still throws, as in the SDK); events
+       before it reach the reducer, nothing after it does, and the
+       connection is closed;
      - a mid-stream transport failure — :api-connection, cause the IOException;
      - an undecodable event — :json-parse.
 
@@ -861,7 +866,11 @@
       ;; SDK's Stream.__stream__ raises on the SSE event NAME `error` and
       ;; fills a missing data "type" from the event name.
       :xform         (map (fn [{:keys [event data]}]
-                            (let [ev ((:read codec) data)
+                            (let [ev (if (= "error" event)
+                                       ;; the SDK raises even when an error
+                                       ;; event's data is not JSON
+                                       (try ((:read codec) data) (catch Exception _ nil))
+                                       ((:read codec) data))
                                   ev (if (and (map? ev) (not (contains? ev "type")) (string? event))
                                        (assoc ev "type" event)
                                        ev)]

@@ -371,7 +371,7 @@ Non-status error types:
 | a callable `:api-key` returned a non-string or blank value (value never included) | `:tools.agents.openai/invalid-api-key` |
 | `:http` is not a fn, or `:json` not a `{:read :write}` codec map (client construction; `:option` in `ex-data`) | `:tools.agents.openai/invalid-options` |
 | `:stream true` requested from a non-streaming function | `:tools.agents.openai/streaming-unsupported` |
-| while reducing a stream: an `error` event, or an event with a top-level `"error"` object (`:error` in ex-data, `:body` the raw data, `:status` nil) | `:tools.agents.openai/stream-error` |
+| while reducing a stream: an `error` event, or an event with a top-level `"error"` object (`:error` and `:event` in ex-data, `:body` the raw data, `:status` nil) | `:tools.agents.openai/stream-error` |
 | while reducing a stream: the connection fails mid-body | `:tools.agents.openai/api-connection-error` |
 | request rejected before any I/O (bad `:as`; files/images: missing/unsupported file or required field; an empty file, batch, fine-tuning job, checkpoint or permission id — the SDK's `ValueError`; batches: bad `custom_id` in `batch-input-jsonl`, no result file id in `batches-results`) | `:tools.agents.openai/invalid-request` |
 | `files-wait-for-processing` gave up after `:max-wait-ms` (the SDK's `RuntimeError`; not an HTTP timeout; never retried) | `:tools.agents.openai/wait-timeout` |
@@ -511,7 +511,11 @@ and Chat Completions streaming-events references, and openai-python @
   "message" "param"}`) and any event with a truthy top-level `"error"`
   (the SDK's `APIError` rule) throw `:tools.agents.openai/stream-error`. The
   SDK raises only for the second shape and yields the `error` event as a
-  `ResponseErrorEvent`; this client throws both. A mid-stream transport
+  `ResponseErrorEvent`; this client throws both, so every stream in this
+  library follows one rule ([divergences.md](divergences.md#in-stream-error-events)):
+  events before the error reach the reducer, nothing after it does, the
+  connection is closed, and ex-data carries `:status` nil, `:body` the raw
+  data, `:error` and `:event` the decoded event. A mid-stream transport
   failure is `api-connection-error`.
 - **Lifecycle.** Reducing closes the body (EOF, `(take n)`, exception); a
   second reduce throws `:tools.agents.stream/consumed`. An unreduced stream

@@ -526,7 +526,8 @@
 (defn- stream-error
   "The typed ex-info for an in-stream error chunk. Like python-genai's
    `APIError.raise_error(error.code, ...)`, `error.code` stands in for the
-   status: it picks the :type and is :status (nil when not an integer)."
+   status: it picks the :type and is :status (nil when not an integer).
+   :error is the error object, :event the decoded chunk."
   [fn-name chunk body retries-taken]
   (let [err    (get chunk "error")
         code   (get err "code")
@@ -535,7 +536,7 @@
     (ex-info (str "tools.agents.gemini/" fn-name ": stream error"
                   (when status (str " " status)) (when (string? msg) (str " " msg)))
              {:type (status->type status) :status status :body body
-              :retries-taken retries-taken})))
+              :retries-taken retries-taken :error err :event chunk})))
 
 (defn generate-content-stream
   "POST request (same map as generate-content) to POST {base-url}/
@@ -567,7 +568,9 @@
    While reducing, throws:
      - an error chunk ({\"error\" {\"code\" c \"message\" m}}) — ex-info typed
        from `c` as a status (e.g. 429 -> :resource-exhausted-error), :body
-       the raw data string;
+       the raw data string, :error the error object, :event the chunk;
+       chunks before it reach the reducer, nothing after it does, and the
+       connection is closed;
      - a mid-stream transport failure — :tools.agents.gemini/api-connection-error;
      - an undecodable chunk — :tools.agents.gemini/json-parse-error.
 

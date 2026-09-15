@@ -840,7 +840,7 @@ being read.
 |---|---|---|
 | non-2xx after retries | from `messages-stream` | the status table above, same `:status`/`:body`/`:headers`; message `tools.agents.anthropic/messages-stream: HTTP <status> <message>` |
 | no connection after retries | from `messages-stream` | `api-connection` |
-| `event: error` (or data `"type": "error"`) | from the reduce; nothing after it is delivered | from `error.type`: `invalid_request_error` → `bad-request`, `authentication_error` → `authentication`, `permission_error` → `permission-denied`, `not_found_error` → `not-found`, `rate_limit_error` → `rate-limit`, `api_error` → `internal-server`, `overloaded_error` → `overloaded`, anything else → `api-status`. `:status nil`, `:body` the raw `data:` string, `:headers` the 2xx response's, `:error-type` the wire string |
+| `event: error` (or data `"type": "error"`) | from the reduce; nothing after it is delivered | from `error.type`: `invalid_request_error` → `bad-request`, `authentication_error` → `authentication`, `permission_error` → `permission-denied`, `not_found_error` → `not-found`, `rate_limit_error` → `rate-limit`, `api_error` → `internal-server`, `overloaded_error` → `overloaded`, anything else → `api-status`. `:status nil`, `:body` the raw `data:` string, `:headers` the 2xx response's, `:error-type` the wire string, `:error` the error object, `:event` the decoded event. An `event: error` whose data is not JSON still throws (`api-status`, `:event` nil), as the SDK falls back to the raw data. The connection is closed ([rule](divergences.md#in-stream-error-events)) |
 | connection lost mid-stream | from the reduce | `api-connection`, cause the `IOException` |
 | undecodable event | from the reduce | `json-parse` |
 
