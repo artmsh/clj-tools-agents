@@ -430,3 +430,118 @@
         (is (nil? (get (:headers @captured) "api-key")))
         (is (str/includes? (:body @captured) "\"model\":\"gpt-4.1-nano\"")))
       (finally (stop!)))))
+
+;; ---------------------------------------------------------------------------
+;; request! — the single public transport (#41). Ports 19400-19409.
+;; ---------------------------------------------------------------------------
+
+(deftest request-get-with-query-extra-headers-and-no-body
+  (let [captured (atom nil)
+        {:keys [port stop!]} (start-server! 19400 "/v1/files"
+                                (fn [req] (reset! captured req)
+                                  {:status 200 :body "{\"object\":\"list\",\"data\":[]}"}))]
+    (try
+      (let [client (oai/client {:api-key "k" :base-url (base-url port) :project "proj-1"})
+            resp   (oai/request! client "files-list"
+                                 {:method :get :path "/files"
+                                  :query {"purpose" "batch" "limit" 2 "after" nil}
+                                  :headers {"openai-beta" "x=v1"}})]
+        (is (= {"object" "list" "data" []} resp))
+        (is (= "GET" (:method @captured)))
+        (is (= "/v1/files" (:path @captured)))
+        (is (= #{"purpose=batch" "limit=2"} (set (str/split (:query @captured) #"&"))))
+        (is (= "Bearer k" (get (:headers @captured) "authorization")))
+        (is (= "proj-1" (get (:headers @captured) "openai-project")))
+        (is (= "x=v1" (get (:headers @captured) "openai-beta")))
+        (is (= "" (:body @captured))))
+      (finally (stop!)))))
+
+(deftest request-as-bytes-returns-raw-bytes-and-as-string-skips-decoding
+  (let [payload (byte-array [0 1 2 -1 123])
+        {:keys [port stop!]} (start-server! 19401 "/v1/files"
+                                (fn [req]
+                                  {:status 200
+                                   :body (if (str/ends-with? (:path req) "/bin") payload "{not json")}))]
+    (try
+      (let [client (oai/client {:api-key "k" :base-url (base-url port)})
+            b      (oai/request! client "files-content" {:method :get :path "/files/f1/bin" :as :bytes})
+            s      (oai/request! client "files-content" {:method :get :path "/files/f1/txt" :as :string})]
+        (is (bytes? b))
+        (is (= (seq payload) (seq b)))
+        (is (= "{not json" s)))
+      (finally (stop!)))))
+
+(deftest request-as-bytes-error-body-is-a-string-and-typed
+  (let [{:keys [port stop!]} (start-server! 19402 "/v1/files"
+                                (fn [_] {:status 404 :body "{\"error\":{\"message\":\"no such file\"}}"}))]
+    (try
+      (let [client (oai/client {:api-key "k" :base-url (base-url port) :max-retries 0})
+            e      (try (oai/request! client "files-content" {:method :get :path "/files/nope" :as :bytes})
+                        nil (catch Exception e e))]
+        (is (= :tools.agents.openai/not-found-error (:type (ex-data e))))
+        (is (= "{\"error\":{\"message\":\"no such file\"}}" (:body (ex-data e))))
+        (is (str/starts-with? (ex-message e) "tools.agents.openai/files-content: HTTP 404 no such file")))
+      (finally (stop!)))))
+
+(deftest request-empty-2xx-json-body-decodes-to-nil
+  (let [{:keys [port stop!]} (start-server! 19403 "/v1/things" (fn [_] {:status 200 :body ""}))]
+    (try
+      (is (nil? (oai/request! (oai/client {:api-key "k" :base-url (base-url port)})
+                              {:method :delete :path "/things/t1"})))
+      (finally (stop!)))))
+
+(deftest request-multipart-sends-form-data-not-json
+  (let [captured (atom nil)
+        {:keys [port stop!]} (start-server! 19404 "/v1/uploads"
+                                (fn [req] (reset! captured req) {:status 200 :body "{\"id\":\"file_1\"}"}))]
+    (try
+      (let [client (oai/client {:api-key "k" :base-url (base-url port)})
+            resp   (oai/request! client "files-create"
+                                 {:path "/uploads"
+                                  :multipart [{:name "purpose" :content "batch"}
+                                              {:name "file" :content "a\nb" :filename "x.jsonl"}]})]
+        (is (= {"id" "file_1"} resp))
+        (is (str/starts-with? (get (:headers @captured) "content-type") "multipart/form-data; boundary="))
+        (is (str/includes? (:body @captured) "filename=\"x.jsonl\"")))
+      (finally (stop!)))))
+
+(deftest request-rejects-stream-in-body-and-multipart-before-network
+  (let [client (oai/client {:api-key "k" :base-url "http://127.0.0.1:1/v1"})]
+    (doseq [req [{:path "/responses" :body {"stream" true}}
+                 {:path "/uploads" :multipart [{:name "stream" :content "true"}]}]]
+      (let [e (try (oai/request! client req) nil (catch Exception e e))]
+        (is (= :tools.agents.openai/streaming-unsupported (:type (ex-data e))))
+        (is (str/starts-with? (ex-message e) "tools.agents.openai/request!: "))))))
+
+(deftest request-401-is-not-retried-while-the-credentials-seam-is-inactive
+  (let [hits (atom 0)
+        {:keys [port stop!]} (start-server! 19405 "/v1/responses"
+                                (fn [_] (swap! hits inc)
+                                  {:status 401 :body "{\"error\":{\"message\":\"bad key\"}}"}))]
+    (try
+      (let [e (try (oai/responses-create (oai/client {:api-key "k" :base-url (base-url port)}) {"model" "m"})
+                   nil (catch Exception e e))]
+        (is (= :tools.agents.openai/authentication-error (:type (ex-data e))))
+        (is (= 0 (:retries-taken (ex-data e))))
+        (is (= 1 @hits)))
+      (finally (stop!)))))
+
+(deftest request-rebuilds-headers-before-every-attempt
+  ;; Pins the #34 seam: headers are built once per ATTEMPT, not once per
+  ;; call, so a credential refreshed between attempts reaches the retry.
+  (let [calls (atom 0)
+        orig  @#'oai/request-headers
+        {:keys [port stop!]} (start-server! 19406 "/v1/responses"
+                                (fn [req]
+                                  (if (= "Bearer k1" (get (:headers req) "authorization"))
+                                    {:status 503 :headers {"retry-after-ms" "1"} :body ""}
+                                    {:status 200 :body (canned-response)})))]
+    (try
+      (with-redefs [oai/request-headers (fn [label client multipart? extra]
+                                          (orig label (assoc client :api-key (str "k" (swap! calls inc)))
+                                                multipart? extra))]
+        (is (= "hello back" (oai/output-text (oai/responses-create
+                                               (oai/client {:api-key "k" :base-url (base-url port)})
+                                               {"model" "m"}))))
+        (is (= 2 @calls)))
+      (finally (stop!)))))
