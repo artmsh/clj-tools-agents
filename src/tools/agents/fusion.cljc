@@ -1,5 +1,5 @@
-(ns tools.agents.converge
-  "Call several LLM provider specs concurrently and converge their successful
+(ns tools.agents.fusion
+  "Call several LLM provider specs concurrently and fuse their successful
    text responses into one deterministic answer map.
 
    Not a provider itself — orchestration across `tools.agents.anthropic` and
@@ -71,7 +71,7 @@
                   :openai (call-openai spec prompt)
                   :anthropic (call-anthropic spec prompt)
                   (throw (ex-info (str "unsupported provider: " (:provider spec))
-                                   {:type :tools.agents.converge/unsupported-provider
+                                   {:type :tools.agents.fusion/unsupported-provider
                                     :provider (:provider spec)}))))]
       (ok-result spec (:text raw) (:response raw)))
     (catch Exception e
@@ -92,7 +92,7 @@
   (when (seq texts)
     (reduce (fn [acc text] (str acc "\n" text)) (first texts) (rest texts))))
 
-(defn converge
+(defn fuse
   "Run `parallel` over `provider-specs` and join the successful texts into one
    newline-separated answer.
 

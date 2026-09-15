@@ -486,7 +486,7 @@
   ;; parser from a vulnerable read-string-based one: under read-string, the
   ;; `#=(throw ...)` payload's own throw fires DURING parsing, which
   ;; parse-retry-after's own catch swallows either way -- both
-  ;; implementations converge on the same nil-then-computed-backoff outcome.
+  ;; implementations arrive at the same nil-then-computed-backoff outcome.
   ;; A payload read-string would evaluate to a plain NUMBER instead of a
   ;; throw is what actually tells the two implementations apart: read-string
   ;; would honor it as a literal Retry-After ("wins outright" per

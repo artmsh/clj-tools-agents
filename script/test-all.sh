@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run all five suites (anthropic + openai + gemini + mcp + converge) on every supported runtime.
+# Run all five suites (anthropic + openai + gemini + mcp + fusion) on every supported runtime.
 # Any failure fails the script.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -13,7 +13,7 @@ clojure -M:test-anthropic || fail=1
 clojure -M:test-openai    || fail=1
 clojure -M:test-gemini    || fail=1
 clojure -M:test-mcp       || fail=1
-clojure -M:test-converge  || fail=1
+clojure -M:test-fusion    || fail=1
 
 echo
 echo "── Babashka ───────────────────────────────"

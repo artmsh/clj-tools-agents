@@ -1,13 +1,13 @@
-# tools.agents.converge
+# tools.agents.fusion
 
-`tools.agents.converge` is a small orchestration namespace for calling
+`tools.agents.fusion` is a small orchestration namespace for calling
 several LLM providers together. It delegates HTTP and provider semantics to
 `tools.agents.openai` and `tools.agents.anthropic` and adds three
 higher-level operations:
 
 - call one provider spec and normalize the result;
 - call multiple provider specs concurrently;
-- converge successful provider texts into a deterministic answer map.
+- fuse successful provider texts into a deterministic answer map.
 
 The namespace currently supports provider specs for `:openai` and
 `:anthropic`.
@@ -21,13 +21,13 @@ underlying logic is unchanged.
 Run the bundled offline demo:
 
 ```bash
-clojure -Sdeps '{:paths ["src" "."]}' -M -e "(require 'examples.converge.provider-demo) (examples.converge.provider-demo/-main)"
+clojure -Sdeps '{:paths ["src" "."]}' -M -e "(require 'examples.fusion.provider-demo) (examples.fusion.provider-demo/-main)"
 # or on Babashka:
-bb -cp src:. -e "(require 'examples.converge.provider-demo) (examples.converge.provider-demo/-main)"
+bb -cp src:. -e "(require 'examples.fusion.provider-demo) (examples.fusion.provider-demo/-main)"
 ```
 
 The demo uses local `:call` hooks, so it does not require network access or
-API keys. It prints a converged answer from two successful mock providers and
+API keys. It prints a fused answer from two successful mock providers and
 keeps one simulated provider failure as structured result data.
 
 ## Provider Specs
@@ -72,9 +72,9 @@ Useful keys:
 Call one provider:
 
 ```clojure
-(require '[tools.agents.converge :as converge])
+(require '[tools.agents.fusion :as fusion])
 
-(converge/provider-call
+(fusion/provider-call
  {:provider :openai
   :id :primary
   :model "gpt-4.1-mini"
@@ -106,7 +106,7 @@ Failed provider calls are captured instead of aborting multi-provider flows:
 Run providers concurrently:
 
 ```clojure
-(converge/parallel
+(fusion/parallel
  [{:provider :openai
    :id :concise
    :model "gpt-4.1-mini"
@@ -120,10 +120,10 @@ Run providers concurrently:
  "Should parser tables be data-first?")
 ```
 
-Converge provider texts:
+Fuse provider texts:
 
 ```clojure
-(converge/converge
+(fusion/fuse
  [{:provider :openai
    :id :concise
    :call (fn [_spec prompt]
@@ -137,7 +137,7 @@ Converge provider texts:
  "Keep tokenizer fast paths explicit?")
 ```
 
-Converged result shape:
+Fused result shape:
 
 ```clojure
 {:status :ok
@@ -156,7 +156,7 @@ If every provider fails, `:status` is `:error`, `:answer` is `nil`, and
 | --- | --- | --- |
 | `provider-call` | provider spec, prompt string | normalized result map |
 | `parallel` | provider spec vector, prompt string | result vector in spec order |
-| `converge` | provider spec vector, prompt string | answer map with texts/results |
+| `fuse` | provider spec vector, prompt string | answer map with texts/results |
 
 Normalized result fields:
 
@@ -169,7 +169,7 @@ Normalized result fields:
 | `:response` | raw provider response map |
 | `:error` | captured provider exception |
 
-Converged result fields:
+Fused result fields:
 
 | Field | Meaning |
 | --- | --- |
@@ -189,10 +189,10 @@ Provider behavior:
 
 - `parallel` uses `future` and `deref`; result ordering is deterministic even
   though provider calls run concurrently.
-- `converge` is intentionally local and deterministic. It does not call a
+- `fuse` is intentionally local and deterministic. It does not call a
   third judge model.
 - Provider retries and tool-call helpers are supplied by
-  `tools.agents.openai`/`tools.agents.anthropic`. `tools.agents.converge`
+  `tools.agents.openai`/`tools.agents.anthropic`. `tools.agents.fusion`
   itself only normalizes and coordinates provider calls.
 - An unsupported `:provider` (without a `:call` hook) throws `ex-info` with
-  `{:type :tools.agents.converge/unsupported-provider}`.
+  `{:type :tools.agents.fusion/unsupported-provider}`.

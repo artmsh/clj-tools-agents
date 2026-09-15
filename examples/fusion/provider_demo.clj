@@ -1,15 +1,15 @@
-(ns examples.converge.provider-demo
-  "tools.agents.converge orchestration demo.
+(ns examples.fusion.provider-demo
+  "tools.agents.fusion orchestration demo.
 
    Uses local :call hooks so it needs no API keys or network — swap them for
    :model/:api-key (and drop :call) to hit real providers.
 
-   Run: clojure -Sdeps '{:paths [\"src\" \".\"]}' -M -e \"(require 'examples.converge.provider-demo) (examples.converge.provider-demo/-main)\"
-        bb -cp src:. -e \"(require 'examples.converge.provider-demo) (examples.converge.provider-demo/-main)\"
+   Run: clojure -Sdeps '{:paths [\"src\" \".\"]}' -M -e \"(require 'examples.fusion.provider-demo) (examples.fusion.provider-demo/-main)\"
+        bb -cp src:. -e \"(require 'examples.fusion.provider-demo) (examples.fusion.provider-demo/-main)\"
 
    Migrated from clz's examples/llm_provider_demo.clj, which demonstrated the
    same orchestration against clz's now-removed embedded clz.llm namespace."
-  (:require [tools.agents.converge :as converge]))
+  (:require [tools.agents.fusion :as fusion]))
 
 (def providers
   [{:provider :openai
@@ -31,10 +31,10 @@
             (throw (ex-info "simulated provider failure" {})))}])
 
 (def prompt
-  "Should provider HTTP details stay separate from convergence logic?")
+  "Should provider HTTP details stay separate from fusion logic?")
 
 (defn -main [& _]
-  (let [result (converge/converge providers prompt)]
+  (let [result (fusion/fuse providers prompt)]
     (println "Status:" (:status result))
     (println "Answer:")
     (println (:answer result))

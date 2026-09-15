@@ -21,7 +21,7 @@ one `tools.agents.*` namespace root instead of two `corevector.*` ones.
 | OpenAI Agents API (beta) — managed sessions, turns, OpenAI-hosted & self-hosted sandboxes | `tools.agents.openai.agents` | [docs/openai-agents.md](docs/openai-agents.md) |
 | Gemini Developer API | `tools.agents.gemini` | [docs/gemini.md](docs/gemini.md) |
 | Model Context Protocol, revision 2026-07-28 — server, client, stdio & Streamable HTTP | `tools.agents.mcp` (+ `.server`, `.client`, `.stdio`, `.http`) | [docs/mcp.md](docs/mcp.md) |
-| Multi-provider orchestration — call providers concurrently, converge successful texts | `tools.agents.converge` | [docs/converge.md](docs/converge.md) |
+| Multi-provider orchestration — call providers concurrently, fuse successful texts | `tools.agents.fusion` | [docs/fusion.md](docs/fusion.md) |
 
 Each doc covers that library's usage, full API parity table against its
 vendor SDK, error hierarchy, retries, and platform notes (streaming, HTTP
@@ -92,7 +92,7 @@ against the reference `everything` server.
 ```
 
 See `examples/anthropic/`, `examples/openai/`, `examples/gemini/`,
-`examples/mcp/` and `examples/converge/` for complete, runnable ports of real
+`examples/mcp/` and `examples/fusion/` for complete, runnable ports of real
 usage shapes from each vendor SDK, the MCP reference servers, and
 multi-provider orchestration — see each doc's Usage section for the full
 list.
@@ -103,9 +103,9 @@ list.
 ./script/test-all.sh
 ```
 
-Runs all five suites (anthropic + openai + gemini + mcp + converge) on JVM
+Runs all five suites (anthropic + openai + gemini + mcp + fusion) on JVM
 Clojure (`clojure -M:test-anthropic` / `-M:test-openai` / `-M:test-gemini` /
-`-M:test-mcp` / `-M:test-converge`) and Babashka (`bb test`), and fails
+`-M:test-mcp` / `-M:test-fusion`) and Babashka (`bb test`), and fails
 loudly if either runtime is red for any suite. Hermetic — mock servers and
 in-process loopbacks only, no outbound network. See each doc's Testing
 section for what each suite covers.
