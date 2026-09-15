@@ -86,6 +86,14 @@
       (retry/with-retries (status-policy [{:status 500} {:status 200}] calls slept
                                          :prepare (fn [n] (str "token-" n))))
       (is (= ["token-0" "token-1"] @calls))))
+  (testing "it re-runs on the auth retry too, with retries-taken unchanged"
+    (let [calls (atom []) slept (atom [])]
+      (retry/with-retries (status-policy [{:status 401} {:status 200}] calls slept
+                                         :prepare (fn [n] (str "token-" n))
+                                         :unauthorized? #(= 401 (:status (:response %)))
+                                         :on-unauthorized (constantly true)))
+      (is (= ["token-0" "token-0"] @calls))
+      (is (= [] @slept))))
   (testing "its exception propagates and is never retried"
     (let [calls (atom []) slept (atom []) boom (ex-info "fetch failed" {})
           e (try (retry/with-retries (status-policy [{:status 200}] calls slept
