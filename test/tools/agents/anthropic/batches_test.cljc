@@ -18,12 +18,12 @@
        "\"results_url\":null}"))
 
 (defn- with-mock
-  "Start the mock on port with handler, call (f client captured-atom), stop.
+  "Start the mock on an OS-assigned port with handler, call (f client captured-atom), stop.
    captured holds every request, in order."
-  ([port handler f] (with-mock port {} handler f))
-  ([port client-opts handler f]
+  ([handler f] (with-mock {} handler f))
+  ([client-opts handler f]
    (let [captured (atom [])
-         {:keys [stop!]} (start-server! port route (fn [req] (swap! captured conj req) (handler req)))]
+         {:keys [port stop!]} (start-server! 0 route (fn [req] (swap! captured conj req) (handler req)))]
      (try
        (f (a/client (merge {:api-key "test-key" :base-url (str "http://127.0.0.1:" port)} client-opts))
           captured)
@@ -36,7 +36,7 @@
 ;; ---------------------------------------------------------------------------
 
 (deftest create-posts-requests-body-with-standard-headers
-  (with-mock 19400
+  (with-mock
     (fn [_] {:status 200 :headers {"request-id" "req_b1"} :body (batch-json "msgbatch_1" "in_progress")})
     (fn [client captured]
       (let [request {"requests" [{"custom_id" "a"
@@ -57,7 +57,7 @@
         (is (nil? (get-in req [:headers "anthropic-beta"])) "batches are GA: the SDK sends no beta header")))))
 
 (deftest retrieve-gets-batch-by-id
-  (with-mock 19401
+  (with-mock
     (fn [_] {:status 200 :body (batch-json "msgbatch_2" "ended")})
     (fn [client captured]
       (is (= "ended" (get (b/batches-retrieve client "msgbatch_2") "processing_status")))
@@ -68,7 +68,7 @@
         (is (= "2023-06-01" (get-in req [:headers "anthropic-version"])))))))
 
 (deftest id-is-url-encoded-into-the-path
-  (with-mock 19402
+  (with-mock
     (fn [_] {:status 200 :body (batch-json "x" "ended")})
     (fn [client captured]
       (b/batches-retrieve client "a/b?c d")
@@ -78,7 +78,7 @@
         (is (nil? (:query req)) "a ? in the id never starts a query string")))))
 
 (deftest empty-or-non-string-id-throws-before-any-request
-  (with-mock 19403
+  (with-mock
     (fn [_] {:status 200 :body "{}"})
     (fn [client captured]
       (doseq [[f id] [[b/batches-retrieve ""] [b/batches-delete ""] [b/batches-cancel nil]
@@ -89,7 +89,7 @@
       (is (empty? @captured)))))
 
 (deftest cancel-posts-without-body
-  (with-mock 19404
+  (with-mock
     (fn [_] {:status 200 :body (batch-json "msgbatch_3" "canceling")})
     (fn [client captured]
       (is (= "canceling" (get (b/batches-cancel client "msgbatch_3") "processing_status")))
@@ -99,7 +99,7 @@
         (is (= "" (:body req)))))))
 
 (deftest delete-uses-http-delete
-  (with-mock 19405
+  (with-mock
     (fn [_] {:status 200 :body "{\"id\":\"msgbatch_4\",\"type\":\"message_batch_deleted\"}"})
     (fn [client captured]
       (is (= {"id" "msgbatch_4" "type" "message_batch_deleted"} (b/batches-delete client "msgbatch_4")))
@@ -108,7 +108,7 @@
         (is (= "/v1/messages/batches/msgbatch_4" (:path req)))))))
 
 (deftest client-betas-and-auth-token-still-apply
-  (with-mock 19406 {:api-key nil :auth-token "tok" :betas ["x-beta"]}
+  (with-mock {:api-key nil :auth-token "tok" :betas ["x-beta"]}
     (fn [_] {:status 200 :body (batch-json "b" "ended")})
     (fn [client captured]
       (b/batches-retrieve client "b")
@@ -119,7 +119,7 @@
 (deftest credential-source-401-invalidates-and-retries-once-through-request!
   (let [{:keys [source fetches]} (rotating-token-cache)
         hits (atom 0)]
-    (with-mock 19419 {:api-key nil :credential-source source :max-retries 0}
+    (with-mock {:api-key nil :credential-source source :max-retries 0}
       (fn [_] (if (= 1 (swap! hits inc))
                 {:status 401 :body "{\"error\":{\"message\":\"expired\"}}"}
                 {:status 200 :body (batch-json "b" "ended")}))
@@ -136,7 +136,7 @@
   (into {} (for [kv (when q (str/split q #"&"))] (vec (str/split kv #"=" 2)))))
 
 (deftest list-sends-query-params-and-returns-page-verbatim
-  (with-mock 19407
+  (with-mock
     (fn [_] {:status 200
              :body (str "{\"data\":[" (batch-json "b1" "ended") "],\"has_more\":true,"
                         "\"first_id\":\"b1\",\"last_id\":\"b1\"}")})
@@ -169,7 +169,7 @@
   (let [pages {nil  ["b1" "b2"]
                "b2" ["b3" "b4"]
                "b4" ["b5"]}]
-    (with-mock 19408
+    (with-mock
       (fn [req]
         (let [after (get (query-map (:query req)) "after_id")
               ids   (get pages after)]
@@ -187,7 +187,7 @@
                  (map (comp query-map :query) @captured))))))))
 
 (deftest list-all-pages-backward-from-before-id
-  (with-mock 19409
+  (with-mock
     (fn [req]
       (let [before (get (query-map (:query req)) "before_id")]
         {:status 200
@@ -212,7 +212,7 @@
        "{\"custom_id\":\"d\",\"result\":{\"type\":\"expired\"}}"))
 
 (deftest results-decodes-jsonl-lines-including-errored
-  (with-mock 19410
+  (with-mock
     (fn [_] {:status 200 :headers {"content-type" "application/binary" "request-id" "req_r1"}
              :body results-jsonl})
     (fn [client captured]
@@ -232,12 +232,12 @@
         (is (= "application/binary" (get-in req [:headers "accept"])))))))
 
 (deftest results-empty-body-is-empty-seq
-  (with-mock 19411
+  (with-mock
     (fn [_] {:status 200 :body ""})
     (fn [client _] (is (= [] (vec (b/batches-results client "msgbatch_6")))))))
 
 (deftest results-malformed-line-throws-typed-parse-error-when-realized
-  (with-mock 19412
+  (with-mock
     (fn [_] {:status 200 :body "{\"custom_id\":\"a\",\"result\":{\"type\":\"canceled\"}}\n{not json\n"})
     (fn [client _]
       (let [results (b/batches-results client "msgbatch_7")
@@ -252,7 +252,7 @@
 ;; ---------------------------------------------------------------------------
 
 (deftest not-found-is-typed-with-api-message
-  (with-mock 19413
+  (with-mock
     (fn [_] {:status 404 :body "{\"type\":\"error\",\"error\":{\"type\":\"not_found_error\",\"message\":\"batch not found\"}}"})
     (fn [client captured]
       (doseq [[fname f] [["batches-retrieve" #(b/batches-retrieve client "nope")]
@@ -264,7 +264,7 @@
       (is (= 2 (count @captured)) "404 is not retried"))))
 
 (deftest conflict-409-is-api-status-and-retried
-  (with-mock 19414 {:max-retries 0}
+  (with-mock {:max-retries 0}
     (fn [_] {:status 409 :body "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"batch still processing\"}}"})
     (fn [client captured]
       (let [e (ex-of #(b/batches-delete client "msgbatch_8"))]
@@ -274,7 +274,7 @@
       (is (= 1 (count @captured)))))
   (let [n (atom 0)]
     (binding [a/*sleep-fn* (fn [_] nil)]
-      (with-mock 19415
+      (with-mock
         (fn [_] (if (= 1 (swap! n inc))
                   {:status 409 :body "{}"}
                   {:status 200 :body (batch-json "msgbatch_9" "canceling")}))

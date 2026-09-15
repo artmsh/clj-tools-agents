@@ -64,7 +64,7 @@
                       "\"data\":[{\"object\":\"embedding\",\"index\":0,\"embedding\":\""
                       (encode-f32le [1.0 -2.5 0.125]) "\"}],"
                       "\"usage\":{\"prompt_tokens\":1,\"total_tokens\":1}}")
-        {:keys [port stop!]} (start-server! 19260 "/v1/embeddings"
+        {:keys [port stop!]} (start-server! 0 "/v1/embeddings"
                                 (fn [req] (reset! captured req) {:status 200 :body body}))]
     (try
       (let [client (oai/client {:api-key "k" :base-url (base-url port) :max-retries 0})
@@ -80,7 +80,7 @@
 (deftest embeddings-create-explicit-float-passthrough-and-typed-errors
   (let [captured (atom nil)
         status   (atom 200)
-        {:keys [port stop!]} (start-server! 19261 "/v1/embeddings"
+        {:keys [port stop!]} (start-server! 0 "/v1/embeddings"
                                 (fn [req]
                                   (reset! captured req)
                                   (if (= 200 @status)

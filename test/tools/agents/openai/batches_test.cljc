@@ -1,7 +1,6 @@
 (ns tools.agents.openai.batches-test
   "tools.agents.openai.batches: pure JSONL building plus mock-server round
-   trips (shared tools.agents.test-support server; base-url carries /v1).
-   Ports 19320-19329."
+   trips (shared tools.agents.test-support server; base-url carries /v1)."
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.string :as str]
             [tools.agents.openai :as oai]
@@ -72,7 +71,7 @@
 
 (deftest batches-create-sends-json-body
   (let [captured (atom nil)
-        {:keys [port stop!]} (start-server! 19320 "/v1/batches"
+        {:keys [port stop!]} (start-server! 0 "/v1/batches"
                                 (fn [req] (reset! captured req) {:status 200 :body batch-json}))]
     (try
       (let [req  {"input_file_id" "file-in" "endpoint" "/v1/responses" "completion_window" "24h"
@@ -89,7 +88,7 @@
 
 (deftest batches-retrieve-cancel-and-404-typing
   (let [captured (atom [])
-        {:keys [port stop!]} (start-server! 19321 "/v1/batches"
+        {:keys [port stop!]} (start-server! 0 "/v1/batches"
                                 (fn [req]
                                   (swap! captured conj req)
                                   (if (str/includes? (:path req) "missing")
@@ -122,7 +121,7 @@
   (let [captured (atom [])
         pages    {nil      "{\"object\":\"list\",\"data\":[{\"id\":\"batch_1\"},{\"id\":\"batch_2\"}],\"first_id\":\"batch_1\",\"last_id\":\"batch_2\",\"has_more\":true}"
                   "batch_2" "{\"object\":\"list\",\"data\":[{\"id\":\"batch_3\"}],\"first_id\":\"batch_3\",\"last_id\":\"batch_3\",\"has_more\":false}"}
-        {:keys [port stop!]} (start-server! 19322 "/v1/batches"
+        {:keys [port stop!]} (start-server! 0 "/v1/batches"
                                 (fn [req]
                                   (swap! captured conj req)
                                   (let [after (some #(second (re-find #"^after=(.*)$" %)) (query-set (:query req)))]
@@ -159,9 +158,9 @@
 (defn- results-server
   "Serves GET /v1/batches/{id} and GET /v1/files/{id}/content from `files`
    ({file-id body}); records every request."
-  [port batch files]
+  [batch files]
   (let [captured (atom [])
-        srv      (start-server! port "/v1"
+        srv      (start-server! 0 "/v1"
                    (fn [req]
                      (swap! captured conj req)
                      (let [path (:path req)]
@@ -182,7 +181,7 @@
         shuffled (shuffle (map-indexed (fn [n cid] [cid n]) cids))
         out-body (str (str/join "\r\n" (map (fn [[cid n]] (ok-line cid n)) shuffled)) "\r\n\r\n")
         batch    {"id" "batch_1" "status" "completed" "output_file_id" "file-out" "error_file_id" "file-err"}
-        {:keys [port stop! captured]} (results-server 19323 batch {"file-out" out-body
+        {:keys [port stop! captured]} (results-server batch {"file-out" out-body
                                                                    "file-err" (str (err-line "req-bad") "\n")})]
     (try
       (let [c   (client port)
@@ -206,7 +205,7 @@
 
 (deftest batches-results-error-cases
   (testing "no output_file_id → invalid-request before any download"
-    (let [{:keys [port stop! captured]} (results-server 19324 nil {"file-err" (str (err-line "a") "\n")})]
+    (let [{:keys [port stop! captured]} (results-server nil {"file-err" (str (err-line "a") "\n")})]
       (try
         (let [c (client port)
               e (thrown #(batches/batches-results c {"id" "batch_1" "status" "in_progress" "output_file_id" nil}))]
@@ -225,7 +224,7 @@
               (is (str/starts-with? (ex-message e) "tools.agents.openai.files/files-content: ")))))
         (finally (stop!)))))
   (testing "malformed line, missing custom_id, duplicate custom_id"
-    (let [{:keys [port stop!]} (results-server 19325 nil
+    (let [{:keys [port stop!]} (results-server nil
                                                {"bad-json" (str (ok-line "a" 1) "\n\n{not json}\n")
                                                 "no-cid"   "{\"id\":\"x\",\"response\":null}\n"
                                                 "dup-out"  (str (ok-line "a" 1) "\n")

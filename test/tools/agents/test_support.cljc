@@ -16,6 +16,19 @@
 (defn- chunk-bytes ^bytes [chunk]
   (if (bytes? chunk) chunk (.getBytes (str chunk) "UTF-8")))
 
+(defn closed-port
+  "A loopback port with nothing listening, for tests that need a refused
+   connection (or a base-url that must never be dialled): bind port 0, read
+   the OS-assigned port, close the socket. A concurrent bind of port 0
+   landing on the same just-freed ephemeral port within the test is
+   possible but improbable; unlike a fixed port, it is never systematic.
+
+   Every mock server here binds port 0 and the tests read `:port` back; no
+   suite uses a fixed port, so parallel runs cannot collide."
+  []
+  (with-open [ss (java.net.ServerSocket. 0 50 (java.net.InetAddress/getByName "127.0.0.1"))]
+    (.getLocalPort ss)))
+
 (defn start-server!
   "Bind `port` and answer requests with `handler`, a
    (fn [{:keys [method path query headers body body-bytes]}]) -> {:status :headers :body}.

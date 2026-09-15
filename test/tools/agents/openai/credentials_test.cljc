@@ -9,13 +9,7 @@
             [tools.agents.openai.agents :as agents]
             [tools.agents.openai.credentials :as creds]
             [tools.agents.token :as token]
-            [tools.agents.test-support :refer [start-server!]]))
-
-(defn- free-port
-  "An unbound port, for the one test that needs a refused connection."
-  []
-  (with-open [ss (java.net.ServerSocket. 0 50 (java.net.InetAddress/getByName "127.0.0.1"))]
-    (.getLocalPort ss)))
+            [tools.agents.test-support :refer [closed-port start-server!]]))
 
 (defn- with-server
   "Start a mock on a free port answering every path with `handler`; call
@@ -308,7 +302,7 @@
 
 (deftest exchange-transport-failure-retries-then-types
   (let [calls (atom 0)
-        port  (free-port)
+        port  (closed-port)
         src   (creds/workload-identity-source
                {:identity-provider-id "idp" :service-account-id "sa" :max-retries 1
                 :provider {:token-type :jwt :get-token (fn [] (swap! calls inc) "subject-jwt-SECRET")}

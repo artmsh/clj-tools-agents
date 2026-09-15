@@ -2,11 +2,7 @@
   "Mock-server / transport-level coverage for tools.agents.openai.agents. The
    mock server itself is tools.agents.test-support, shared with the
    anthropic/gemini/openai suites. Everything here is identical handler logic
-   and identical assertions on both runtimes.
-
-   Port range 19000-19079 — chosen not to collide with the sibling suites'
-   ranges (anthropic 18930-18975, gemini 18980-18997, openai 18950-18971).
-   Newer tests (#49 onward) bind port 0 instead."
+   and identical assertions on both runtimes."
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.string :as str]
             [tools.agents.openai :as oai]
@@ -15,7 +11,7 @@
             [tools.agents.stream :as stream]
             [examples.openai.agents-sandbox-task :as ex-task]
             [examples.openai.agents-self-hosted :as ex-self-hosted]
-            [tools.agents.test-support :refer [start-server! start-abort-server! rotating-token-cache]]))
+            [tools.agents.test-support :refer [closed-port start-server! start-abort-server! rotating-token-cache]]))
 
 (defn- base-url [port] (str "http://127.0.0.1:" port "/v1"))
 
@@ -55,7 +51,7 @@
 
 (deftest sessions-create-posts-with-required-headers-and-body
   (let [captured (atom nil)
-        {:keys [port stop!]} (start-server! 19000 "/v1/agents/sessions"
+        {:keys [port stop!]} (start-server! 0 "/v1/agents/sessions"
                                 (fn [req] (reset! captured req) {:status 200 :body (canned-session "sess_1" "in_progress")}))]
     (try
       (let [client  (oai/client {:api-key "test-key" :base-url (base-url port)})
@@ -78,7 +74,7 @@
 
 (deftest sessions-create-org-and-project-headers-forwarded
   (let [captured (atom nil)
-        {:keys [port stop!]} (start-server! 19001 "/v1/agents/sessions"
+        {:keys [port stop!]} (start-server! 0 "/v1/agents/sessions"
                                 (fn [req] (reset! captured req) {:status 200 :body (canned-session "sess_1" "idle")}))]
     (try
       (let [client (oai/client {:api-key "k" :base-url (base-url port) :organization "org-abc" :project "proj-xyz"})]
@@ -88,14 +84,14 @@
       (finally (stop!)))))
 
 (deftest sessions-create-rejects-stream-true-before-any-network-activity
-  (let [client (oai/client {:api-key "k" :base-url "http://127.0.0.1:19999/v1"})
+  (let [client (oai/client {:api-key "k" :base-url (str "http://127.0.0.1:" (closed-port) "/v1")})
         e (try (agents/sessions-create client {"environment" {"type" "none"} "input" "hi" "stream" true})
                nil (catch Exception e e))]
     (is (some? e))
     (is (= :tools.agents.openai/streaming-unsupported (:type (ex-data e))))))
 
 (deftest sessions-create-rejects-keyword-stream-key-too
-  (let [client (oai/client {:api-key "k" :base-url "http://127.0.0.1:19999/v1"})
+  (let [client (oai/client {:api-key "k" :base-url (str "http://127.0.0.1:" (closed-port) "/v1")})
         e (try (agents/sessions-create client {:stream true}) nil (catch Exception e e))]
     (is (some? e))
     (is (= :tools.agents.openai/streaming-unsupported (:type (ex-data e))))))
@@ -106,7 +102,7 @@
 
 (deftest sessions-retrieve-gets-by-id
   (let [captured (atom nil)
-        {:keys [port stop!]} (start-server! 19002 "/v1/agents/sessions/sess_42"
+        {:keys [port stop!]} (start-server! 0 "/v1/agents/sessions/sess_42"
                                 (fn [req] (reset! captured req) {:status 200 :body (canned-session "sess_42" "idle")}))]
     (try
       (let [client  (oai/client {:api-key "k" :base-url (base-url port)})
@@ -118,7 +114,7 @@
 
 (deftest sessions-list-sends-query-params
   (let [captured (atom nil)
-        {:keys [port stop!]} (start-server! 19003 "/v1/agents/sessions"
+        {:keys [port stop!]} (start-server! 0 "/v1/agents/sessions"
                                 (fn [req] (reset! captured req)
                                   {:status 200 :body "{\"object\":\"list\",\"data\":[],\"has_more\":false}"}))]
     (try
@@ -134,7 +130,7 @@
   ;; (via `name`) — encoding it via `str` would send a literal leading colon
   ;; (":desc" -> "%3Adesc"), a garbage value OpenAI would receive silently.
   (let [captured (atom nil)
-        {:keys [port stop!]} (start-server! 19020 "/v1/agents/sessions"
+        {:keys [port stop!]} (start-server! 0 "/v1/agents/sessions"
                                 (fn [req] (reset! captured req)
                                   {:status 200 :body "{\"object\":\"list\",\"data\":[],\"has_more\":false}"}))]
     (try
@@ -145,7 +141,7 @@
 
 (deftest sessions-list-with-no-params-sends-no-query-string
   (let [captured (atom nil)
-        {:keys [port stop!]} (start-server! 19004 "/v1/agents/sessions"
+        {:keys [port stop!]} (start-server! 0 "/v1/agents/sessions"
                                 (fn [req] (reset! captured req)
                                   {:status 200 :body "{\"object\":\"list\",\"data\":[],\"has_more\":false}"}))]
     (try
@@ -156,7 +152,7 @@
 
 (deftest sessions-delete-sends-delete
   (let [captured (atom nil)
-        {:keys [port stop!]} (start-server! 19005 "/v1/agents/sessions/sess_1"
+        {:keys [port stop!]} (start-server! 0 "/v1/agents/sessions/sess_1"
                                 (fn [req] (reset! captured req)
                                   {:status 200 :body "{\"id\":\"sess_1\",\"object\":\"agent.session.deleted\",\"deleted\":true}"}))]
     (try
@@ -181,7 +177,7 @@
 
 (deftest agents-create-posts-to-agents-with-beta-header-and-body
   (let [captured (atom nil)
-        {:keys [port stop!]} (start-server! 19025 "/v1/agents"
+        {:keys [port stop!]} (start-server! 0 "/v1/agents"
                                 (fn [req] (reset! captured req) {:status 200 :body (canned-agent "agent_1" "helper")}))]
     (try
       (let [client (oai/client {:api-key "k" :base-url (base-url port)})
@@ -205,7 +201,7 @@
 
 (deftest agents-retrieve-gets-by-id
   (let [captured (atom nil)
-        {:keys [port stop!]} (start-server! 19026 "/v1/agents"
+        {:keys [port stop!]} (start-server! 0 "/v1/agents"
                                 (fn [req] (reset! captured req) {:status 200 :body (canned-agent "agent_42" nil)}))]
     (try
       (let [client (oai/client {:api-key "k" :base-url (base-url port)})
@@ -221,7 +217,7 @@
   ;; nil must reach the wire as JSON null: the reference defines null as
   ;; "clear" for name/instructions/metadata, distinct from omitting the key.
   (let [captured (atom nil)
-        {:keys [port stop!]} (start-server! 19027 "/v1/agents"
+        {:keys [port stop!]} (start-server! 0 "/v1/agents"
                                 (fn [req] (reset! captured req) {:status 200 :body (canned-agent "agent_1" "renamed")}))]
     (try
       (let [client (oai/client {:api-key "k" :base-url (base-url port)})
@@ -236,7 +232,7 @@
 
 (deftest agents-list-sends-cursor-params-and-decodes-the-page
   (let [captured (atom nil)
-        {:keys [port stop!]} (start-server! 19028 "/v1/agents"
+        {:keys [port stop!]} (start-server! 0 "/v1/agents"
                                 (fn [req] (reset! captured req)
                                   {:status 200
                                    :body (str "{\"object\":\"list\",\"data\":[" (canned-agent "agent_2" "b") ","
@@ -255,7 +251,7 @@
 
 (deftest agents-list-with-no-params-sends-no-query-string
   (let [captured (atom nil)
-        {:keys [port stop!]} (start-server! 19029 "/v1/agents"
+        {:keys [port stop!]} (start-server! 0 "/v1/agents"
                                 (fn [req] (reset! captured req)
                                   {:status 200 :body "{\"object\":\"list\",\"data\":[],\"first_id\":null,\"last_id\":null,\"has_more\":false}"}))]
     (try
@@ -268,7 +264,7 @@
 
 (deftest agents-delete-sends-delete
   (let [captured (atom nil)
-        {:keys [port stop!]} (start-server! 19030 "/v1/agents"
+        {:keys [port stop!]} (start-server! 0 "/v1/agents"
                                 (fn [req] (reset! captured req)
                                   {:status 200 :body "{\"id\":\"agent_1\",\"deleted\":true,\"object\":\"agent.deleted\"}"}))]
     (try
@@ -282,7 +278,7 @@
       (finally (stop!)))))
 
 (deftest agents-retrieve-404-maps-to-not-found
-  (let [{:keys [port stop!]} (start-server! 19031 "/v1/agents"
+  (let [{:keys [port stop!]} (start-server! 0 "/v1/agents"
                                 (fn [_] {:status 404 :body "{\"error\":{\"message\":\"No such agent\"}}"}))]
     (try
       (let [client (oai/client {:api-key "k" :base-url (base-url port) :max-retries 0})
@@ -298,7 +294,7 @@
 
 (deftest send-message-posts-the-input-message-event
   (let [captured (atom nil)
-        {:keys [port stop!]} (start-server! 19006 "/v1/agents/sessions/sess_1/events"
+        {:keys [port stop!]} (start-server! 0 "/v1/agents/sessions/sess_1/events"
                                 (fn [req] (reset! captured req) {:status 200 :body "{\"accepted\":true}"}))]
     (try
       (let [client (oai/client {:api-key "k" :base-url (base-url port)})]
@@ -312,7 +308,7 @@
 
 (deftest cancel-turn-posts-the-input-cancel-event
   (let [captured (atom nil)
-        {:keys [port stop!]} (start-server! 19007 "/v1/agents/sessions/sess_1/events"
+        {:keys [port stop!]} (start-server! 0 "/v1/agents/sessions/sess_1/events"
                                 (fn [req] (reset! captured req) {:status 200 :body "{\"accepted\":true}"}))]
     (try
       (let [client (oai/client {:api-key "k" :base-url (base-url port)})]
@@ -322,7 +318,7 @@
 
 (deftest send-tool-result-success-shape
   (let [captured (atom nil)
-        {:keys [port stop!]} (start-server! 19008 "/v1/agents/sessions/sess_1/events"
+        {:keys [port stop!]} (start-server! 0 "/v1/agents/sessions/sess_1/events"
                                 (fn [req] (reset! captured req) {:status 200 :body "{\"accepted\":true}"}))]
     (try
       (let [client (oai/client {:api-key "k" :base-url (base-url port)})]
@@ -339,7 +335,7 @@
 
 (deftest send-tool-result-failure-shape
   (let [captured (atom nil)
-        {:keys [port stop!]} (start-server! 19009 "/v1/agents/sessions/sess_1/events"
+        {:keys [port stop!]} (start-server! 0 "/v1/agents/sessions/sess_1/events"
                                 (fn [req] (reset! captured req) {:status 200 :body "{\"accepted\":true}"}))]
     (try
       (let [client (oai/client {:api-key "k" :base-url (base-url port)})]
@@ -357,7 +353,7 @@
 
 (deftest sessions-items-list-sends-query-and-decodes
   (let [captured (atom nil)
-        {:keys [port stop!]} (start-server! 19010 "/v1/agents/sessions/sess_1/items"
+        {:keys [port stop!]} (start-server! 0 "/v1/agents/sessions/sess_1/items"
                                 (fn [req] (reset! captured req) {:status 200 :body (canned-items "tree printed")}))]
     (try
       (let [client (oai/client {:api-key "k" :base-url (base-url port)})
@@ -373,7 +369,7 @@
 
 (deftest sessions-turns-list-sends-query-and-decodes-the-failed-turn
   (let [captured (atom nil)
-        {:keys [port stop!]} (start-server! 19021 "/v1/agents/sessions/sess_1/turns"
+        {:keys [port stop!]} (start-server! 0 "/v1/agents/sessions/sess_1/turns"
                                 (fn [req] (reset! captured req)
                                   {:status 200 :body (canned-turns [(canned-turn "turn_2" "failed" credit-error)
                                                                     (canned-turn "turn_1" "completed" nil)])}))]
@@ -392,7 +388,7 @@
 
 (deftest sessions-turns-retrieve-gets-by-id
   (let [captured (atom nil)
-        {:keys [port stop!]} (start-server! 19022 "/v1/agents/sessions/sess_1/turns/turn_1"
+        {:keys [port stop!]} (start-server! 0 "/v1/agents/sessions/sess_1/turns/turn_1"
                                 (fn [req] (reset! captured req)
                                   {:status 200 :body (canned-turn "turn_1" "in_progress" nil)}))]
     (try
@@ -410,7 +406,7 @@
 
 (deftest environments-retrieve-gets-by-id
   (let [captured (atom nil)
-        {:keys [port stop!]} (start-server! 19011 "/v1/agents/environments/ccarenv_1"
+        {:keys [port stop!]} (start-server! 0 "/v1/agents/environments/ccarenv_1"
                                 (fn [req] (reset! captured req)
                                   {:status 200 :body "{\"id\":\"ccarenv_1\",\"status\":\"connected\"}"}))]
     (try
@@ -425,7 +421,7 @@
 ;; ---------------------------------------------------------------------------
 
 (deftest non-2xx-throws-with-status-and-extracted-message
-  (let [{:keys [port stop!]} (start-server! 19012 "/v1/agents/sessions"
+  (let [{:keys [port stop!]} (start-server! 0 "/v1/agents/sessions"
                                 (fn [_] {:status 429
                                          :body "{\"error\":{\"message\":\"Rate limit reached\"}}"}))]
     (try
@@ -440,7 +436,7 @@
       (finally (stop!)))))
 
 (deftest sessions-retrieve-404-maps-to-not-found
-  (let [{:keys [port stop!]} (start-server! 19013 "/v1/agents/sessions/sess_missing"
+  (let [{:keys [port stop!]} (start-server! 0 "/v1/agents/sessions/sess_missing"
                                 (fn [_] {:status 404 :body "{\"error\":{\"message\":\"No such session\"}}"}))]
     (try
       (let [client (oai/client {:api-key "k" :base-url (base-url port) :max-retries 0})
@@ -449,7 +445,7 @@
       (finally (stop!)))))
 
 (deftest malformed-json-response-throws-catchable-parse-error
-  (let [{:keys [port stop!]} (start-server! 19014 "/v1/agents/sessions"
+  (let [{:keys [port stop!]} (start-server! 0 "/v1/agents/sessions"
                                 (fn [_] {:status 200 :body "{not valid json"}))]
     (try
       (let [client (oai/client {:api-key "k" :base-url (base-url port)})
@@ -462,7 +458,7 @@
       (finally (stop!)))))
 
 (deftest connection-failure-is-typed-not-leaked
-  (let [client (oai/client {:api-key "k" :base-url "http://127.0.0.1:19998/v1" :max-retries 0})
+  (let [client (oai/client {:api-key "k" :base-url (str "http://127.0.0.1:" (closed-port) "/v1") :max-retries 0})
         e (try (agents/sessions-retrieve client "sess_1") nil (catch Exception e e))]
     (is (some? e))
     (is (= :tools.agents.openai/api-connection-error (:type (ex-data e))))
@@ -472,9 +468,9 @@
 (deftest missing-api-key-throws-before-any-network-activity
   ;; A hand-built client map bypassing tools.agents.openai/client (which would
   ;; itself throw first) — this namespace's own guard must still catch it.
-  ;; Port 19998 has nothing listening: if a network call were ever attempted
+  ;; Nothing listens on the closed port: if a network call were ever attempted
   ;; this would fail with a connection error instead.
-  (let [client {:base-url "http://127.0.0.1:19998/v1"}
+  (let [client {:base-url (str "http://127.0.0.1:" (closed-port) "/v1")}
         e (try (agents/sessions-retrieve client "sess_1") nil (catch Exception e e))]
     (is (some? e))
     (is (= :tools.agents.openai/missing-credentials (:type (ex-data e))))))
@@ -486,7 +482,7 @@
 
 (deftest retries-a-429-then-succeeds
   (let [hits (atom 0)
-        {:keys [port stop!]} (start-server! 19015 "/v1/agents/sessions"
+        {:keys [port stop!]} (start-server! 0 "/v1/agents/sessions"
                                 (fn [_]
                                   (if (< (swap! hits inc) 3)
                                     {:status 429 :headers {"retry-after-ms" "1"} :body "{}"}
@@ -499,7 +495,7 @@
 
 (deftest retries-are-exhausted-then-the-status-error-surfaces
   (let [hits (atom 0)
-        {:keys [port stop!]} (start-server! 19016 "/v1/agents/sessions"
+        {:keys [port stop!]} (start-server! 0 "/v1/agents/sessions"
                                 (fn [_] (swap! hits inc)
                                   {:status 503 :headers {"retry-after-ms" "1"} :body "{}"}))]
     (try
@@ -518,7 +514,7 @@
 (deftest example-sandbox-task-runs-against-mock-server
   (let [session-hits (atom 0)
         {:keys [port stop!]}
-        (start-server! 19017 "/v1/agents/sessions"
+        (start-server! 0 "/v1/agents/sessions"
           (fn [{:keys [method path] :as req}]
             (cond
               (and (= method "POST") (= path "/v1/agents/sessions"))
@@ -548,7 +544,7 @@
   ;; The live no-credits shape: session back to "idle" with no error, items
   ;; holding only the user's input — the failure is only on the turn.
   (let [{:keys [port stop!]}
-        (start-server! 19023 "/v1/agents/sessions"
+        (start-server! 0 "/v1/agents/sessions"
           (fn [{:keys [method path]}]
             (cond
               (and (= method "POST") (= path "/v1/agents/sessions"))
@@ -579,7 +575,7 @@
   ;; then failed — polling must not stop on the session status alone.
   (let [turn-hits (atom 0)
         {:keys [port stop!]}
-        (start-server! 19024 "/v1/agents/sessions"
+        (start-server! 0 "/v1/agents/sessions"
           (fn [{:keys [method path]}]
             (cond
               (and (= method "POST") (= path "/v1/agents/sessions"))
@@ -608,7 +604,7 @@
 
 (deftest example-sandbox-task-poll-timeout-throws
   (let [{:keys [port stop!]}
-        (start-server! 19018 "/v1/agents/sessions"
+        (start-server! 0 "/v1/agents/sessions"
           (fn [{:keys [method path]}]
             (cond
               (and (= method "POST") (= path "/v1/agents/sessions"))
@@ -629,7 +625,7 @@
 (deftest example-self-hosted-runs-against-mock-server
   (let [captured (atom nil)
         {:keys [port stop!]}
-        (start-server! 19019 "/v1/agents/sessions"
+        (start-server! 0 "/v1/agents/sessions"
           (fn [req] (reset! captured req)
             {:status 200
              :body (canned-session "sess_1" "requires_action"
@@ -660,7 +656,7 @@
 
 (deftest sessions-artifacts-list-sends-cursor-query-and-decodes
   (let [captured (atom nil)
-        {:keys [port stop!]} (start-server! 19032 "/v1/agents/sessions/sess_1/artifacts"
+        {:keys [port stop!]} (start-server! 0 "/v1/agents/sessions/sess_1/artifacts"
                                 (fn [req] (reset! captured req)
                                   {:status 200
                                    :body (str "{\"object\":\"list\",\"data\":["
@@ -683,7 +679,7 @@
 
 (deftest sessions-artifacts-retrieve-gets-by-id
   (let [captured (atom nil)
-        {:keys [port stop!]} (start-server! 19033 "/v1/agents/sessions/sess_1/artifacts/art_1"
+        {:keys [port stop!]} (start-server! 0 "/v1/agents/sessions/sess_1/artifacts/art_1"
                                 (fn [req] (reset! captured req)
                                   {:status 200 :body (canned-artifact "art_1" "/workspace/outputs/p.bin")}))]
     (try
@@ -698,7 +694,7 @@
 
 (deftest sessions-artifacts-content-round-trips-non-utf8-bytes
   (let [captured (atom nil)
-        {:keys [port stop!]} (start-server! 19034 "/v1/agents/sessions/sess_1/artifacts/art_1/content"
+        {:keys [port stop!]} (start-server! 0 "/v1/agents/sessions/sess_1/artifacts/art_1/content"
                                 (fn [req] (reset! captured req)
                                   {:status 200 :headers {"content-type" "application/octet-stream"}
                                    :body non-utf8-bytes}))]
@@ -717,7 +713,7 @@
       (finally (stop!)))))
 
 (deftest sessions-artifacts-content-404-is-typed-with-decoded-message
-  (let [{:keys [port stop!]} (start-server! 19035 "/v1/agents/sessions/sess_1/artifacts"
+  (let [{:keys [port stop!]} (start-server! 0 "/v1/agents/sessions/sess_1/artifacts"
                                 (fn [_] {:status 404 :body "{\"error\":{\"message\":\"No such artifact\"}}"}))]
     (try
       (let [client (oai/client {:api-key "k" :base-url (base-url port) :max-retries 0})
@@ -735,7 +731,7 @@
   ;; Redirect.NEVER, so a 3xx surfaces as a typed error rather than a silent
   ;; follow (which would forward the bearer token to the Location host).
   (let [hits (atom [])
-        {:keys [port stop!]} (start-server! 19036 "/v1/agents/sessions/sess_1/artifacts"
+        {:keys [port stop!]} (start-server! 0 "/v1/agents/sessions/sess_1/artifacts"
                                 (fn [{:keys [path]}]
                                   (swap! hits conj path)
                                   {:status 302 :headers {"location" "/v1/signed/blob"} :body ""}))]
@@ -750,7 +746,7 @@
 
 (deftest sessions-artifacts-delete-sends-delete
   (let [captured (atom nil)
-        {:keys [port stop!]} (start-server! 19037 "/v1/agents/sessions/sess_1/artifacts/art_1"
+        {:keys [port stop!]} (start-server! 0 "/v1/agents/sessions/sess_1/artifacts/art_1"
                                 (fn [req] (reset! captured req)
                                   {:status 200
                                    :body "{\"id\":\"art_1\",\"deleted\":true,\"object\":\"agent.session.artifact.deleted\"}"}))]
@@ -775,7 +771,7 @@
 (deftest environments-files-list-follows-page-next-tokens
   (let [queries (atom [])
         {:keys [port stop!]}
-        (start-server! 19038 "/v1/agents/environments/ccarenv_1/files"
+        (start-server! 0 "/v1/agents/environments/ccarenv_1/files"
           (fn [{:keys [method path query]}]
             ;; JVM's .getQuery decodes %2F, httpkit's does not: decode here.
             (swap! queries conj [method path (update-vals (parse-query query)
@@ -807,7 +803,7 @@
       (finally (stop!)))))
 
 (deftest environments-files-list-404-maps-to-not-found
-  (let [{:keys [port stop!]} (start-server! 19039 "/v1/agents/environments"
+  (let [{:keys [port stop!]} (start-server! 0 "/v1/agents/environments"
                                 (fn [_] {:status 404 :body "{\"error\":{\"message\":\"No such environment\"}}"}))]
     (try
       (let [client (oai/client {:api-key "k" :base-url (base-url port) :max-retries 0})
@@ -820,7 +816,7 @@
 
 (deftest environments-files-create-sends-json-body-with-base64-data
   (let [captured (atom [])
-        {:keys [port stop!]} (start-server! 19040 "/v1/agents/environments/ccarenv_1/files"
+        {:keys [port stop!]} (start-server! 0 "/v1/agents/environments/ccarenv_1/files"
                                 (fn [req] (swap! captured conj req)
                                   {:status 200 :body (canned-env-file "/workspace/in.bin" 5)}))
         tmp (java.io.File/createTempFile "clj-tools-agents-env-file" ".bin")]
@@ -854,8 +850,8 @@
       (finally (stop!) (.delete tmp)))))
 
 (deftest environments-files-create-rejects-unsupported-data-before-network
-  ;; Nothing listens on 19998: an attempted request would be a connection error.
-  (let [client (oai/client {:api-key "k" :base-url "http://127.0.0.1:19998/v1" :max-retries 0})
+  ;; Nothing listens on the closed port: an attempted request would be a connection error.
+  (let [client (oai/client {:api-key "k" :base-url (str "http://127.0.0.1:" (closed-port) "/v1") :max-retries 0})
         e      (try (agents/environments-files-create client "ccarenv_1"
                       {"type" "inline" "path" "/workspace/x" "data" 42})
                     nil (catch Exception e e))]
@@ -864,7 +860,7 @@
 
 ;; ---------------------------------------------------------------------------
 ;; Event streaming (#25): sessions-events-stream, sessions-create-stream,
-;; root-turn-finished?, await-root-turn. Ports 19041-19049.
+;; root-turn-finished?, await-root-turn.
 ;; ---------------------------------------------------------------------------
 
 (def ^:private sse-headers {"content-type" "text/event-stream"})
@@ -900,7 +896,7 @@
         server-saw (promise)
         frames     (fixture-frames)
         {:keys [port stop!]}
-        (start-server! 19041 "/v1/agents/sessions/sess_1/events"
+        (start-server! 0 "/v1/agents/sessions/sess_1/events"
           (fn [req]
             (reset! captured req)
             {:status 200 :headers sse-headers
@@ -942,7 +938,7 @@
 
 (deftest sessions-events-stream-tolerates-event-lines-keep-alives-and-done
   (let [{:keys [port stop!]}
-        (start-server! 19042 "/v1/agents/sessions/sess_1/events"
+        (start-server! 0 "/v1/agents/sessions/sess_1/events"
           (fn [_] {:status 200 :headers sse-headers
                    :body (fn [send!]
                            (send! ": comment\n\n")
@@ -963,7 +959,7 @@
   (let [gone   (promise)
         frames (fixture-frames)
         {:keys [port stop!]}
-        (start-server! 19043 "/v1/agents/sessions/sess_1/events"
+        (start-server! 0 "/v1/agents/sessions/sess_1/events"
           (fn [_] {:status 200 :headers sse-headers
                    :body (fn [send!]
                            (doseq [f (take 3 frames)] (send! f))
@@ -982,7 +978,7 @@
 (deftest sessions-events-stream-http-error-before-the-stream-is-typed
   (let [hits (atom 0)
         {:keys [port stop!]}
-        (start-server! 19044 "/v1/agents/sessions/sess_missing/events"
+        (start-server! 0 "/v1/agents/sessions/sess_missing/events"
           (fn [_] (swap! hits inc)
             {:status 404 :headers {"content-type" "application/json"}
              :body "{\"error\":{\"message\":\"No session found\",\"type\":\"invalid_request_error\"}}"}))]
@@ -999,7 +995,7 @@
 (deftest sessions-events-stream-retries-a-503-before-the-first-byte
   (let [hits (atom 0)
         {:keys [port stop!]}
-        (start-server! 19045 "/v1/agents/sessions/sess_1/events"
+        (start-server! 0 "/v1/agents/sessions/sess_1/events"
           (fn [_]
             (if (= 1 (swap! hits inc))
               {:status 503 :headers {"retry-after-ms" "1"} :body "{\"error\":{\"message\":\"busy\"}}"}
@@ -1013,7 +1009,7 @@
 
 (deftest sessions-events-stream-mid-stream-abort-is-a-connection-error
   (let [{:keys [port stop!]}
-        (start-abort-server! 19046 {:headers sse-headers :chunks (take 2 (fixture-frames))})]
+        (start-abort-server! 0 {:headers sse-headers :chunks (take 2 (fixture-frames))})]
     (try
       (let [client (oai/client {:api-key "k" :base-url (base-url port) :max-retries 0})
             seen   (atom [])
@@ -1099,7 +1095,7 @@
         gone     (promise)
         frames   (fixture-frames)
         {:keys [port stop!]}
-        (start-server! 19047 "/v1/agents/sessions"
+        (start-server! 0 "/v1/agents/sessions"
           (fn [req]
             (reset! captured req)
             {:status 200 :headers sse-headers
@@ -1130,7 +1126,7 @@
 
 (deftest await-root-turn-over-a-truncated-stream-throws-stream-truncated
   (let [{:keys [port stop!]}
-        (start-server! 19048 "/v1/agents/sessions/sess_1/events"
+        (start-server! 0 "/v1/agents/sessions/sess_1/events"
           (fn [_] {:status 200 :headers sse-headers :body (apply str (take 8 (fixture-frames)))}))]
     (try
       (let [client (oai/client {:api-key "k" :base-url (base-url port)})
@@ -1142,7 +1138,7 @@
       (finally (stop!)))))
 
 (deftest sessions-create-stream-still-leaves-sessions-create-refusing-stream
-  (let [client (oai/client {:api-key "k" :base-url "http://127.0.0.1:19999/v1"})
+  (let [client (oai/client {:api-key "k" :base-url (str "http://127.0.0.1:" (closed-port) "/v1")})
         e      (try (agents/sessions-create client {"input" "hi" "stream" true}) nil (catch Exception e e))]
     (is (= :tools.agents.openai/streaming-unsupported (:type (ex-data e))))
     (is (str/includes? (ex-message e) "sessions-create-stream"))))
@@ -1309,8 +1305,8 @@
       (is (every? #(= "agents=v1" (get-in % [:headers "openai-beta"])) @calls)))))
 
 (deftest sessions-update-rejects-stream-true-before-network
-  ;; Nothing listens on 19998: an attempted request would be a connection error.
-  (let [client (oai/client {:api-key "k" :base-url "http://127.0.0.1:19998/v1" :max-retries 0})
+  ;; Nothing listens on the closed port: an attempted request would be a connection error.
+  (let [client (oai/client {:api-key "k" :base-url (str "http://127.0.0.1:" (closed-port) "/v1") :max-retries 0})
         e      (try (agents/sessions-update client "sess_1" {"stream" true}) nil (catch Exception e e))]
     (is (= :tools.agents.openai/streaming-unsupported (:type (ex-data e))))))
 
@@ -1613,7 +1609,7 @@
 (deftest sessions-create-with-credential-source-refreshes-on-401
   (let [auths (atom [])
         {:keys [source fetches]} (rotating-token-cache)
-        {:keys [port stop!]} (start-server! 19079 "/v1/agents/sessions"
+        {:keys [port stop!]} (start-server! 0 "/v1/agents/sessions"
                                 (fn [req]
                                   (swap! auths conj [(get (:headers req) "authorization")
                                                      (get (:headers req) "openai-beta")])
@@ -1668,10 +1664,6 @@
 ;; callable :api-key (#37) — inherited from the openai client, streaming open
 ;; included. OS-assigned ports.
 ;; ---------------------------------------------------------------------------
-
-(defn- free-port []
-  (with-open [s (java.net.ServerSocket. 0 50 (java.net.InetAddress/getByName "127.0.0.1"))]
-    (.getLocalPort s)))
 
 (deftest sessions-create-with-api-key-fn-calls-it-per-attempt
   (let [auths (atom [])

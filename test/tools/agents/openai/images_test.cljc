@@ -1,7 +1,6 @@
 (ns tools.agents.openai.images-test
   "tools.agents.openai.images: pure part building plus mock-server round trips
-   (shared tools.agents.test-support server; base-url carries /v1). Ports
-   19300-19303."
+   (shared tools.agents.test-support server; base-url carries /v1)."
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.string :as str]
             [tools.agents.openai :as oai]
@@ -115,7 +114,7 @@
 
 (deftest images-generate-json-body
   (let [captured (atom nil)
-        {:keys [port stop!]} (start-server! 19300 "/v1/images"
+        {:keys [port stop!]} (start-server! 0 "/v1/images"
                                 (fn [req] (reset! captured req) {:status 200 :body images-response}))]
     (try
       (let [resp (images/images-generate (client port)
@@ -136,7 +135,7 @@
         img-b    (.getBytes "second" "UTF-8")
         mask     (byte-array [(unchecked-byte 0x89) 0x50 0x4e 0x47 0 (unchecked-byte 0xff)])
         tmp      (java.io.File/createTempFile "tools-agents-images" ".webp")
-        {:keys [port stop!]} (start-server! 19301 "/v1/images"
+        {:keys [port stop!]} (start-server! 0 "/v1/images"
                                 (fn [req] (reset! captured req) {:status 200 :body images-response}))]
     (try
       (with-open [os (java.io.FileOutputStream. tmp)] (.write os img-b))
@@ -174,7 +173,7 @@
 (deftest images-create-variation-multipart
   (let [captured (atom nil)
         img      (all-bytes)
-        {:keys [port stop!]} (start-server! 19302 "/v1/images"
+        {:keys [port stop!]} (start-server! 0 "/v1/images"
                                 (fn [req] (reset! captured req)
                                   {:status 200 :body "{\"created\":1,\"data\":[{\"url\":\"https://x/y.png\"}]}"}))]
     (try
@@ -199,7 +198,7 @@
 
 (deftest images-4xx-typing
   (let [hits (atom 0)
-        {:keys [port stop!]} (start-server! 19303 "/v1/images"
+        {:keys [port stop!]} (start-server! 0 "/v1/images"
                                 (fn [req]
                                   (swap! hits inc)
                                   (if (str/ends-with? (:path req) "/generations")
