@@ -68,6 +68,11 @@ the [files guide](https://developers.openai.com/api/docs/guides/agents-api/envir
 and openai-python's `sessions/artifacts.py` / `environments/files.py`.
 The reference has no environment-file retrieve, delete or content endpoint.
 
+Session update is implemented from the
+[reference page](https://developers.openai.com/api/reference/resources/beta/subresources/agents/subresources/sessions/methods/update/index.md)
+and openai-python's `sessions/sessions.py`: metadata only. Not yet verified
+live.
+
 Vaults and vault credentials are implemented from the reference pages
 ([vaults create](https://developers.openai.com/api/reference/resources/beta/subresources/agents/subresources/vaults/methods/create/index.md),
 [retrieve](https://developers.openai.com/api/reference/resources/beta/subresources/agents/subresources/vaults/methods/retrieve/index.md),
@@ -220,6 +225,7 @@ test suite runs it instantly against a mock server) and
 | `client.beta.agents.delete(agent_id)` — `DELETE /v1/agents/{agent_id}` | `(agents-delete client agent-id)` | Returns `{"deleted" true "object" "agent.deleted"}`. Deleting an agent live sessions reference is undocumented. |
 | `client.beta.agents.sessions.create(**params)` | `(sessions-create client request)` | `request` passed through to JSON almost verbatim. Throws immediately on `stream: true`: use `sessions-create-stream`. |
 | `client.beta.agents.sessions.retrieve(id)` | `(sessions-retrieve client session-id)` | |
+| `client.beta.agents.sessions.update(session_id, metadata=)` — `POST /v1/agents/sessions/{session_id}` | `(sessions-update client session-id request)` | `{"metadata" …}` is the only field; it replaces all metadata, `nil`/`{}` clears, omitted leaves it. Returns the session. |
 | `client.beta.agents.sessions.list(**params)` | `(sessions-list client params)` / `(sessions-list client)` | `params` is a plain query-param map (`{"limit" 20 "order" "desc" "after" "sess_..."}`); page with `"after"` = the previous page's `"last_id"` while `"has_more"` is true. |
 | `client.beta.agents.sessions.delete(id)` | `(sessions-delete client session-id)` | Removes the session from the API; does not stop self-hosted provider compute (per OpenAI's own docs) and has no webhook. |
 | `client.beta.agents.sessions.events.create(id, events=[...])` | `(sessions-events-create client session-id request)` | Raw escape hatch; prefer the three helpers below for the shapes OpenAI's docs actually show. |
@@ -607,6 +613,11 @@ body sent as JSON null; and a 400 on credential create typed
 `vaults-crud-round-trip-against-the-real-api` (same gate; no inference, no
 credential) runs create → retrieve → list (polled) → empty credential list →
 delete → retrieve 404. It **has not been run yet**.
+
+`sessions-update` (#49): POST to the session path with the metadata body,
+`nil` metadata sent as JSON null, `"stream" true` rejected before any
+network I/O. No live test: it needs a session, which `sessions-create`
+provisions; not cheap enough to justify for a metadata write.
 
 Environment templates (#49): method, path, beta header, query and body for
 all five methods (a `nil` `"name"` on update sent as JSON null) and a 404

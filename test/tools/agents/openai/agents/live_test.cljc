@@ -1230,6 +1230,27 @@
   (str "{\"object\":\"list\",\"data\":[" (str/join "," item-jsons) "],"
        "\"first_id\":\"a\",\"last_id\":\"b\",\"has_more\":true}"))
 
+;; --- sessions-update ----------------------------------------------------------
+
+(deftest sessions-update-posts-metadata-to-the-session
+  (with-recording-server
+    (ok "{\"id\":\"sess_1\",\"object\":\"agent.session\",\"status\":\"idle\",\"metadata\":{\"ticket\":\"T-1\"}}")
+    (fn [client calls]
+      (is (= {"ticket" "T-1"} (get (agents/sessions-update client "sess_1" {"metadata" {"ticket" "T-1"}}) "metadata")))
+      (agents/sessions-update client "sess_1" {"metadata" nil})
+      (is (= [["POST" "/v1/agents/sessions/sess_1" nil {"metadata" {"ticket" "T-1"}}]
+              ["POST" "/v1/agents/sessions/sess_1" nil {"metadata" nil}]]
+             (mapv wire @calls))
+          "nil reaches the wire as JSON null, which clears metadata")
+      (is (str/includes? (:body (second @calls)) "\"metadata\":null"))
+      (is (every? #(= "agents=v1" (get-in % [:headers "openai-beta"])) @calls)))))
+
+(deftest sessions-update-rejects-stream-true-before-network
+  ;; Nothing listens on 19998: an attempted request would be a connection error.
+  (let [client (oai/client {:api-key "k" :base-url "http://127.0.0.1:19998/v1" :max-retries 0})
+        e      (try (agents/sessions-update client "sess_1" {"stream" true}) nil (catch Exception e e))]
+    (is (= :tools.agents.openai/streaming-unsupported (:type (ex-data e))))))
+
 ;; --- environment templates --------------------------------------------------
 
 (def ^:private canned-template
