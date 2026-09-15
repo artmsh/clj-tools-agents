@@ -4,8 +4,9 @@
    (`resources/webhooks/webhooks.py`, `lib/_webhooks.py`), which implement the
    Standard Webhooks scheme (https://www.standardwebhooks.com).
 
-   Pure: no HTTP, no client. Only the clock (overridable via :now-s) and the
-   OPENAI_WEBHOOK_SECRET env var touch the process.
+   Pure: no HTTP; a client is optional (only its :webhook-secret is read).
+   Only the clock (overridable via :now-s) and the OPENAI_WEBHOOK_SECRET env
+   var touch the process.
 
    PAYLOAD MUST BE THE RAW REQUEST BODY (String or byte[]), exactly as
    received. Re-serialized JSON (parsed then written back) changes bytes and
@@ -18,7 +19,7 @@
    is base64-decoded; any other secret is used as its raw UTF-8 bytes.
 
    Errors (ex-info, :type in ex-data):
-     :tools.agents.openai/missing-webhook-secret           no :secret and no env var (SDK ValueError)
+     :tools.agents.openai/missing-webhook-secret           no :secret, no client secret, no env var (SDK ValueError)
      :tools.agents.openai/missing-webhook-header           header absent, :header in ex-data (SDK ValueError)
      :tools.agents.openai/invalid-webhook-secret           `whsec_` remainder is not base64 (SDK binascii.Error)
      :tools.agents.openai/invalid-webhook-signature-error  bad timestamp format, too old, too new,
@@ -35,12 +36,16 @@
 
 (defn resolve-webhook-secret
   "Explicit :secret (an explicit \"\" is kept, as in the SDK) >
-   OPENAI_WEBHOOK_SECRET > throw :tools.agents.openai/missing-webhook-secret.
-   getenv-fn is injected for tests."
+   (:webhook-secret (:client opts)) > OPENAI_WEBHOOK_SECRET > throw
+   :tools.agents.openai/missing-webhook-secret. :client is an optional
+   tools.agents.openai/client record (the SDK's client-level
+   `webhook_secret`). getenv-fn is injected for tests."
   [opts getenv-fn]
-  (let [s (:secret opts)]
+  (let [s  (:secret opts)
+        cs (:webhook-secret (:client opts))]
     (cond
       (some? s) s
+      (some? cs) cs
       (some? (getenv-fn "OPENAI_WEBHOOK_SECRET")) (getenv-fn "OPENAI_WEBHOOK_SECRET")
       :else (fail! :tools.agents.openai/missing-webhook-secret
                    (str "The webhook secret must either be set using the env var, "
@@ -92,7 +97,9 @@
 
    headers: map, keys matched case-insensitively (strings or keywords).
    opts:
-     :secret     webhook secret; falls back to OPENAI_WEBHOOK_SECRET
+     :secret     webhook secret; falls back to :client's :webhook-secret,
+                 then OPENAI_WEBHOOK_SECRET
+     :client     optional tools.agents.openai/client record
      :tolerance  seconds, default 300, applied to both too-old and too-new
      :now-s      current epoch seconds (default: system clock) — for tests"
   ([payload headers] (verify-signature payload headers {}))

@@ -89,7 +89,7 @@
 
 ;; ---------------------------------------------------------------------------
 ;; Process boundary — `getenv`, `sleep!` and `now-ms` are testability seams.
-;; Network I/O is tools.agents.http/request!, called from post-json! below.
+;; Network I/O is tools.agents.http/request!, called from request! below.
 ;; ---------------------------------------------------------------------------
 
 (defn- getenv [name]
@@ -146,12 +146,17 @@
                    (`default-max-retries`, openai-python's own default). 0
                    disables retries. The Python `with_options(max_retries=n)`
                    per-call override is just `(assoc client :max-retries n)`
-                   here, since the client record is associative."
+                   here, since the client record is associative.
+     :webhook-secret  secret for tools.agents.openai.webhooks verification
+                   (falls back to OPENAI_WEBHOOK_SECRET; key absent when
+                   unset). An explicit `:secret` passed to verify-signature /
+                   unwrap still wins."
   ([] (client {}))
   ([opts]
    (let [creds (resolve-credentials opts getenv)
          org   (or (:organization opts) (getenv "OPENAI_ORG_ID"))
-         proj  (or (:project opts) (getenv "OPENAI_PROJECT_ID"))]
+         proj  (or (:project opts) (getenv "OPENAI_PROJECT_ID"))
+         whsec (if (some? (:webhook-secret opts)) (:webhook-secret opts) (getenv "OPENAI_WEBHOOK_SECRET"))]
      (map->OpenAIClient
       (cond-> (merge {:base-url    (or (:base-url opts) (getenv "OPENAI_BASE_URL") default-base-url)
                       :max-retries (if (number? (:max-retries opts))
@@ -159,7 +164,8 @@
                                      default-max-retries)}
                      creds)
         (seq org)  (assoc :organization org)
-        (seq proj) (assoc :project proj))))))
+        (seq proj)    (assoc :project proj)
+        (some? whsec) (assoc :webhook-secret whsec))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Error typing
@@ -380,21 +386,42 @@
     (str base-url (subs path 1))
     (str base-url path)))
 
-(defn- request-headers [fn-name client]
+(defn- fn-label
+  "Error-message prefix for fn-name: a name already qualified with `/` (e.g.
+   \"tools.agents.openai.agents/sessions-create\") is used verbatim, a bare
+   one is qualified under tools.agents.openai."
+  [fn-name]
+  (if (str/includes? (str fn-name) "/") (str fn-name) (str "tools.agents.openai/" fn-name)))
+
+(defn- request-headers
+  "Headers for ONE attempt. `request!` calls this before every attempt and
+   never reuses a previous attempt's map, so credentials that change between
+   attempts (a refreshed token, #34) land on the retry. `extra` is merged
+   last and may override any default."
+  [label client multipart? extra]
   (when-not (:api-key client)
-    (throw (ex-info (str "tools.agents.openai/" fn-name ": client has no :api-key — build it via "
+    (throw (ex-info (str label ": client has no :api-key — build it via "
                           "tools.agents.openai/client")
                      {:type :tools.agents.openai/missing-credentials})))
   ;; OpenAI-Organization / OpenAI-Project must be ABSENT (not empty-valued)
   ;; when unset — the SDK emits Omit() for them. cond->, never assoc-of-nil.
-  (cond-> {"authorization" (str "Bearer " (:api-key client))
-           "content-type" "application/json"}
-    (seq (:organization client)) (assoc "openai-organization" (:organization client))
-    (seq (:project client))      (assoc "openai-project" (:project client))))
+  ;; A multipart body gets its content-type (with boundary) from
+  ;; tools.agents.http/request!, so the JSON one is not set there.
+  (merge (cond-> {"authorization" (str "Bearer " (:api-key client))}
+           (not multipart?)             (assoc "content-type" "application/json")
+           (seq (:organization client)) (assoc "openai-organization" (:organization client))
+           (seq (:project client))      (assoc "openai-project" (:project client)))
+         extra))
 
-(defn- reject-streaming! [fn-name request]
-  (when (or (true? (get request :stream)) (true? (get request "stream")))
-    (throw (ex-info (str "tools.agents.openai/" fn-name ": :stream true is not supported — "
+(defn- streaming-requested? [body multipart]
+  (boolean
+   (or (and (map? body) (or (true? (get body :stream)) (true? (get body "stream"))))
+       (some (fn [part] (and (= "stream" (str (:name part))) (= "true" (str (:content part)))))
+             multipart))))
+
+(defn- reject-streaming! [label body multipart]
+  (when (streaming-requested? body multipart)
+    (throw (ex-info (str label ": :stream true is not supported — "
                           "SSE streaming is not implemented by this client. See README.")
                      {:type :tools.agents.openai/streaming-unsupported}))))
 
@@ -417,59 +444,132 @@
   (let [n (:max-retries client)]
     (if (number? n) (max 0 (long n)) default-max-retries)))
 
+(defn- invalidate-credentials!
+  "SEAM FOR #34 (refreshable credentials). NOT ACTIVE YET.
+
+   `request!` calls this on a 401, at most once per call. Returning true
+   means the cached credential was invalidated and the next `request-headers`
+   call will produce a fresh one; `request!` then retries once, OUTSIDE the
+   :max-retries budget (credentials plan §4-5). Static :api-key credentials
+   have nothing to refresh, so this returns false and a 401 surfaces at once
+   as :tools.agents.openai/authentication-error, as before."
+  [_client]
+  false)
+
+(defn- body->string
+  "A response body as a String: `:as :bytes` yields byte[], the rest a String."
+  [body]
+  (cond (nil? body)   nil
+        (bytes? body) (String. ^bytes body "UTF-8")
+        :else         (str body)))
+
+(defn- decode-success [as body]
+  (case as
+    :json   (when (seq body) (read-json body))
+    :string body
+    :bytes  body))
+
+(defn request!
+  "The one OpenAI transport every resource method uses: tools.agents.openai,
+   tools.agents.openai.agents, .embeddings, .realtime and later resource
+   namespaces. One call is one logical request: build the URL, encode the
+   JSON body ONCE, then loop attempts through tools.agents.http/request!,
+   rebuilding headers before EVERY attempt. Transport failures and retryable
+   statuses are retried per openai-python's policy (`should-retry?`,
+   `retry-delay-ms`: `x-should-retry`, `retry-after-ms`, `retry-after`;
+   :max-retries on the client, default 2); errors are typed by `status->type`.
+
+   fn-name labels error messages: a bare name (\"files-create\") is prefixed
+   with \"tools.agents.openai/\"; a qualified one
+   (\"tools.agents.openai.agents/sessions-create\") is used verbatim. The
+   2-arity uses \"request!\".
+
+   req:
+     :method     :get | :post | :delete | ... (default :post)
+     :path       endpoint path appended to the client's base-url, e.g. \"/files\"
+     :query      optional params map, bracket-encoded by
+                 tools.agents.http/encode-params
+     :body       optional JSON value (map, vector, ...), encoded by `write-json`
+     :multipart  optional tools.agents.http multipart parts, instead of :body;
+                 no JSON content-type is sent
+     :headers    extra headers merged over the defaults on every attempt,
+                 e.g. {\"openai-beta\" \"agents=v1\"}
+     :as         :json (default: decode a 2xx body, empty body -> nil) |
+                 :string (raw String, no decode) | :bytes (raw byte[])
+
+   A `stream` true body field or multipart part throws
+   :tools.agents.openai/streaming-unsupported before any network I/O.
+
+   Throws ex-info:
+     - non-2xx (not retryable, or budget spent): {:type (status->type status)
+       :status :body <String> :retries-taken}
+     - no response after the budget: :tools.agents.openai/api-connection-error
+     - malformed 2xx JSON: :tools.agents.openai/json-parse-error, not retried
+       (the SDK decodes after its retry loop)
+
+   401 SEAM (#34): on a 401 the loop asks `invalidate-credentials!` once and,
+   if it reports an invalidated credential, retries once outside :max-retries.
+   It reports false today, so a 401 is never retried."
+  ([client req] (request! client "request!" req))
+  ([client fn-name {:keys [method path query body multipart headers as]
+                    :or   {method :post as :json}}]
+   (let [label (fn-label fn-name)]
+     (when-not (contains? #{:json :string :bytes} as)
+       (throw (ex-info (str label ": unsupported :as " (pr-str as) " — expected :json, :string or :bytes")
+                       {:type :tools.agents.openai/invalid-request})))
+     (reject-streaming! label body multipart)
+     (let [url         (endpoint-url (:base-url client) path)
+           body-str    (when (some? body) (write-json body))
+           max-retries (resolve-max-retries client)]
+       (loop [retries-taken 0
+              auth-retried? false]
+         (let [outcome (try
+                         {:resp (http/request!
+                                 (cond-> {:method  method
+                                          :url     url
+                                          :query   query
+                                          :headers (request-headers label client (some? multipart) headers)
+                                          :as      (if (= as :bytes) :bytes :string)}
+                                   body-str  (assoc :body body-str)
+                                   multipart (assoc :multipart multipart)))}
+                         (catch Exception e
+                           (if (own-error? e) (throw e) {:error e})))]
+           (if (:error outcome)
+             ;; No response at all: DNS, connection refused, TLS handshake,
+             ;; timeout. The SDK retries these without consulting _should_retry.
+             (if (< retries-taken max-retries)
+               (do (sleep! (retry-delay-ms retries-taken nil (now-ms)))
+                   (recur (inc retries-taken) auth-retried?))
+               (throw (ex-info (str label ": connection failed: " (:error outcome))
+                               {:type :tools.agents.openai/api-connection-error :status nil :body nil
+                                :retries-taken retries-taken})))
+             (let [{:keys [status] resp-hdrs :headers resp-body :body} (:resp outcome)]
+               (cond
+                 (and status (>= status 200) (< status 300))
+                 (decode-success as resp-body)
+
+                 (and (= status 401) (not auth-retried?) (invalidate-credentials! client))
+                 (recur retries-taken true)
+
+                 (and (< retries-taken max-retries) (should-retry? status resp-hdrs (now-ms)))
+                 (do (sleep! (retry-delay-ms retries-taken resp-hdrs (now-ms)))
+                     (recur (inc retries-taken) auth-retried?))
+
+                 :else
+                 (let [body-s  (body->string resp-body)
+                       err-msg (extract-error-message body-s)
+                       detail  (cond err-msg err-msg (seq body-s) body-s :else nil)]
+                   (throw (ex-info (str label ": HTTP " status (when detail (str " " detail)))
+                                   {:type (status->type status) :status status :body body-s
+                                    :retries-taken retries-taken}))))))))))))
+
 (defn post-json!
-  "Shared transport for every resource method: build URL + headers, encode the
-   request map, POST it, classify the status, decode the body — retrying
-   transport failures and retryable statuses per openai-python's policy (see
-   `should-retry?` / `retry-delay-ms`; :max-retries on the client, default 2).
-
-   Public (not ^:private) so sibling resource namespaces
-   (tools.agents.openai.embeddings, tools.agents.openai.realtime) POST through
-   this exact retry loop and error typing instead of a copy of it. fn-name
-   prefixes error messages; path is appended to the client's base-url.
-
-   Non-retryable failures, and retryable ones once the budget is spent, throw
-   with :retries-taken in ex-data. A malformed body on an otherwise-successful
-   2xx is NOT retried — same as the SDK, where decoding happens after the
-   retry loop has already broken out."
+  "POST a JSON request map to path and decode the JSON response: a thin
+   wrapper over `request!`, kept public for sibling namespaces
+   (tools.agents.openai.embeddings, tools.agents.openai.realtime). Same
+   retries, error typing and ex-data as `request!`."
   [client fn-name path request]
-  (reject-streaming! fn-name request)
-  (let [url         (endpoint-url (:base-url client) path)
-        body-str    (write-json request)
-        max-retries (resolve-max-retries client)]
-    (loop [retries-taken 0]
-      ;; Headers are rebuilt on every attempt, so credentials that change
-      ;; between attempts (a refreshed token) land on the retry. The typed
-      ;; :missing-credentials throw passes through own-error?.
-      (let [outcome (try
-                      {:resp (http/request! {:method :post :url url
-                                             :headers (request-headers fn-name client)
-                                             :body body-str})}
-                      (catch Exception e
-                        (if (own-error? e) (throw e) {:error e})))]
-        (if (:error outcome)
-          ;; No response at all: DNS, connection refused, TLS handshake,
-          ;; timeout. The SDK retries these without consulting _should_retry.
-          (if (< retries-taken max-retries)
-            (do (sleep! (retry-delay-ms retries-taken nil (now-ms)))
-                (recur (inc retries-taken)))
-            (throw (ex-info (str "tools.agents.openai/" fn-name ": connection failed: " (:error outcome))
-                             {:type :tools.agents.openai/api-connection-error :status nil :body nil
-                              :retries-taken retries-taken})))
-          (let [resp      (:resp outcome)
-                status    (:status resp)
-                resp-hdrs (:headers resp)
-                resp-body (:body resp)]
-            (if (and status (>= status 200) (< status 300))
-              (read-json resp-body)
-              (if (and (< retries-taken max-retries) (should-retry? status resp-hdrs (now-ms)))
-                (do (sleep! (retry-delay-ms retries-taken resp-hdrs (now-ms)))
-                    (recur (inc retries-taken)))
-                (let [err-msg (extract-error-message resp-body)
-                      detail  (cond err-msg err-msg (seq resp-body) resp-body :else nil)]
-                  (throw (ex-info (str "tools.agents.openai/" fn-name ": HTTP " status (when detail (str " " detail)))
-                                   {:type (status->type status) :status status :body resp-body
-                                    :retries-taken retries-taken})))))))))))
+  (request! client fn-name {:method :post :path path :body request}))
 
 ;; ---------------------------------------------------------------------------
 ;; Public API — resource methods

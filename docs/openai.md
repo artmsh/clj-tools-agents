@@ -133,9 +133,9 @@ header, no query string) plus Microsoft's documentation.
 | `timeout` (default 10 min) / `APITimeoutError` | *(not implemented)* | Each runtime's HTTP leaf uses its own default timeout; a timeout surfaces as `:tools.agents.openai/api-connection-error` (which is also where Python's `APITimeoutError` sits in the hierarchy, as a subclass of `APIConnectionError`) and is retried like any other transport failure, exactly as the SDK does. |
 | `client.responses.create(..., stream=True)` / `client.responses.stream(...)` | **rejected outright** | See Streaming below. |
 | `client.embeddings.create(**params)` | `(tools.agents.openai.embeddings/embeddings-create client params)` | `POST /embeddings` (`resources/embeddings.py`). Omitted `encoding_format` → sent as `"base64"` and each string `data[].embedding` decoded as little-endian float32 into doubles (`lib/_parsing/_embeddings.py`); an explicit `"float"`/`"base64"` is returned untouched. Empty `data` with the implicit format → `:tools.agents.openai/invalid-response`. Helper: `decode-embedding-base64`. |
-| `client.webhooks.verify_signature(payload, headers, secret=, tolerance=300)` / `client.webhooks.unwrap(payload, headers, secret=)` | `(tools.agents.openai.webhooks/verify-signature payload headers {:secret :tolerance :now-s})` / `(tools.agents.openai.webhooks/unwrap payload headers opts)` | Pure, no HTTP (`lib/_webhooks.py`). Standard Webhooks HMAC-SHA256 over `{webhook-id}.{webhook-timestamp}.{body}`; `payload` must be the raw body (String or `byte[]`). Two-sided 300 s window, `whsec_` secrets base64-decoded (others used as raw bytes), space-separated `v1,<b64>` or bare signatures, constant-time compare. Secret: `:secret` → `OPENAI_WEBHOOK_SECRET`; the SDK's client-level `webhook_secret` is not on `OpenAIClient`. `unwrap` returns the event parsed by `read-json`. |
+| `client.webhooks.verify_signature(payload, headers, secret=, tolerance=300)` / `client.webhooks.unwrap(payload, headers, secret=)` | `(tools.agents.openai.webhooks/verify-signature payload headers {:secret :tolerance :now-s})` / `(tools.agents.openai.webhooks/unwrap payload headers opts)` | Pure, no HTTP (`lib/_webhooks.py`). Standard Webhooks HMAC-SHA256 over `{webhook-id}.{webhook-timestamp}.{body}`; `payload` must be the raw body (String or `byte[]`). Two-sided 300 s window, `whsec_` secrets base64-decoded (others used as raw bytes), space-separated `v1,<b64>` or bare signatures, constant-time compare. Secret: `:secret` → `(:webhook-secret client)` (pass `{:client c}` in opts; `client` resolves `:webhook-secret` → `OPENAI_WEBHOOK_SECRET`, as `_client.py` does for `webhook_secret`) → `OPENAI_WEBHOOK_SECRET`. `unwrap` returns the event parsed by `read-json`. |
 | `client.realtime.client_secrets.create(**params)` | `(tools.agents.openai.realtime/realtime-client-secrets-create client params)` | `POST /realtime/client_secrets` (`resources/realtime/client_secrets.py`); `expires_after` / `session` pass through verbatim. |
-| `client.images.*` / `.files.*` / `.batches.*` / `.fine_tuning.*` / Assistants / Realtime `connect` + `calls.*` | *(not implemented)* | Not yet ported. `post-json!` is the shared transport, so adding another POST resource is a two-line change. |
+| `client.images.*` / `.files.*` / `.batches.*` / `.fine_tuning.*` / Assistants / Realtime `connect` + `calls.*` | *(not implemented)* | Not yet ported. `request!` is the shared transport (any method, `:query`, JSON or multipart body, `:as :json`/`:string`/`:bytes`), so a new resource method is a single call. See Shared transport below. |
 | `admin_api_key` / `OPENAI_ADMIN_KEY`, Workload Identity Federation | *(not implemented)* | The credential chain here is explicit `:api-key` → `OPENAI_API_KEY` → throw. The SDK's fuller chain (admin keys, token-exchange workload identity) is out of scope. |
 | Azure OpenAI v1: `OpenAI(base_url="https://<resource>.openai.azure.com/openai/v1/", api_key=...)` | `(client {:base-url "https://<resource>.openai.azure.com/openai/v1" :api-key ...})` | Works through `:base-url`; no Azure-specific code. API key or a static Entra ID token, both as `Authorization: Bearer`. A refreshing Entra token provider needs callable `:api-key` (#37). Not verified against a live Azure resource. See Azure OpenAI (v1 API) above. |
 | `AzureOpenAI(azure_endpoint=, azure_deployment=, api_version=)` (legacy) | *(not supported)* | Deployment path rewriting, the required `api-version` query and `AZURE_OPENAI_*` / `OPENAI_API_VERSION` env vars are not ported. Use the v1 API. |
@@ -189,7 +189,7 @@ Non-status error types:
 | structurally wrong content (non-array `"content"`, non-string `"text"`, non-string non-null `"content"`) | `:tools.agents.openai/invalid-content-shape` |
 | webhook: bad timestamp format, timestamp outside tolerance, or no matching signature (`InvalidWebhookSignatureError`) | `:tools.agents.openai/invalid-webhook-signature-error` |
 | webhook: `webhook-id` / `webhook-timestamp` / `webhook-signature` header absent (`:header` in ex-data) | `:tools.agents.openai/missing-webhook-header` |
-| webhook: no `:secret` and no `OPENAI_WEBHOOK_SECRET` | `:tools.agents.openai/missing-webhook-secret` |
+| webhook: no `:secret`, no client `:webhook-secret` and no `OPENAI_WEBHOOK_SECRET` | `:tools.agents.openai/missing-webhook-secret` |
 | webhook: `whsec_` secret is not valid base64 | `:tools.agents.openai/invalid-webhook-secret` |
 
 These keywords sit directly under `:tools.agents.openai/…`, not under a
@@ -220,8 +220,8 @@ tuning, on by default with `:max-retries` 2.
   header wins outright (exact, case-sensitive match, as in the SDK), otherwise
   408 / 409 / 429 / 5xx retry and everything else does not. A `Retry-After`
   longer than two minutes vetoes the retry entirely.
-- **What is not retried.** 4xx other than 408/409/429; a malformed JSON body
-  on an otherwise-successful 2xx (the SDK decodes after its retry loop has
+- **What is not retried.** 4xx other than 408/409/429; a malformed, non-empty
+  JSON body on an otherwise-successful 2xx (an empty one decodes to `nil`) (the SDK decodes after its retry loop has
   already broken out); and this library's own typed refusal, the `:stream true`
   rejection — mirroring the SDK re-raising `OpenAIError` out of the send path
   without retrying.
@@ -325,6 +325,43 @@ Clients build request headers inside each retry attempt, so credentials that
 change between attempts reach the retry; the request body is encoded once.
 The shared function pins **HTTP/1.1** — see below.
 
+### Shared transport: `request!`
+
+Every OpenAI resource method, in this namespace and in
+`tools.agents.openai.agents`, `.embeddings` and `.realtime`, goes through one
+public function, so there is exactly one copy of the retry loop:
+
+```clojure
+(oai/request! client "files-list"
+              {:method  :get            ;; default :post
+               :path    "/files"        ;; appended to :base-url
+               :query   {"limit" 20}    ;; bracket-encoded
+               :body    {...}           ;; JSON value, encoded once; or
+               ;; :multipart [{:name :content :filename :content-type}]
+               :headers {"openai-beta" "agents=v1"}  ;; merged over defaults
+               :as      :json})         ;; :json (default) | :string | :bytes
+```
+
+- Headers (`Authorization`, `OpenAI-Organization`/`OpenAI-Project`,
+  `content-type: application/json` unless multipart, then `:headers`) are
+  rebuilt before every attempt.
+- `:as :json` decodes a 2xx body; an empty 2xx body returns `nil` (since #41
+  for every method; before it, openai's own POST methods threw
+  `json-parse-error` on an empty body, agents returned `nil`). `:string`
+  returns the raw text and `:bytes` the raw `byte[]` (file and artifact
+  content). Error bodies in `ex-data` are always Strings.
+- Errors, retries and `:retries-taken` are exactly as described in Retries
+  and the error table. The `fn-name` argument labels messages: a bare name gets
+  the `tools.agents.openai/` prefix, a qualified name
+  (`"tools.agents.openai.agents/sessions-create"`) is used verbatim.
+- A `stream` true body field or multipart part throws `streaming-unsupported`
+  before any I/O.
+- `post-json!` stays public as `(request! client fn-name {:path path :body request})`.
+- **401 seam (#34, inactive):** on a 401 the loop consults a private
+  `invalidate-credentials!` once; when a refreshable credential source exists
+  it will invalidate the cached token and retry once outside `:max-retries`.
+  Today it always declines, so a 401 is never retried.
+
 Everything else — URL/header building, the JSON codec, credential resolution,
 error typing, the whole retry policy, `output-text`/`completion-text`
 extraction, the message-list helpers — is plain, portable `clojure.core`,
@@ -381,7 +418,10 @@ image). JVM Clojure uses `com.sun.net.httpserver.HttpServer` (built into the
 JDK, zero deps). Mock
 ports are `18950`–`18964`, chosen not to collide with
 tools.agents.anthropic's `18930`–`18946`, `18965`–`18971` for the retry
-tests, and `19391` for the Azure v1 example. Port `18999` is additionally used by the three tests that deliberately
+tests, `19391` for the Azure v1 example, and `19400`–`19406` for the
+`request!` transport tests (GET + `:query` + extra headers, `:as :bytes` /
+`:string`, empty 2xx body, multipart, streaming rejection, 401 not retried,
+headers rebuilt per attempt). Port `18999` is additionally used by the three tests that deliberately
 start *no* server (missing credentials and the two connection-failure tests,
 which actually dial it and so assume nothing else on the host has `18999`
 bound).

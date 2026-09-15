@@ -8,9 +8,10 @@
    SIBLING OF tools.agents.openai, NOT A PEER LIBRARY: this namespace takes
    the exact `OpenAIClient` record `tools.agents.openai/client` builds
    (:api-key, :base-url, :organization, :project, :max-retries all apply
-   unchanged) and reuses that namespace's JSON codec (`write-json`/
-   `read-json`) and retry-policy functions (`should-retry?`, `retry-delay-ms`)
-   verbatim, rather than re-implementing or forking them. The Agents API lives
+   unchanged) and sends every request through that namespace's public
+   transport, `tools.agents.openai/request!` (JSON codec, retry loop,
+   per-attempt headers, error typing), rather than re-implementing or
+   forking it. The Agents API lives
    under the SAME `https://api.openai.com/v1` root as Responses and Chat
    Completions — distinguished only by the `/agents` path prefix and a
    required `OpenAI-Beta: agents=v1` header this namespace adds to every
@@ -71,8 +72,9 @@
    See docs/openai-agents.md's \"Streaming is not supported — poll instead\"
    section and `examples/openai/agents_sandbox_task.clj`.
 
-   PORTABILITY: all network I/O goes through `tools.agents.http/request!`,
-   the shared HTTP request function (GET/POST/DELETE here: sessions
+   PORTABILITY: all network I/O goes through `tools.agents.openai/request!`
+   and from there `tools.agents.http/request!`, the shared HTTP request
+   function (GET/POST/DELETE here: sessions
    and items need GET, session deletion needs DELETE), which needs no reader
    conditional. Everything else is plain, portable clojure.core, exercised
    identically by both test runners.
@@ -88,11 +90,10 @@
 ;; the quickstart: "include it explicitly when using cURL."
 (def ^:private beta-header "agents=v1")
 
-(defn- sleep! [millis] (let [ms (long millis)] (when (pos? ms) (Thread/sleep ms) nil)))
-(defn- now-ms [] (System/currentTimeMillis))
-
 ;; ---------------------------------------------------------------------------
-;; Request plumbing — URL/header building, error typing, the shared transport.
+;; Request plumbing — path building and a thin adapter over
+;; tools.agents.openai/request!, which owns the retry loop, per-attempt
+;; headers and error typing for this namespace too.
 ;; ---------------------------------------------------------------------------
 
 (defn- query-string
@@ -112,96 +113,34 @@
   [id]
   (http/url-encode id))
 
-(defn- request-headers [fn-name client]
-  (when-not (:api-key client)
-    (throw (ex-info (str "tools.agents.openai.agents/" fn-name ": client has no :api-key — build one via "
-                          "tools.agents.openai/client")
-                     {:type :tools.agents.openai/missing-credentials})))
-  (cond-> {"authorization" (str "Bearer " (:api-key client))
-           "content-type"  "application/json"
-           "openai-beta"   beta-header}
-    (seq (:organization client)) (assoc "openai-organization" (:organization client))
-    (seq (:project client))      (assoc "openai-project" (:project client))))
-
-(defn- reject-streaming! [fn-name request]
+(defn- reject-streaming!
+  "Runs before tools.agents.openai/request!'s own streaming check so this
+   namespace's refusal points at polling instead."
+  [fn-name request]
   (when (or (true? (get request :stream)) (true? (get request "stream")))
     (throw (ex-info (str "tools.agents.openai.agents/" fn-name ": :stream true is not supported — "
                           "SSE streaming is not implemented by this client. Poll `sessions-retrieve` / "
                           "`sessions-items-list` instead — see docs/openai-agents.md.")
                      {:type :tools.agents.openai/streaming-unsupported}))))
 
-;; status->type and extract-error-message are NOT duplicated here — this
-;; namespace calls tools.agents.openai's own (public, not ^:private) copies
-;; directly, so the two can never drift apart. See the ns docstring for why
-;; that means this namespace's thrown :type is always :tools.agents.openai/…,
-;; never a `.agents`-suffixed keyword.
-
-(defn- own-error?
-  "True for an already-typed ex-info from tools.agents.openai — whose
-   write-json/read-json/status->type/extract-error-message this namespace
-   calls directly, and which is therefore the only namespace any ex-info
-   passing through this file's own throw sites can ever be typed under (see
-   the ns docstring)."
-  [e]
-  (let [data (ex-data e)]
-    (boolean (and data (keyword? (:type data)) (= "tools.agents.openai" (namespace (:type data)))))))
-
-(defn- resolve-max-retries [client]
-  (let [n (:max-retries client)]
-    (if (number? n) (max 0 (long n)) oai/default-max-retries)))
+;; status->type, extract-error-message and the retry loop are NOT duplicated
+;; here: every request goes through tools.agents.openai/request!, so the two
+;; namespaces can never drift apart. That is also why this namespace's thrown
+;; :type is always :tools.agents.openai/…, never a `.agents`-suffixed keyword.
 
 (defn- send-request!
-  "Shared transport for every resource method below: build the URL and
-   headers, JSON-encode `body-value` when given, perform `method`, retry
-   transport failures and retryable statuses per tools.agents.openai's own
-   `should-retry?`/`retry-delay-ms` policy (`:max-retries` on the client,
-   default 2 — identical policy to the sibling namespace, just parameterized
-   over HTTP method here since this API needs GET and DELETE as well as
-   POST), and decode a 2xx JSON body.
-
-   `path` is already fully built (joined with a query string, if any, by the
-   caller). `body-value` is a Clojure map to encode as the request body, or
-   nil for a GET/DELETE with no body.
-
-   Non-retryable failures, and retryable ones once the budget is spent, throw
-   ex-info with message prefixed \"tools.agents.openai.agents/<fn-name>: \"
-   and `:type` under `:tools.agents.openai/…` (see the ns docstring) plus
-   `:retries-taken`."
+  "Every resource method below calls this: `tools.agents.openai/request!`
+   with the `OpenAI-Beta: agents=v1` header and messages labelled
+   \"tools.agents.openai.agents/<fn-name>: \". `path` already carries its
+   query string, if any (see `query-string`). `body-value` is the JSON request
+   map, or nil for GET/DELETE. A 2xx with an empty body returns nil."
   [client fn-name method path body-value]
   (when (map? body-value) (reject-streaming! fn-name body-value))
-  (let [url         (oai/endpoint-url (:base-url client) path)
-        body-str    (when body-value (oai/write-json body-value))
-        max-retries (resolve-max-retries client)]
-    (loop [retries-taken 0]
-      ;; Headers are rebuilt on every attempt, so credentials that change
-      ;; between attempts land on the retry; see tools.agents.openai/post-json!.
-      (let [outcome (try
-                      {:resp (http/request! {:method method :url url
-                                             :headers (request-headers fn-name client)
-                                             :body body-str})}
-                      (catch Exception e
-                        (if (own-error? e) (throw e) {:error e})))]
-        (if (:error outcome)
-          (if (< retries-taken max-retries)
-            (do (sleep! (oai/retry-delay-ms retries-taken nil (now-ms)))
-                (recur (inc retries-taken)))
-            (throw (ex-info (str "tools.agents.openai.agents/" fn-name ": connection failed: " (:error outcome))
-                             {:type :tools.agents.openai/api-connection-error :status nil :body nil
-                              :retries-taken retries-taken})))
-          (let [resp      (:resp outcome)
-                status    (:status resp)
-                resp-hdrs (:headers resp)
-                resp-body (:body resp)]
-            (if (and status (>= status 200) (< status 300))
-              (when (seq resp-body) (oai/read-json resp-body))
-              (if (and (< retries-taken max-retries) (oai/should-retry? status resp-hdrs (now-ms)))
-                (do (sleep! (oai/retry-delay-ms retries-taken resp-hdrs (now-ms)))
-                    (recur (inc retries-taken)))
-                (let [err-msg (oai/extract-error-message resp-body)
-                      detail  (cond err-msg err-msg (seq resp-body) resp-body :else nil)]
-                  (throw (ex-info (str "tools.agents.openai.agents/" fn-name ": HTTP " status (when detail (str " " detail)))
-                                   {:type (oai/status->type status) :status status :body resp-body
-                                    :retries-taken retries-taken})))))))))))
+  (oai/request! client (str "tools.agents.openai.agents/" fn-name)
+                {:method  method
+                 :path    path
+                 :body    body-value
+                 :headers {"openai-beta" beta-header}}))
 
 ;; ---------------------------------------------------------------------------
 ;; Public API — saved (reusable) agents

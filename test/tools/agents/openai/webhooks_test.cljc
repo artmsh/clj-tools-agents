@@ -5,6 +5,7 @@
    (tests/lib/test_webhook_signature.py). Clock injected via :now-s."
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.string :as str]
+            [tools.agents.openai :as oai]
             [tools.agents.openai.webhooks :as wh]))
 
 (defn- err-type [f]
@@ -161,5 +162,13 @@
   (is (= "explicit" (wh/resolve-webhook-secret {:secret "explicit"} (constantly "env"))))
   (is (= "" (wh/resolve-webhook-secret {:secret ""} (constantly "env"))))
   (is (= "env" (wh/resolve-webhook-secret {} {"OPENAI_WEBHOOK_SECRET" "env"})))
+  (testing "client :webhook-secret sits between :secret and the env var"
+    (let [c (oai/client {:api-key "k" :base-url "http://x/v1" :webhook-secret "from-client"})]
+      (is (= "from-client" (:webhook-secret c)))
+      (is (= "from-client" (wh/resolve-webhook-secret {:client c} (constantly "env"))))
+      (is (= "explicit" (wh/resolve-webhook-secret {:secret "explicit" :client c} (constantly "env"))))
+      (is (= "env" (wh/resolve-webhook-secret {:client (dissoc c :webhook-secret)} (constantly "env"))))
+      (is (nil? (wh/verify-signature payload (signed-headers)
+                                     {:client (assoc c :webhook-secret raw-secret) :now-s now})))))
   (is (= :tools.agents.openai/missing-webhook-secret
          (err-type #(wh/resolve-webhook-secret {} (constantly nil))))))

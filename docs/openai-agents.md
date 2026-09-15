@@ -7,8 +7,10 @@ openai-python's `client.beta.agents.*` resource tree.
 
 **Sibling of [tools.agents.openai](openai.md), not a peer library.** It takes
 the exact same `OpenAIClient` record `tools.agents.openai/client` builds and
-reuses that namespace's JSON codec and retry-policy functions verbatim,
-because the Agents API lives under the same `https://api.openai.com/v1` root
+sends every request through that namespace's public transport,
+`tools.agents.openai/request!` (JSON codec, retry loop, per-attempt headers,
+error typing; see [openai.md](openai.md#shared-transport-request)), adding
+only its `OpenAI-Beta` header and message prefix, because the Agents API lives under the same `https://api.openai.com/v1` root
 — distinguished only by the `/agents` path prefix and a required
 `OpenAI-Beta: agents=v1` header this namespace adds to every request. Build
 one client and use it with both namespaces.
@@ -297,8 +299,8 @@ rather than through the mock server — `.getPath()` on JVM Clojure's
 them, while Babashka's httpkit-backed mock does not, so the same encoded
 request produces two different `:path` strings depending on the runtime;
 testing the pure encoder directly sidesteps that asymmetry entirely.
-Everything else here calls straight through to `tools.agents.openai`'s
-already-tested pure retry functions, so there is nothing new to re-test in
+Everything else here calls straight through to `tools.agents.openai/request!`,
+tested in that namespace's suites, so there is nothing new to re-test in
 isolation.
 
 `test/tools/agents/openai/agents/live_test.cljc` runs the same local mock
@@ -311,7 +313,8 @@ exact string, since neither this library's `query-string` builder nor a
 Clojure map's own iteration order guarantees key order), the exact wire
 shape of `send-message`/`cancel-turn`/`send-tool-result`, non-2xx errors
 mapping through the same status table `tools.agents.openai` uses, the retry
-loop actually firing through this namespace's own transport leaf, connection
+loop actually firing through `send-request!` (the thin adapter over
+`tools.agents.openai/request!`), connection
 failures, `:stream true` rejected before any network activity (both string-
 and keyword-keyed), a missing-credentials guard on a hand-built client map,
 and both `examples/openai/agents_*.clj` files run end-to-end against the mock
