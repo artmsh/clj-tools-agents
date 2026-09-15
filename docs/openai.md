@@ -94,7 +94,8 @@ yourself, exactly as the Python README's own example does:
 | `timeout` (default 10 min) / `APITimeoutError` | *(not implemented)* | Each runtime's HTTP leaf uses its own default timeout; a timeout surfaces as `:tools.agents.openai/api-connection-error` (which is also where Python's `APITimeoutError` sits in the hierarchy, as a subclass of `APIConnectionError`) and is retried like any other transport failure, exactly as the SDK does. |
 | `client.responses.create(..., stream=True)` / `client.responses.stream(...)` | **rejected outright** | See Streaming below. |
 | `client.embeddings.create(**params)` | `(tools.agents.openai.embeddings/embeddings-create client params)` | `POST /embeddings` (`resources/embeddings.py`). Omitted `encoding_format` → sent as `"base64"` and each string `data[].embedding` decoded as little-endian float32 into doubles (`lib/_parsing/_embeddings.py`); an explicit `"float"`/`"base64"` is returned untouched. Empty `data` with the implicit format → `:tools.agents.openai/invalid-response`. Helper: `decode-embedding-base64`. |
-| `client.images.*` / `.files.*` / `.batches.*` / `.fine_tuning.*` / Assistants / Realtime / webhooks | *(not implemented)* | Only the two text-generation resource methods are in scope for this port. `post-json!` is the shared transport, so adding another POST resource is a two-line change. |
+| `client.webhooks.verify_signature(payload, headers, secret=, tolerance=300)` / `client.webhooks.unwrap(payload, headers, secret=)` | `(tools.agents.openai.webhooks/verify-signature payload headers {:secret :tolerance :now-s})` / `(tools.agents.openai.webhooks/unwrap payload headers opts)` | Pure, no HTTP (`lib/_webhooks.py`). Standard Webhooks HMAC-SHA256 over `{webhook-id}.{webhook-timestamp}.{body}`; `payload` must be the raw body (String or `byte[]`). Two-sided 300 s window, `whsec_` secrets base64-decoded (others used as raw bytes), space-separated `v1,<b64>` or bare signatures, constant-time compare. Secret: `:secret` → `OPENAI_WEBHOOK_SECRET`; the SDK's client-level `webhook_secret` is not on `OpenAIClient`. `unwrap` returns the event parsed by `read-json`. |
+| `client.images.*` / `.files.*` / `.batches.*` / `.fine_tuning.*` / Assistants / Realtime | *(not implemented)* | Only the two text-generation resource methods are in scope for this port. `post-json!` is the shared transport, so adding another POST resource is a two-line change. |
 | `admin_api_key` / `OPENAI_ADMIN_KEY`, Workload Identity Federation, `AzureOpenAI` | *(not implemented)* | The credential chain here is explicit `:api-key` → `OPENAI_API_KEY` → throw. The SDK's fuller chain (admin keys, token-exchange workload identity, Azure's separate deployment/api-version routing) is out of scope. |
 
 ### Credential resolution & headers (confirmed from openai-python source)
@@ -144,6 +145,10 @@ Non-status error types:
 | `:stream true` requested | `:tools.agents.openai/streaming-unsupported` |
 | response has no `"output"` / `"choices"` array, or an empty `"choices"` | `:tools.agents.openai/invalid-response` |
 | structurally wrong content (non-array `"content"`, non-string `"text"`, non-string non-null `"content"`) | `:tools.agents.openai/invalid-content-shape` |
+| webhook: bad timestamp format, timestamp outside tolerance, or no matching signature (`InvalidWebhookSignatureError`) | `:tools.agents.openai/invalid-webhook-signature-error` |
+| webhook: `webhook-id` / `webhook-timestamp` / `webhook-signature` header absent (`:header` in ex-data) | `:tools.agents.openai/missing-webhook-header` |
+| webhook: no `:secret` and no `OPENAI_WEBHOOK_SECRET` | `:tools.agents.openai/missing-webhook-secret` |
+| webhook: `whsec_` secret is not valid base64 | `:tools.agents.openai/invalid-webhook-secret` |
 
 These keywords sit directly under `:tools.agents.openai/…`, not under a
 `.error` sub-namespace the way `tools.agents.anthropic` and

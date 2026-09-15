@@ -448,11 +448,12 @@
 (def ^:private max-retry-delay-ms 8000)                 ;; MAX_RETRY_DELAY = 8.0
 (def ^:private max-retry-after-delay-ms (* 2 60 1000))  ;; MAX_RETRY_AFTER_DELAY = 2 * 60
 
-(defn- header-value
+(defn header-value
   "Case-insensitive header lookup. Response header maps differ per runtime —
    java.net.http and babashka.http-client lower-case theirs, and keys may be
    strings or keywords. A multi-value header arrives as a vector; take the
-   first, as every HTTP client here does."
+   first, as every HTTP client here does. Public (not ^:private) so
+   tools.agents.openai.webhooks looks up inbound webhook headers the same way."
   [headers k]
   (when (map? headers)
     (let [target (str/lower-case k)]
