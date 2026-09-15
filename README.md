@@ -88,6 +88,10 @@ openai (and so openai.agents) and gemini clients:
   Anthropic sends the token as `Authorization: Bearer` plus
   `anthropic-beta: oauth-2025-04-20`, openai as `Authorization: Bearer`,
   gemini as `Authorization: Bearer` instead of `x-goog-api-key`.
+- openai only: `:api-key` may be a zero-arg fn (openai-python's callable
+  `api_key`, e.g. an Azure Entra token provider). It becomes a source that
+  calls the fn before every attempt with no cache and declines
+  `invalidate!`, so a 401 is not retried, as in the SDK. See docs/openai.md.
 - **Extension point.** Anything satisfying the `tools.agents.token/TokenSource`
   protocol (`-token`, `-invalidate`) is accepted. Workload identity, profile
   files and callable keys (#35–#38) are constructors returning a source,

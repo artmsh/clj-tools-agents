@@ -1313,3 +1313,61 @@
         (finally
           (when @session-id (live-cleanup-session! client @session-id)))))
     (is true "skipped: set OPENAI_AGENTS_LIVE=1 and OPENAI_API_KEY")))
+
+;; ---------------------------------------------------------------------------
+;; callable :api-key (#37) — inherited from the openai client, streaming open
+;; included. OS-assigned ports.
+;; ---------------------------------------------------------------------------
+
+(defn- free-port []
+  (with-open [s (java.net.ServerSocket. 0 50 (java.net.InetAddress/getByName "127.0.0.1"))]
+    (.getLocalPort s)))
+
+(deftest sessions-create-with-api-key-fn-calls-it-per-attempt
+  (let [auths (atom [])
+        calls (atom 0)
+        {:keys [port stop!]} (start-server! (free-port) "/v1/agents/sessions"
+                                (fn [req]
+                                  (swap! auths conj [(get (:headers req) "authorization")
+                                                     (get (:headers req) "openai-beta")])
+                                  (if (= 1 (count @auths))
+                                    {:status 503 :headers {"retry-after-ms" "1"} :body "{}"}
+                                    {:status 200 :body (canned-session "sess_1" "in_progress")})))]
+    (try
+      (let [client  (oai/client {:api-key #(str "entra-" (swap! calls inc)) :base-url (base-url port)})
+            session (agents/sessions-create client {"agent" {"model" "m"} "input" "hi"})]
+        (is (= "sess_1" (get session "id")))
+        (is (= [["Bearer entra-1" "agents=v1"] ["Bearer entra-2" "agents=v1"]] @auths)))
+      (finally (stop!)))))
+
+(deftest sessions-events-stream-open-calls-api-key-fn-per-attempt
+  (let [auths (atom [])
+        calls (atom 0)
+        {:keys [port stop!]}
+        (start-server! (free-port) "/v1/agents/sessions/sess_1/events"
+          (fn [req]
+            (swap! auths conj (get (:headers req) "authorization"))
+            (if (= 1 (count @auths))
+              {:status 429 :headers {"retry-after-ms" "1"} :body "{}"}
+              {:status 200 :headers sse-headers
+               :body (fn [send!] (doseq [f (fixture-frames)] (send! f)))})))]
+    (try
+      (let [client (oai/client {:api-key #(str "entra-" (swap! calls inc)) :base-url (base-url port)})
+            events (into [] (agents/sessions-events-stream client "sess_1"))]
+        (is (seq events))
+        (is (= ["Bearer entra-1" "Bearer entra-2"] @auths))
+        (is (= 2 @calls)))
+      (finally (stop!)))))
+
+(deftest sessions-create-with-api-key-fn-401-is-not-retried
+  (let [hits  (atom 0)
+        calls (atom 0)
+        {:keys [port stop!]} (start-server! (free-port) "/v1/agents/sessions"
+                                (fn [_] (swap! hits inc) {:status 401 :body "{}"}))]
+    (try
+      (let [client (oai/client {:api-key #(str "entra-" (swap! calls inc)) :base-url (base-url port)})
+            e      (try (agents/sessions-create client {"agent" {"model" "m"} "input" "hi"}) nil
+                        (catch Exception e e))]
+        (is (= :tools.agents.openai/authentication-error (:type (ex-data e))))
+        (is (= [1 1] [@hits @calls])))
+      (finally (stop!)))))

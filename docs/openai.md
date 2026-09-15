@@ -174,7 +174,25 @@ accepts, per Microsoft:
 |---|---|---|
 | API key as `Authorization: Bearer <key>` | Accepted. Microsoft's API-key examples for the OpenAI Python, JavaScript, Go and Java SDKs pass the Azure key as the SDK's `api_key`, which those SDKs send as `Authorization: Bearer`. The [v1 OpenAPI spec](https://github.com/Azure/azure-rest-api-specs/blob/a6943a926f76b3a2f90371b3466157eddf760e25/specification/ai/data-plane/OpenAI.v1/azure-v1-v1-generated.json) declares an API-key scheme in the `authorization` header next to `api-key`. The prose never states it separately. | **works** |
 | API key as `api-key: <key>` header | Accepted (Microsoft's REST example). | not sent. The client has no custom-header option, and the Bearer form above makes it unnecessary. |
-| Microsoft Entra ID access token as `Authorization: Bearer <token>` | Accepted. Scope `https://ai.azure.com/.default`, role `Cognitive Services OpenAI User`. | **static token only**: pass it as `:api-key`. It is never refreshed, so rebuild the client before it expires. A refreshing token provider (the SDK's `api_key=token_provider`) needs callable `:api-key`, #37. |
+| Microsoft Entra ID access token as `Authorization: Bearer <token>` | Accepted. Scope `https://ai.azure.com/.default`, role `Cognitive Services OpenAI User`. | **works**: pass a token-provider fn as `:api-key` (the SDK's `api_key=get_bearer_token_provider(...)`), called before every attempt, see below. A static token string also works but is never refreshed. |
+
+Microsoft Entra ID with a refreshing token, the SDK's
+`OpenAI(base_url=..., api_key=get_bearer_token_provider(DefaultAzureCredential(), "https://ai.azure.com/.default"))`:
+
+```clojure
+;; get-entra-token: your zero-arg fn returning a current access token String
+;; for scope https://ai.azure.com/.default (e.g. azure-identity's
+;; DefaultAzureCredential via Java interop). Put any caching in it: the client
+;; calls it before every attempt, exactly like the SDK's callable api_key.
+(oai/client {:base-url "https://<resource>.openai.azure.com/openai/v1"
+             :api-key  get-entra-token})
+```
+
+In Python the caching lives in the azure-identity credential behind
+`get_bearer_token_provider`, not in the SDK; this library likewise adds no
+cache around the fn. To have the library cache instead,
+pass `:credential-source (tools.agents.token/token-cache {:fetch! ...})` with
+`:expires-at`, which also gets the one 401 retry.
 
 Not supported: the legacy `AzureOpenAI` client shape, i.e.
 `{endpoint}/openai/deployments/{deployment}/...` routing, the required
@@ -228,16 +246,30 @@ header, no query string) plus Microsoft's documentation.
 | `client.fine_tuning.alpha.graders.run` / `.validate` | *(not implemented)* | Alpha (`POST /fine_tuning/alpha/graders/run\|validate`, `resources/fine_tuning/alpha/graders.py`); out of scope. |
 | Assistants / Realtime `connect` + `calls.*` | *(not implemented)* | Not yet ported. `request!` is the shared transport (any method, `:query`, JSON or multipart body, `:as :json`/`:string`/`:bytes`), so a new resource method is a single call. See Shared transport below. |
 | `admin_api_key` / `OPENAI_ADMIN_KEY`, Workload Identity Federation | *(not implemented)* | The credential chain here is explicit `:credential-source` → explicit `:api-key` → `OPENAI_API_KEY` → throw. Admin keys and the token exchange are not ported; the cache, per-attempt token and 401 retry they need are (`:credential-source`, see README, Refreshable credentials). The checkpoint-permission endpoints accept an admin key passed as `:api-key`. |
-| Azure OpenAI v1: `OpenAI(base_url="https://<resource>.openai.azure.com/openai/v1/", api_key=...)` | `(client {:base-url "https://<resource>.openai.azure.com/openai/v1" :api-key ...})` | Works through `:base-url`; no Azure-specific code. API key or a static Entra ID token, both as `Authorization: Bearer`. A refreshing Entra token provider needs callable `:api-key` (#37). Not verified against a live Azure resource. See Azure OpenAI (v1 API) above. |
+| Azure OpenAI v1: `OpenAI(base_url="https://<resource>.openai.azure.com/openai/v1/", api_key=...)` | `(client {:base-url "https://<resource>.openai.azure.com/openai/v1" :api-key ...})` | Works through `:base-url`; no Azure-specific code. API key, static Entra ID token or an Entra token-provider fn (callable `:api-key`), all as `Authorization: Bearer`. Not verified against a live Azure resource. See Azure OpenAI (v1 API) above. |
 | `AzureOpenAI(azure_endpoint=, azure_deployment=, api_version=)` (legacy) | *(not supported)* | Deployment path rewriting, the required `api-version` query and `AZURE_OPENAI_*` / `OPENAI_API_VERSION` env vars are not ported. Use the v1 API. |
 
 ### Credential resolution & headers (confirmed from openai-python source)
 
-Precedence, first match wins: explicit `:api-key` → `OPENAI_API_KEY` env var
-→ throw. An explicit `:credential-source` (a `tools.agents.token/TokenSource`)
+Precedence, first match wins: explicit `:api-key` (a String or a zero-arg
+fn) → `OPENAI_API_KEY` env var → throw. An explicit `:credential-source` (a `tools.agents.token/TokenSource`)
 replaces this chain: its token is fetched before every attempt and sent as
 `Authorization: Bearer`; combining it with `:api-key` throws
 `invalid-credentials`. See README, Refreshable credentials.
+
+Callable `:api-key` (openai-python 3.14.0 `api_key: str | Callable[[], str]`,
+`_client.py:164,253-255`):
+
+| behaviour | openai-python | this client |
+|---|---|---|
+| when called | before every attempt, retries included: `_prepare_options` → `_refresh_api_key` (`_client.py:671-672,688-690`) at the top of each retry-loop iteration (`_base_client.py:1052-1054`) | same: wrapped as a `tools.agents.token/TokenSource` stored as `:credential-source`, asked for a token per attempt by `request!`, streaming opens (`:as :stream`) included |
+| at construction | not called; its presence satisfies the missing-credentials check (`_client.py:266-274`) | not called; beats `OPENAI_API_KEY` |
+| caching | none; `self.api_key` overwritten on each call | none; cache inside the fn if needed |
+| 401 | not retried: `_send_with_auth_retry` returns unless workload identity is set (`_client.py:578-579`); `_should_retry` has no 401 branch (`_base_client.py:815`) | not retried: the source's `invalidate!` returns false → `authentication-error` |
+| fn throws | propagates, not retried (raised before the send's `try`) | propagates as-is, not retried |
+| empty / `None` return | no `Authorization` header → `TypeError` "Could not resolve authentication method" (`_client.py:620-623,655-665`) | **divergence:** `:tools.agents.openai/invalid-api-key`, before any I/O |
+| non-string return | f-string formatted into the header | **divergence:** `invalid-api-key`; blank strings too. `ex-data` is exactly `{:type ...}`, never the value |
+| with `:credential-source` | n/a | `invalid-credentials` |
 
 - Auth is always `Authorization: Bearer <api-key>` — there is no `x-api-key`
   path here, and no beta header (both of which the Anthropic sibling needs).
@@ -279,6 +311,7 @@ Non-status error types:
 | malformed request/response JSON | `:tools.agents.openai/json-encode-error` / `:tools.agents.openai/json-parse-error` |
 | missing credentials (client construction or a hand-built client map) | `:tools.agents.openai/missing-credentials` |
 | `:credential-source` not a `TokenSource`, or combined with `:api-key` | `:tools.agents.openai/invalid-credentials` |
+| a callable `:api-key` returned a non-string or blank value (value never included) | `:tools.agents.openai/invalid-api-key` |
 | `:stream true` requested | `:tools.agents.openai/streaming-unsupported` |
 | request rejected before any I/O (bad `:as`; files/images: missing/unsupported file or required field; an empty file, batch, fine-tuning job, checkpoint or permission id — the SDK's `ValueError`; batches: bad `custom_id` in `batch-input-jsonl`, no result file id in `batches-results`) | `:tools.agents.openai/invalid-request` |
 | `files-wait-for-processing` gave up after `:max-wait-ms` (the SDK's `RuntimeError`; not an HTTP timeout; never retried) | `:tools.agents.openai/wait-timeout` |
@@ -319,7 +352,7 @@ tuning, on by default with `:max-retries` 2.
   longer than two minutes vetoes the retry entirely.
 - **401.** Retried once, immediately and outside `:max-retries`, only for a
   `:credential-source` client after invalidating the token it sent. A static
-  `:api-key` 401 is never retried.
+  or callable `:api-key` 401 is never retried (as in the SDK).
 - **What is not retried.** 4xx other than 408/409/429; a malformed, non-empty
   JSON body on an otherwise-successful 2xx (an empty one decodes to `nil`) (the SDK decodes after its retry loop has
   already broken out); and this library's own typed refusal, the `:stream true`
@@ -465,7 +498,8 @@ public function, so there is exactly one copy of the retry loop:
 - `post-json!` stays public as `(request! client fn-name {:path path :body request})`.
 - **401:** for a `:credential-source` client the loop invalidates the token
   the failed attempt sent and retries once outside `:max-retries`; a second
-  401 throws. A static `:api-key` 401 is never retried.
+  401 throws. A static or callable `:api-key` 401 is never retried (a
+  callable one is a source whose `invalidate!` declines).
 
 Everything else — URL/header building, the JSON codec, credential resolution,
 error typing, the whole retry policy, `output-text`/`completion-text`
@@ -561,7 +595,8 @@ tests, `19391` for the Azure v1 example, and `19400`–`19405` for the
 `request!` transport tests (GET + `:query` + extra headers, `:as :bytes` /
 `:string`, empty 2xx body, multipart, streaming rejection, static-key 401 not
 retried), `19350`–`19354` for `:credential-source` (401
-invalidate-and-retry, token per attempt), `19280`–`19285` for the
+invalidate-and-retry, token per attempt), OS-assigned ports for callable
+`:api-key` (per-attempt calls, 401, bad return, streaming open), `19280`–`19285` for the
 `tools.agents.openai.files` tests (multipart wire format, File streamed from
 disk, list query, retrieve/delete, 404 typing, binary content round-trip,
 wait-for-processing), and `19300`–`19303` for the
