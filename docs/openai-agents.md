@@ -53,8 +53,25 @@ Saved (reusable) agent CRUD is implemented from those reference pages:
 [list](https://developers.openai.com/api/reference/resources/beta/subresources/agents/methods/list/index.md),
 [delete](https://developers.openai.com/api/reference/resources/beta/subresources/agents/methods/delete/index.md).
 A saved agent is distinct from a *session's* inline `agent` config, which
-`sessions-create` passes through either way. The session/environment
-Artifacts and Files APIs are still **not implemented**; they are additive.
+`sessions-create` passes through either way.
+
+Session artifacts and environment files are implemented from the reference
+pages
+([artifacts list](https://developers.openai.com/api/reference/resources/beta/subresources/agents/subresources/sessions/subresources/artifacts/methods/list/index.md),
+[retrieve](https://developers.openai.com/api/reference/resources/beta/subresources/agents/subresources/sessions/subresources/artifacts/methods/retrieve/index.md),
+[content](https://developers.openai.com/api/reference/resources/beta/subresources/agents/subresources/sessions/subresources/artifacts/methods/content/index.md),
+[delete](https://developers.openai.com/api/reference/resources/beta/subresources/agents/subresources/sessions/subresources/artifacts/methods/delete/index.md);
+[environment files list](https://developers.openai.com/api/reference/resources/beta/subresources/agents/subresources/environments/subresources/files/methods/list/index.md),
+[create](https://developers.openai.com/api/reference/resources/beta/subresources/agents/subresources/environments/subresources/files/methods/create/index.md)),
+the [files guide](https://developers.openai.com/api/docs/guides/agents-api/environments/files.md)
+and openai-python's `sessions/artifacts.py` / `environments/files.py`.
+The reference has no environment-file retrieve, delete or content endpoint.
+Two points are **not yet verified live** (probe P1,
+`artifacts-and-environment-files-probe-against-the-real-api`, has not run):
+whether artifact content arrives inline or as a redirect, and how
+environment-file token paging behaves on a real environment. The content
+reference page has a `curl` example but no Returns block; the SDK sends
+`Accept: application/octet-stream` and reads a binary response.
 
 ## Usage
 
@@ -105,6 +122,25 @@ Artifacts and Files APIs are still **not implemented**; they are additive.
    "input" "Print a directory tree."})
 (agents/agents-list client {"limit" 20})   ; page with "after" = "last_id" while "has_more"
 (agents/agents-delete client (get saved "id"))
+
+;; Files: copy input into a connected environment, download published output.
+(def env-id (get-in (agents/sessions-retrieve client (get session "id")) ["environment" "id"]))
+(agents/environments-files-create client env-id
+  {"type" "inline" "path" "/workspace/in.csv"
+   "data" (clojure.java.io/file "in.csv")})   ; or byte[], Path, or a base64 String
+(agents/environments-files-list client env-id {"path" "/workspace" "limit" 100})
+;; => {"object" "page" "data" [...] "has_more" true "next" "..."}; pass "page" = "next"
+
+;; Artifacts: files the agent wrote under /workspace/outputs, published when a turn completes.
+(let [sid      (get session "id")
+      turn-id  (get (agents/latest-root-turn (agents/sessions-turns-list client sid)) "id")
+      artifact (->> (get (agents/sessions-artifacts-list client sid) "data")
+                    (filter #(and (= turn-id (get % "turn_id"))
+                                  (= "/workspace/outputs/report.pdf" (get % "path"))))
+                    first)]
+  (clojure.java.io/copy (agents/sessions-artifacts-content client sid (get artifact "id"))  ; byte[]
+                        (clojure.java.io/file "report.pdf"))
+  (agents/sessions-artifacts-delete client sid (get artifact "id")))
 ```
 
 See `examples/openai/agents_sandbox_task.clj` for the complete polling loop
@@ -138,7 +174,12 @@ test suite runs it instantly against a mock server) and
 | `item.content[…].text` traversal (no single SDK helper — see below) | `(items-output-text items-response)` | Concatenates every assistant `output_text` block, oldest-first when called with `{"order" "asc"}`. Deliberately more lenient than `tools.agents.openai/output-text` on a non-array `"content"`; see [divergences.md](divergences.md). |
 | `GET /v1/agents/environments/{id}` (literal endpoint text, API reference) | `(environments-retrieve client environment-id)` | Poll a sandbox's `"status"`: `"pending"`, `"connected"`, `"disconnected"`, `"expired"` or `"failed"` (API reference). Also carries `"type"`, `"files"`, `"plugins"`, `"skills"`. |
 | `codex exec-server --remote ... --environment-id ...` (shell, not an SDK call) | `(self-hosted-executor-command session)` | Pure function from a created self-hosted session to the executor's argv — see Self-hosted sandboxes below for what this library does and does not do here. |
-| Artifacts / environment Files APIs | *(not implemented)* | Additive; see the primary-source note above. |
+| `client.beta.agents.sessions.artifacts.list(session_id, **params)` — `GET /v1/agents/sessions/{session_id}/artifacts` | `(sessions-artifacts-list client session-id params)` / `(sessions-artifacts-list client session-id)` | Cursor paging like `sessions-list`: `after`/`limit` (1-100)/`order` (default `desc`), plus `environment_id`. Only `openai_hosted`, only `/workspace/outputs`, only on turn completion. Match on `turn_id` + `path`. |
+| `client.beta.agents.sessions.artifacts.retrieve(artifact_id, session_id=)` — `GET /v1/agents/sessions/{session_id}/artifacts/{artifact_id}` | `(sessions-artifacts-retrieve client session-id artifact-id)` | `SessionArtifact` metadata: `path`, `size_bytes`, `turn_id`, `environment_id`, `created_at`. |
+| `client.beta.agents.sessions.artifacts.content(artifact_id, session_id=)` — `GET /v1/agents/sessions/{session_id}/artifacts/{artifact_id}/content` | `(sessions-artifacts-content client session-id artifact-id)` | Returns `byte[]` (`:as :bytes`), `Accept: application/octet-stream`, whole body in memory (≤200 MiB per artifact). **Redirects are not followed** (JDK `Redirect.NEVER` on both runtimes; httpx in the SDK follows): a 3xx throws `api-status-error`. Transport unverified live (P1). |
+| `client.beta.agents.sessions.artifacts.delete(artifact_id, session_id=)` — `DELETE /v1/agents/sessions/{session_id}/artifacts/{artifact_id}` | `(sessions-artifacts-delete client session-id artifact-id)` | Deletes the published copy only. Returns `{"deleted" true "object" "agent.session.artifact.deleted"}`. |
+| `client.beta.agents.environments.files.list(environment_id, **params)` — `GET /v1/agents/environments/{environment_id}/files` | `(environments-files-list client environment-id params)` / `(environments-files-list client environment-id)` | **Token paging** (`SyncTokenPage`), not `after`: response `{"object" "page" "has_more" .. "next" ..}`; pass `"page"` = `"next"`, keeping `path`/`order`/`limit`. Connected environments only. Unverified live (P1). |
+| `client.beta.agents.environments.files.create(environment_id, type=, path=, data=/file_id=)` — `POST /v1/agents/environments/{environment_id}/files` | `(environments-files-create client environment-id request)` | JSON body, not multipart. `{"type" "inline" "path" .. "data" ..}` or `{"type" "file_id" "path" .. "file_id" ..}`. `"data"`: a base64 String is sent verbatim; `byte[]`/`File`/`Path` is read and std-base64-encoded. Inline ≤5 MiB before encoding (API-enforced). No delete/retrieve endpoint exists. |
 | `client.beta.agents.sessions.create(..., stream=True)` / `.events.stream(...)` | **rejected outright** / *(not implemented)* | See Streaming below. |
 
 ### Credentials & headers
@@ -331,7 +372,22 @@ model tokens) and passes as skipped unless both `OPENAI_AGENTS_LIVE=1` and
 targets `https://api.openai.com/v1` (override: `OPENAI_AGENTS_BASE_URL`;
 model: `OPENAI_AGENTS_MODEL`, default `gpt-5.5`).
 
-Port range `19000`–`19039` — chosen not to collide with the sibling suites'
+Artifacts and environment files: the mock suite covers method/path/beta
+header/query for all six methods, a binary round trip of every byte value
+plus invalid UTF-8 sequences through `sessions-artifacts-content`, a 302 on
+content surfacing as `api-status-error` without a second request, `page`/`next`
+token paging across two pages, the create body for a base64 String, `byte[]`,
+`File`, `Path` and `file_id`, rejection of unsupported `"data"` before any
+network I/O, and 404s typed `not-found-error`.
+`artifacts-and-environment-files-probe-against-the-real-api` is probe P1, same
+gate and overrides: an `openai_hosted` session whose turn writes
+`probe-\0\377` to `/workspace/outputs/p.bin`; while the environment is
+connected it creates `/workspace/in.txt` and pages env files with `limit` 1;
+after the turn it lists, retrieves, downloads (byte-exact), and deletes the
+artifact, then expects a 404. Cleanup cancels and deletes the session,
+retrying a 409. It costs a short turn and **has not been run yet**.
+
+Port range `19000`–`19079` — chosen not to collide with the sibling suites'
 ranges (anthropic `18930`–`18975`, gemini `18980`–`18997`, openai
 `18950`–`18971`).
 

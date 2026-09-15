@@ -4,7 +4,7 @@
    anthropic/gemini/openai suites. Everything here is identical handler logic
    and identical assertions on both runtimes.
 
-   Port range 19000-19039 — chosen not to collide with the sibling suites'
+   Port range 19000-19079 — chosen not to collide with the sibling suites'
    ranges (anthropic 18930-18975, gemini 18980-18997, openai 18950-18971)."
   (:require [clojure.test :refer [deftest is]]
             [clojure.string :as str]
@@ -642,6 +642,224 @@
       (finally (stop!)))))
 
 ;; ---------------------------------------------------------------------------
+;; session artifacts
+;; ---------------------------------------------------------------------------
+
+(defn- canned-artifact [id path]
+  (str "{\"id\":\"" id "\",\"object\":\"agent.session.artifact\",\"created_at\":1757900000,"
+       "\"environment_id\":\"ccarenv_1\",\"path\":\"" path "\",\"session_id\":\"sess_1\","
+       "\"size_bytes\":8,\"turn_id\":\"turn_1\"}"))
+
+;; Every byte value, then a lone continuation byte, a truncated 2-byte lead
+;; and an overlong NUL — none of which survives a UTF-8 String round trip.
+(def ^:private non-utf8-bytes
+  (byte-array (map unchecked-byte (concat (range 256) [0x80 0xc3 0x28 0xc0 0x80 0xff 0x00]))))
+
+(deftest sessions-artifacts-list-sends-cursor-query-and-decodes
+  (let [captured (atom nil)
+        {:keys [port stop!]} (start-server! 19032 "/v1/agents/sessions/sess_1/artifacts"
+                                (fn [req] (reset! captured req)
+                                  {:status 200
+                                   :body (str "{\"object\":\"list\",\"data\":["
+                                              (canned-artifact "art_1" "/workspace/outputs/p.bin")
+                                              "],\"first_id\":\"art_1\",\"last_id\":\"art_1\",\"has_more\":false}")}))]
+    (try
+      (let [client (oai/client {:api-key "k" :base-url (base-url port)})
+            page   (agents/sessions-artifacts-list client "sess_1" {"after" "art_0" "limit" 10
+                                                                     "order" "asc" "environment_id" "ccarenv_1"})]
+        (is (= "GET" (:method @captured)))
+        (is (= "/v1/agents/sessions/sess_1/artifacts" (:path @captured)))
+        (is (= "agents=v1" (get-in @captured [:headers "openai-beta"])))
+        (is (= {"after" "art_0" "limit" "10" "order" "asc" "environment_id" "ccarenv_1"}
+               (parse-query (:query @captured))))
+        (is (= "/workspace/outputs/p.bin" (get-in page ["data" 0 "path"])))
+        (is (= "art_1" (get page "last_id")))
+        (agents/sessions-artifacts-list client "sess_1")
+        (is (nil? (:query @captured)) "no params, no query string"))
+      (finally (stop!)))))
+
+(deftest sessions-artifacts-retrieve-gets-by-id
+  (let [captured (atom nil)
+        {:keys [port stop!]} (start-server! 19033 "/v1/agents/sessions/sess_1/artifacts/art_1"
+                                (fn [req] (reset! captured req)
+                                  {:status 200 :body (canned-artifact "art_1" "/workspace/outputs/p.bin")}))]
+    (try
+      (let [client   (oai/client {:api-key "k" :base-url (base-url port)})
+            artifact (agents/sessions-artifacts-retrieve client "sess_1" "art_1")]
+        (is (= "GET" (:method @captured)))
+        (is (= "/v1/agents/sessions/sess_1/artifacts/art_1" (:path @captured)))
+        (is (= "agents=v1" (get-in @captured [:headers "openai-beta"])))
+        (is (= "turn_1" (get artifact "turn_id")))
+        (is (= 8 (get artifact "size_bytes"))))
+      (finally (stop!)))))
+
+(deftest sessions-artifacts-content-round-trips-non-utf8-bytes
+  (let [captured (atom nil)
+        {:keys [port stop!]} (start-server! 19034 "/v1/agents/sessions/sess_1/artifacts/art_1/content"
+                                (fn [req] (reset! captured req)
+                                  {:status 200 :headers {"content-type" "application/octet-stream"}
+                                   :body non-utf8-bytes}))]
+    (try
+      (let [client  (oai/client {:api-key "k" :base-url (base-url port)})
+            content (agents/sessions-artifacts-content client "sess_1" "art_1")]
+        (is (= "GET" (:method @captured)))
+        (is (= "/v1/agents/sessions/sess_1/artifacts/art_1/content" (:path @captured)))
+        (is (= "application/octet-stream" (get-in @captured [:headers "accept"])))
+        (is (= "agents=v1" (get-in @captured [:headers "openai-beta"])))
+        (is (bytes? content))
+        (is (java.util.Arrays/equals ^bytes non-utf8-bytes ^bytes content))
+        (is (not (java.util.Arrays/equals ^bytes non-utf8-bytes
+                                          (.getBytes (String. ^bytes non-utf8-bytes "UTF-8") "UTF-8")))
+            "fixture really is not UTF-8 safe"))
+      (finally (stop!)))))
+
+(deftest sessions-artifacts-content-404-is-typed-with-decoded-message
+  (let [{:keys [port stop!]} (start-server! 19035 "/v1/agents/sessions/sess_1/artifacts"
+                                (fn [_] {:status 404 :body "{\"error\":{\"message\":\"No such artifact\"}}"}))]
+    (try
+      (let [client (oai/client {:api-key "k" :base-url (base-url port) :max-retries 0})
+            e      (try (agents/sessions-artifacts-content client "sess_1" "art_missing") nil
+                        (catch Exception e e))]
+        (is (= :tools.agents.openai/not-found-error (:type (ex-data e))))
+        (is (= 404 (:status (ex-data e))))
+        (is (string? (:body (ex-data e))))
+        (is (str/starts-with? (str (ex-message e))
+                              "tools.agents.openai.agents/sessions-artifacts-content: HTTP 404 No such artifact")))
+      (finally (stop!)))))
+
+(deftest sessions-artifacts-content-does-not-follow-a-redirect
+  ;; Pins the documented behaviour: the shared java.net.http client keeps
+  ;; Redirect.NEVER, so a 3xx surfaces as a typed error rather than a silent
+  ;; follow (which would forward the bearer token to the Location host).
+  (let [hits (atom [])
+        {:keys [port stop!]} (start-server! 19036 "/v1/agents/sessions/sess_1/artifacts"
+                                (fn [{:keys [path]}]
+                                  (swap! hits conj path)
+                                  {:status 302 :headers {"location" "/v1/signed/blob"} :body ""}))]
+    (try
+      (let [client (oai/client {:api-key "k" :base-url (base-url port) :max-retries 0})
+            e      (try (agents/sessions-artifacts-content client "sess_1" "art_1") nil
+                        (catch Exception e e))]
+        (is (= :tools.agents.openai/api-status-error (:type (ex-data e))))
+        (is (= 302 (:status (ex-data e))))
+        (is (= ["/v1/agents/sessions/sess_1/artifacts/art_1/content"] @hits)))
+      (finally (stop!)))))
+
+(deftest sessions-artifacts-delete-sends-delete
+  (let [captured (atom nil)
+        {:keys [port stop!]} (start-server! 19037 "/v1/agents/sessions/sess_1/artifacts/art_1"
+                                (fn [req] (reset! captured req)
+                                  {:status 200
+                                   :body "{\"id\":\"art_1\",\"deleted\":true,\"object\":\"agent.session.artifact.deleted\"}"}))]
+    (try
+      (let [client (oai/client {:api-key "k" :base-url (base-url port)})
+            result (agents/sessions-artifacts-delete client "sess_1" "art_1")]
+        (is (= "DELETE" (:method @captured)))
+        (is (= "/v1/agents/sessions/sess_1/artifacts/art_1" (:path @captured)))
+        (is (= "agents=v1" (get-in @captured [:headers "openai-beta"])))
+        (is (true? (get result "deleted")))
+        (is (= "agent.session.artifact.deleted" (get result "object"))))
+      (finally (stop!)))))
+
+;; ---------------------------------------------------------------------------
+;; environment files
+;; ---------------------------------------------------------------------------
+
+(defn- canned-env-file [path size]
+  (str "{\"environment_id\":\"ccarenv_1\",\"object\":\"agent.environment.file\",\"path\":\"" path
+       "\",\"size_bytes\":" size "}"))
+
+(deftest environments-files-list-follows-page-next-tokens
+  (let [queries (atom [])
+        {:keys [port stop!]}
+        (start-server! 19038 "/v1/agents/environments/ccarenv_1/files"
+          (fn [{:keys [method path query]}]
+            ;; JVM's .getQuery decodes %2F, httpkit's does not: decode here.
+            (swap! queries conj [method path (update-vals (parse-query query)
+                                                          #(java.net.URLDecoder/decode ^String % "UTF-8"))])
+            (if (= "tok_2" (get (parse-query query) "page"))
+              {:status 200 :body (str "{\"object\":\"page\",\"data\":[" (canned-env-file "/workspace/a.txt" 1)
+                                      "],\"has_more\":false,\"next\":null}")}
+              {:status 200 :body (str "{\"object\":\"page\",\"data\":[" (canned-env-file "/workspace/b.txt" 2)
+                                      "],\"has_more\":true,\"next\":\"tok_2\"}")})))]
+    (try
+      (let [client (oai/client {:api-key "k" :base-url (base-url port)})
+            params {"limit" 1 "path" "/workspace" "order" "desc"}
+            pages  (loop [resp (agents/environments-files-list client "ccarenv_1" params)
+                          acc  [resp]]
+                     (if (get resp "has_more")
+                       (let [nxt (agents/environments-files-list client "ccarenv_1"
+                                                                 (assoc params "page" (get resp "next")))]
+                         (recur nxt (conj acc nxt)))
+                       acc))]
+        (is (= 2 (count pages)))
+        (is (= ["/workspace/b.txt" "/workspace/a.txt"]
+               (mapv #(get-in % ["data" 0 "path"]) pages)))
+        (is (every? #(= "page" (get % "object")) pages))
+        (is (= [["GET" "/v1/agents/environments/ccarenv_1/files"
+                 {"limit" "1" "path" "/workspace" "order" "desc"}]
+                ["GET" "/v1/agents/environments/ccarenv_1/files"
+                 {"limit" "1" "path" "/workspace" "order" "desc" "page" "tok_2"}]]
+               @queries)))
+      (finally (stop!)))))
+
+(deftest environments-files-list-404-maps-to-not-found
+  (let [{:keys [port stop!]} (start-server! 19039 "/v1/agents/environments"
+                                (fn [_] {:status 404 :body "{\"error\":{\"message\":\"No such environment\"}}"}))]
+    (try
+      (let [client (oai/client {:api-key "k" :base-url (base-url port) :max-retries 0})
+            e      (try (agents/environments-files-list client "ccarenv_missing") nil (catch Exception e e))]
+        (is (= :tools.agents.openai/not-found-error (:type (ex-data e))))
+        (is (str/includes? (str (ex-message e)) "environments-files-list: HTTP 404 No such environment")))
+      (finally (stop!)))))
+
+(defn- decode-b64 ^bytes [^String s] (.decode (java.util.Base64/getDecoder) s))
+
+(deftest environments-files-create-sends-json-body-with-base64-data
+  (let [captured (atom [])
+        {:keys [port stop!]} (start-server! 19040 "/v1/agents/environments/ccarenv_1/files"
+                                (fn [req] (swap! captured conj req)
+                                  {:status 200 :body (canned-env-file "/workspace/in.bin" 5)}))
+        tmp (java.io.File/createTempFile "clj-tools-agents-env-file" ".bin")]
+    (try
+      (java.nio.file.Files/write (.toPath tmp) ^bytes non-utf8-bytes
+                                 ^"[Ljava.nio.file.OpenOption;" (into-array java.nio.file.OpenOption []))
+      (let [client  (oai/client {:api-key "k" :base-url (base-url port)})
+            created (agents/environments-files-create client "ccarenv_1"
+                      {"type" "inline" "path" "/workspace/in.txt" "data" "aGVsbG8="})]
+        (is (= "agent.environment.file" (get created "object")))
+        (agents/environments-files-create client "ccarenv_1"
+          {"type" "inline" "path" "/workspace/in.bin" "data" non-utf8-bytes})
+        (agents/environments-files-create client "ccarenv_1"
+          {"type" "inline" "path" "/workspace/in.bin" "data" tmp})
+        (agents/environments-files-create client "ccarenv_1"
+          {"type" "inline" "path" "/workspace/in.bin" "data" (.toPath tmp)})
+        (agents/environments-files-create client "ccarenv_1"
+          {"type" "file_id" "path" "/workspace/in.pdf" "file_id" "file-abc"})
+        (let [[as-string as-bytes as-file as-path as-file-id] @captured
+              body (fn [req] (oai/read-json (:body req)))]
+          (is (= "POST" (:method as-string)))
+          (is (= "/v1/agents/environments/ccarenv_1/files" (:path as-string)))
+          (is (= "agents=v1" (get-in as-string [:headers "openai-beta"])))
+          (is (str/starts-with? (str (get-in as-string [:headers "content-type"])) "application/json"))
+          (is (= {"type" "inline" "path" "/workspace/in.txt" "data" "aGVsbG8="} (body as-string))
+              "a String is sent verbatim")
+          (doseq [req [as-bytes as-file as-path]]
+            (is (java.util.Arrays/equals ^bytes non-utf8-bytes (decode-b64 (get (body req) "data")))))
+          (is (= {"type" "file_id" "path" "/workspace/in.pdf" "file_id" "file-abc"} (body as-file-id))
+              "no \"data\" key is added")))
+      (finally (stop!) (.delete tmp)))))
+
+(deftest environments-files-create-rejects-unsupported-data-before-network
+  ;; Nothing listens on 19998: an attempted request would be a connection error.
+  (let [client (oai/client {:api-key "k" :base-url "http://127.0.0.1:19998/v1" :max-retries 0})
+        e      (try (agents/environments-files-create client "ccarenv_1"
+                      {"type" "inline" "path" "/workspace/x" "data" 42})
+                    nil (catch Exception e e))]
+    (is (= :tools.agents.openai/invalid-request (:type (ex-data e))))
+    (is (str/includes? (str (ex-message e)) "java.lang.Long"))))
+
+;; ---------------------------------------------------------------------------
 ;; REAL-API saved-agent CRUD round trip — the one test in this file that
 ;; talks to OpenAI. Skipped (a single passing assertion) unless both
 ;; OPENAI_AGENTS_LIVE=1 and OPENAI_API_KEY are set, so a key merely present in
@@ -682,4 +900,92 @@
           ;; best-effort cleanup when a step before delete threw
           (try (agents/agents-delete client id) (catch Exception _ nil))
           (throw e))))
+    (is true "skipped: set OPENAI_AGENTS_LIVE=1 and OPENAI_API_KEY")))
+
+;; ---------------------------------------------------------------------------
+;; REAL-API probe P1 (#19): artifacts and environment files. Same gate and
+;; env overrides as the CRUD round trip above. COSTS MONEY: one openai_hosted
+;; session and one short turn. Cleanup (cancel + delete, retrying a 409) runs
+;; in `finally`. Findings to record in docs/openai-agents.md: whether content
+;; arrives inline or as a 3xx (this client does not follow redirects), bytes
+;; intact, env-file create on the live environment, token paging.
+;; ---------------------------------------------------------------------------
+
+(defn- live-poll
+  "Call `f` every `interval-ms` until it returns truthy, up to `timeout-ms`."
+  [f interval-ms timeout-ms]
+  (let [deadline (+ (System/currentTimeMillis) timeout-ms)]
+    (loop []
+      (or (f)
+          (if (< (System/currentTimeMillis) deadline)
+            (do (Thread/sleep (long interval-ms)) (recur))
+            (throw (ex-info "live probe: poll timed out" {:timeout-ms timeout-ms})))))))
+
+(defn- live-cleanup-session! [client session-id]
+  (try (agents/cancel-turn client session-id) (catch Exception _ nil))
+  (loop [attempt 1]
+    (let [outcome (try (agents/sessions-delete client session-id) :deleted
+                       (catch Exception e (:type (ex-data e))))]
+      (when (and (= outcome :tools.agents.openai/conflict-error) (< attempt 5))
+        (Thread/sleep 2000)
+        (recur (inc attempt))))))
+
+(deftest artifacts-and-environment-files-probe-against-the-real-api
+  (if-let [api-key (and (= "1" (System/getenv "OPENAI_AGENTS_LIVE"))
+                       (not-empty (System/getenv "OPENAI_API_KEY")))]
+    (let [client     (oai/client {:api-key api-key
+                                  :base-url (env "OPENAI_AGENTS_BASE_URL" "https://api.openai.com/v1")})
+          model      (env "OPENAI_AGENTS_MODEL" "gpt-5.5")
+          expected   (byte-array (map unchecked-byte [0x70 0x72 0x6f 0x62 0x65 0x2d 0x00 0xff]))
+          session    (agents/sessions-create client
+                       {"agent" {"model" model "instructions" "Do exactly what is asked; no extra work."}
+                        "environment" {"type" "openai_hosted"}
+                        "input" (str "Run: mkdir -p /workspace/outputs && "
+                                     "printf 'probe-\\000\\377' > /workspace/outputs/p.bin. Reply OK.")})
+          session-id (get session "id")]
+      (try
+        (is (string? session-id))
+        (let [env-id (live-poll #(get-in (agents/sessions-retrieve client session-id) ["environment" "id"])
+                                1000 120000)]
+          ;; Env files need a connected environment: do them while the turn runs.
+          (live-poll #(contains? #{"connected" "disconnected" "failed" "expired"}
+                                 (get (agents/environments-retrieve client env-id) "status"))
+                     1000 180000)
+          (let [created (agents/environments-files-create client env-id
+                          {"type" "inline" "path" "/workspace/in.txt" "data" (.getBytes "hello" "UTF-8")})]
+            (is (= "agent.environment.file" (get created "object")))
+            (is (= 5 (get created "size_bytes"))))
+          (let [params {"limit" 1 "path" "/workspace"}
+                page1  (agents/environments-files-list client env-id params)]
+            (is (= "page" (get page1 "object")))
+            (is (<= (count (get page1 "data")) 1))
+            (when (get page1 "has_more")
+              (is (string? (get page1 "next")))
+              (let [page2 (agents/environments-files-list client env-id (assoc params "page" (get page1 "next")))]
+                (is (= "page" (get page2 "object")))
+                (is (not= (get page1 "data") (get page2 "data")))))))
+        (let [turn (live-poll #(let [t (agents/latest-root-turn (agents/sessions-turns-list client session-id))]
+                                 (when (agents/turn-finished? t) t))
+                              2000 300000)]
+          (is (= "completed" (get turn "status")) (pr-str (get turn "error")))
+          (let [listed   (agents/sessions-artifacts-list client session-id)
+                artifact (some #(when (and (= "/workspace/outputs/p.bin" (get % "path"))
+                                           (= (get turn "id") (get % "turn_id")))
+                                  %)
+                               (get listed "data"))
+                aid      (get artifact "id")]
+            (is (= "list" (get listed "object")))
+            (is (some? artifact) (pr-str listed))
+            (when aid
+              (is (= 8 (get artifact "size_bytes")))
+              (is (= artifact (agents/sessions-artifacts-retrieve client session-id aid)))
+              ;; A 3xx here (api-status-error) means the API redirects: record it.
+              (let [content (agents/sessions-artifacts-content client session-id aid)]
+                (is (java.util.Arrays/equals ^bytes expected ^bytes content) (pr-str (vec content))))
+              (is (true? (get (agents/sessions-artifacts-delete client session-id aid) "deleted")))
+              (let [e (try (agents/sessions-artifacts-retrieve client session-id aid) nil
+                           (catch Exception e e))]
+                (is (= :tools.agents.openai/not-found-error (:type (ex-data e))))))))
+        (finally
+          (when session-id (live-cleanup-session! client session-id)))))
     (is true "skipped: set OPENAI_AGENTS_LIVE=1 and OPENAI_API_KEY")))
