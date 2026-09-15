@@ -192,7 +192,8 @@
   ;; attempted, this would hang/error with a connection failure instead of
   ;; the expected missing-credentials error.
   (let [home (str (java.nio.file.Files/createTempDirectory "anthropic-home" (make-array java.nio.file.attribute.FileAttribute 0)))
-        e    (try (with-redefs [a/user-home (constantly home)] ; never the real ~/.config/anthropic
+        e    (try (with-redefs [a/user-home (constantly home) ; never the real ~/.config/anthropic
+                                a/getenv    (constantly nil)]  ; nor ANTHROPIC_* from the shell
                     (a/client {:base-url "http://127.0.0.1:18999"}))
                   nil (catch Exception e e))]
     (is (some? e))

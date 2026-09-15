@@ -72,13 +72,15 @@
   ;; "/responses" to it. Regressing this to a host-only default (the sibling
   ;; library's shape) would silently produce ".../responses" without /v1.
   (is (= "https://api.openai.com/v1" oai/default-base-url))
-  (is (= oai/default-base-url (:base-url (oai/client {:api-key "k"})))))
+  (with-redefs [oai/getenv (constantly nil)] ; an exported OPENAI_BASE_URL must not leak in
+    (is (= oai/default-base-url (:base-url (oai/client {:api-key "k"}))))))
 
 (deftest client-custom-base-url
   (is (= "http://127.0.0.1:9/v1" (:base-url (oai/client {:api-key "k" :base-url "http://127.0.0.1:9/v1"})))))
 
 (deftest client-omits-organization-and-project-when-unset
-  (let [c (oai/client {:api-key "k" :base-url "http://x/v1"})]
+  (let [c (with-redefs [oai/getenv (constantly nil)] ; nor OPENAI_ORG_ID / OPENAI_PROJECT_ID
+            (oai/client {:api-key "k" :base-url "http://x/v1"}))]
     (is (not (contains? c :organization)))
     (is (not (contains? c :project)))))
 

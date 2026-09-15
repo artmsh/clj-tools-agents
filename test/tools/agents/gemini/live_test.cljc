@@ -176,8 +176,11 @@
     (is (= 0 (:retries-taken (ex-data e))))))
 
 (deftest missing-api-key-throws-before-any-network-activity
-  ;; Assumes GOOGLE_API_KEY/GEMINI_API_KEY are unset in the test environment.
-  (let [e (try (g/client {:base-url "http://127.0.0.1:18999"}) nil (catch Exception e e))]
+  ;; An empty injected env: the outcome must not depend on GOOGLE_API_KEY /
+  ;; GEMINI_API_KEY being exported in the shell running the suite.
+  (let [e (try (with-redefs [g/getenv (constantly nil)]
+                 (g/client {:base-url "http://127.0.0.1:18999"}))
+               nil (catch Exception e e))]
     (is (some? e))
     (is (= :tools.agents.gemini/missing-credentials (:type (ex-data e))))))
 
