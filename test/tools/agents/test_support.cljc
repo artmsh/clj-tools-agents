@@ -82,7 +82,9 @@
                                                                        (boolean (hk/send! ch (chunk-bytes chunk) false)))))
                                                   (finally (hk/close ch)))))}))
                           resp)))
-                    {:port port :legacy-return-value? false})]
+                    ;; loopback, like the JVM branch: on macOS a 0.0.0.0 bind can be handed a port
+                    ;; another process holds on 127.0.0.1, which then answers our requests
+                    {:ip "127.0.0.1" :port port :legacy-return-value? false})]
        {:port (hk/server-port server) :stop! (fn [] (hk/server-stop! server))})
 
      :clj
