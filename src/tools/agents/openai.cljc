@@ -136,14 +136,43 @@
                               "or set the OPENAI_API_KEY environment variable")
                          {:type :tools.agents.openai/missing-credentials}))))))
 
+(defn- api-key-fn-source
+  "A TokenSource over a zero-arg `:api-key` fn, mirroring openai-python's
+   callable `api_key` (openai-python 3.14.0 @d421d7ab):
+     - called before EVERY attempt, retries included, never cached:
+       `_prepare_options` -> `_refresh_api_key` (`_client.py:671-672,688-690`)
+       runs at the top of each retry-loop iteration (`_base_client.py:1052-1054`)
+     - never called at construction (`_client.py:253-255,266-274`)
+     - a 401 is not retried: `_send_with_auth_retry` returns the response
+       unless workload identity is configured (`_client.py:578-579`), and
+       `_should_retry` has no 401 branch (`_base_client.py:815`). So
+       invalidate! declines and `request!` surfaces the 401 at once.
+     - a throwing fn propagates as-is before the request is built.
+   Divergence: the SDK type-checks nothing (an empty value drops the
+   Authorization header and trips `_validate_headers`' TypeError,
+   `_client.py:655-665`; a non-string is f-string formatted). Here a
+   non-string or blank return throws :tools.agents.openai/invalid-api-key,
+   carrying neither the value nor its type."
+  [f]
+  (reify token/TokenSource
+    (-token [_]
+      (let [k (f)]
+        (if (and (string? k) (not (str/blank? k)))
+          k
+          (throw (ex-info "tools.agents.openai: the :api-key fn must return a non-blank String"
+                          {:type :tools.agents.openai/invalid-api-key})))))
+    (-invalidate [_ _] false)))
+
 (defn- resolve-client-credentials
   "The full credential chain `client` uses: an explicit :credential-source,
-   else `resolve-credentials` (explicit :api-key > OPENAI_API_KEY > throw).
+   else a zero-arg :api-key fn (wrapped by `api-key-fn-source`), else
+   `resolve-credentials` (explicit :api-key > OPENAI_API_KEY > throw).
    Returns {:credential-source src} or {:api-key s}. Later refreshable
-   sources (#36 workload identity, #37 callable :api-key) plug in here as
-   further steps that return {:credential-source <TokenSource>}."
+   sources (#36 workload identity) plug in here as further steps that return
+   {:credential-source <TokenSource>}."
   [opts getenv-fn]
-  (if (contains? opts :credential-source)
+  (cond
+    (contains? opts :credential-source)
     (let [src (:credential-source opts)]
       (when-not (token/token-source? src)
         (throw (ex-info (str "tools.agents.openai/client: :credential-source must satisfy "
@@ -153,16 +182,28 @@
         (throw (ex-info "tools.agents.openai/client: pass either :api-key or :credential-source, not both"
                         {:type :tools.agents.openai/invalid-credentials})))
       {:credential-source src})
+
+    (fn? (:api-key opts))
+    {:credential-source (api-key-fn-source (:api-key opts))}
+
+    :else
     (resolve-credentials opts getenv-fn)))
 
 (defn client
   "Build an OpenAIClient record — the 'client object' analogue of Python's
    OpenAI(...) constructor. Resolves credentials eagerly (fails fast with a
-   catchable ex-info BEFORE any network request).
+   catchable ex-info BEFORE any network request); a callable :api-key or a
+   :credential-source is only checked here and called per attempt.
 
    opts:
      :api-key      explicit API key -> sent as `Authorization: Bearer <key>`
-                   (falls back to OPENAI_API_KEY)
+                   (falls back to OPENAI_API_KEY). May be a zero-arg fn
+                   returning the key (openai-python's callable `api_key`,
+                   e.g. an Entra ID token provider): NOT called here, but
+                   before every attempt, retries included, with no caching.
+                   A non-string/blank return throws
+                   {:type :tools.agents.openai/invalid-api-key}; a 401 is
+                   not retried. Stored as :credential-source.
      :credential-source  a tools.agents.token/TokenSource (e.g.
                    `tools.agents.token/token-cache`) asked for a token before
                    every attempt -> `Authorization: Bearer <token>`. Replaces
@@ -436,10 +477,14 @@
   [label client]
   (if-let [src (:credential-source client)]
     (token/token! src)
-    (or (:api-key client)
+    (if (fn? (:api-key client))
+      ;; `(assoc client :api-key f)`: same per-attempt call and validation
+      ;; as a fn passed to `client`.
+      (token/token! (api-key-fn-source (:api-key client)))
+      (or (:api-key client)
         (throw (ex-info (str label ": client has no :api-key — build it via "
                              "tools.agents.openai/client")
-                        {:type :tools.agents.openai/missing-credentials})))))
+                        {:type :tools.agents.openai/missing-credentials}))))))
 
 (defn- request-headers
   "Headers for ONE attempt. `request!` calls this before every attempt and

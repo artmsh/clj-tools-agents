@@ -439,6 +439,117 @@
     (is (= ::exchange-failed (:type (ex-data e))))
     (is (= 1 @calls))))
 
+;; ---------------------------------------------------------------------------
+;; callable :api-key (#37): openai-python's `api_key=<callable>` — called before
+;; every attempt, no cache, 401 not retried, bad return typed. OS-assigned ports.
+;; ---------------------------------------------------------------------------
+
+(defn- free-port []
+  (with-open [s (java.net.ServerSocket. 0 50 (java.net.InetAddress/getByName "127.0.0.1"))]
+    (.getLocalPort s)))
+
+(defn- counting-key-fn
+  "A zero-arg :api-key fn returning \"key-1\", \"key-2\", ... Returns {:f :calls}."
+  []
+  (let [calls (atom 0)]
+    {:calls calls :f (fn [] (str "key-" (swap! calls inc)))}))
+
+(deftest api-key-fn-is-not-called-at-construction
+  (let [{:keys [f calls]} (counting-key-fn)
+        client (oai/client {:api-key f :base-url "http://127.0.0.1:1/v1"})]
+    (is (= 0 @calls))
+    (is (nil? (:api-key client)))
+    (is (token/token-source? (:credential-source client)))))
+
+(deftest api-key-fn-wins-over-env-var
+  (let [{:keys [f]} (counting-key-fn)]
+    (with-redefs [oai/getenv (fn [n] (when (= n "OPENAI_API_KEY") "env-key"))]
+      (let [client (oai/client {:api-key f :base-url "http://x/v1"})]
+        (is (nil? (:api-key client)))
+        (is (= "key-1" (token/token! (:credential-source client))))))))
+
+(deftest api-key-fn-called-before-every-attempt-without-caching
+  (let [seen (atom [])
+        {:keys [f calls]} (counting-key-fn)
+        {:keys [port stop!]} (start-server! (free-port) "/v1/responses"
+                                (fn [req]
+                                  (swap! seen conj (get (:headers req) "authorization"))
+                                  (case (count @seen)
+                                    1 {:status 429 :headers {"retry-after-ms" "1"} :body "{}"}
+                                    2 {:status 503 :headers {"retry-after-ms" "1"} :body "{}"}
+                                    {:status 200 :body (canned-response)})))]
+    (try
+      (let [client (oai/client {:api-key f :base-url (base-url port)})]
+        (is (= "hello back" (oai/output-text (oai/responses-create client {"model" "m" "input" "hi"}))))
+        (is (= ["Bearer key-1" "Bearer key-2" "Bearer key-3"] @seen))
+        ;; A second call calls the fn again: nothing cached across requests.
+        (oai/responses-create client {"model" "m" "input" "hi"})
+        (is (= "Bearer key-4" (last @seen)))
+        (is (= 4 @calls)))
+      (finally (stop!)))))
+
+(deftest api-key-fn-401-is-not-retried
+  (let [hits (atom 0)
+        {:keys [f calls]} (counting-key-fn)
+        {:keys [port stop!]} (start-server! (free-port) "/v1/responses"
+                                (fn [_] (swap! hits inc)
+                                  {:status 401 :body "{\"error\":{\"message\":\"bad token\"}}"}))]
+    (try
+      (let [client (oai/client {:api-key f :base-url (base-url port) :max-retries 2})
+            e      (try (oai/responses-create client {"model" "m" "input" "hi"}) nil (catch Exception e e))]
+        (is (= :tools.agents.openai/authentication-error (:type (ex-data e))))
+        (is (= 1 @hits))
+        (is (= 1 @calls))
+        (is (not (re-find #"key-" (str (ex-message e) (pr-str (ex-data e)))))))
+      (finally (stop!)))))
+
+(deftest api-key-fn-bad-return-throws-typed-before-any-request
+  (let [hits (atom 0)
+        {:keys [port stop!]} (start-server! (free-port) "/v1/responses"
+                                (fn [_] (swap! hits inc) {:status 200 :body (canned-response)}))]
+    (try
+      (doseq [bad [nil "" "   " 42 :sekrit-kw {"k" "sekrit-map"}]]
+        (let [client (oai/client {:api-key (constantly bad) :base-url (base-url port)})
+              e      (try (oai/responses-create client {"model" "m" "input" "hi"}) nil (catch Exception e e))]
+          (is (= :tools.agents.openai/invalid-api-key (:type (ex-data e))) (pr-str bad))
+          (is (= {:type :tools.agents.openai/invalid-api-key} (ex-data e)))
+          (is (not (re-find #"sekrit|42" (ex-message e))))))
+      (is (= 0 @hits) "never sent, never retried")
+      (finally (stop!)))))
+
+(deftest api-key-fn-exception-propagates-unretried
+  (let [calls  (atom 0)
+        client (oai/client {:api-key (fn [] (swap! calls inc) (throw (ex-info "provider down" {:type ::provider-down})))
+                            :base-url (str "http://127.0.0.1:" (free-port) "/v1")})
+        e      (try (oai/responses-create client {"model" "m" "input" "hi"}) nil (catch Exception e e))]
+    (is (= ::provider-down (:type (ex-data e))))
+    (is (= 1 @calls))))
+
+(deftest api-key-fn-assoced-onto-a-client-is-called-per-attempt
+  (let [seen (atom [])
+        {:keys [f]} (counting-key-fn)
+        {:keys [port stop!]} (start-server! (free-port) "/v1/responses"
+                                (fn [req]
+                                  (swap! seen conj (get (:headers req) "authorization"))
+                                  (if (= 1 (count @seen))
+                                    {:status 429 :headers {"retry-after-ms" "1"} :body "{}"}
+                                    {:status 200 :body (canned-response)})))]
+    (try
+      (let [client (assoc (oai/client {:api-key "static" :base-url (base-url port)}) :api-key f)]
+        (oai/responses-create client {"model" "m" "input" "hi"})
+        (is (= ["Bearer key-1" "Bearer key-2"] @seen))
+        (let [e (try (oai/responses-create (assoc client :api-key (constantly " ")) {"model" "m"})
+                     nil (catch Exception e e))]
+          (is (= :tools.agents.openai/invalid-api-key (:type (ex-data e))))))
+      (finally (stop!)))))
+
+(deftest api-key-fn-with-credential-source-is-invalid-credentials
+  (let [{:keys [f calls]} (counting-key-fn)
+        e (try (oai/client {:api-key f :credential-source (per-call-token-source)}) nil
+               (catch Exception e e))]
+    (is (= :tools.agents.openai/invalid-credentials (:type (ex-data e))))
+    (is (= 0 @calls))))
+
 
 ;; ---------------------------------------------------------------------------
 ;; examples/*.clj wired end-to-end against the mock server
