@@ -1,0 +1,42 @@
+event: response.created
+data: {"type":"response.created","response":{"id":"resp_123","object":"response","created_at":1740855869,"status":"in_progress","error":null,"model":"gpt-6-astra","output":[],"usage":null},"sequence_number":0}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","output_index":0,"item":{"id":"msg_123","status":"in_progress","type":"message","role":"assistant","content":[]},"sequence_number":1}
+
+event: response.content_part.added
+data: {"type":"response.content_part.added","item_id":"msg_123","output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]},"sequence_number":2}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","item_id":"msg_123","output_index":0,"content_index":0,"delta":"Checking","sequence_number":3}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","item_id":"msg_123","output_index":0,"content_index":0,"delta":" the weather.","sequence_number":4}
+
+event: response.output_text.done
+data: {"type":"response.output_text.done","item_id":"msg_123","output_index":0,"content_index":0,"text":"Checking the weather.","sequence_number":5}
+
+event: response.content_part.done
+data: {"type":"response.content_part.done","item_id":"msg_123","output_index":0,"content_index":0,"sequence_number":6,"part":{"type":"output_text","text":"Checking the weather.","annotations":[]}}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","output_index":0,"item":{"id":"msg_123","status":"completed","type":"message","role":"assistant","content":[{"type":"output_text","text":"Checking the weather.","annotations":[]}]},"sequence_number":7}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","output_index":1,"item":{"id":"item-abc","type":"function_call","call_id":"call_abc","name":"get_weather","arguments":"","status":"in_progress"},"sequence_number":8}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","item_id":"item-abc","output_index":1,"delta":"{ \"arg\":","sequence_number":9}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","item_id":"item-abc","output_index":1,"delta":" 123 }","sequence_number":10}
+
+event: response.function_call_arguments.done
+data: {"type":"response.function_call_arguments.done","item_id":"item-abc","output_index":1,"arguments":"{ \"arg\": 123 }","sequence_number":11}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","output_index":1,"item":{"id":"item-abc","type":"function_call","call_id":"call_abc","name":"get_weather","arguments":"{ \"arg\": 123 }","status":"completed"},"sequence_number":12}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_123","object":"response","created_at":1740855869,"status":"completed","error":null,"model":"gpt-6-astra","output":[{"id":"msg_123","status":"completed","type":"message","role":"assistant","content":[{"type":"output_text","text":"Checking the weather.","annotations":[]}]},{"id":"item-abc","type":"function_call","call_id":"call_abc","name":"get_weather","arguments":"{ \"arg\": 123 }","status":"completed"}],"usage":{"input_tokens":37,"output_tokens":11,"total_tokens":48}},"sequence_number":13}
+

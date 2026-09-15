@@ -40,12 +40,19 @@
    \"max_output_tokens\"). See docs/openai.md 'JSON: a small hand-rolled
    codec, not a dependency'.
 
-   STREAMING: not implemented. :stream true is rejected with a clear error
-   rather than silently ignored. See docs/openai.md 'Streaming is not
-   supported'."
+   STREAMING: `responses-stream` is `client.responses.create(...,
+   stream=True)`. It opens the request NOW through `request!` (`:as
+   :stream`: same retries, 401 retry and error typing, before the first byte
+   only) and returns a single-use reducible (tools.agents.stream) of decoded
+   event maps. `accumulate-response-stream` folds the events into the final
+   Response that `output-text` reads; `stream-complete?` tells a finished
+   stream from a cut-off one. `:stream true` on `responses-create` /
+   `request!` (without `:as :stream`) is still rejected. See docs/openai.md
+   'Streaming'."
   (:require [clojure.string :as str]
             [tools.agents.http :as http]
             [tools.agents.json :as json]
+            [tools.agents.stream :as stream]
             [tools.agents.token :as token]))
 
 ;; openai-python's default base_url INCLUDES the /v1 path segment (unlike
@@ -510,8 +517,8 @@
 
 (defn- reject-streaming! [label body multipart]
   (when (streaming-requested? body multipart)
-    (throw (ex-info (str label ": :stream true is not supported — "
-                          "SSE streaming is not implemented by this client. See README.")
+    (throw (ex-info (str label ": :stream true is not supported here — "
+                          "use tools.agents.openai/responses-stream for SSE streaming")
                      {:type :tools.agents.openai/streaming-unsupported}))))
 
 (defn- own-error?
@@ -686,7 +693,7 @@
    to POST {base-url}/responses. Returns the decoded response map (string
    keys). The analogue of Python's client.responses.create(**params).
 
-   :stream true throws immediately — see the ns docstring's STREAMING note.
+   :stream true throws immediately; stream with `responses-stream`.
 
    Throws ex-info on any failure, message prefixed
    \"tools.agents.openai/responses-create: \", ex-data
@@ -705,6 +712,285 @@
    code, exactly as the SDK's own README does."
   [client request]
   (post-json! client "chat-completions-create" "/chat/completions" request))
+
+;; ---------------------------------------------------------------------------
+;; Public API — streaming
+;; ---------------------------------------------------------------------------
+;; Wire format: developers.openai.com/api/docs/guides/streaming-responses and
+;; .../api/reference/resources/responses/streaming-events. Frame handling is
+;; openai-python src/openai/_streaming.py `Stream.__stream__` (@ d421d7a):
+;; `data` starting with "[DONE]" ends the stream undecoded, a data object with
+;; a truthy top-level "error" raises, and the response is closed in `finally`.
+
+(defn- py-truthy?
+  "Python truthiness, for the SDK's `data.get(\"error\")` test."
+  [v]
+  (cond (or (nil? v) (false? v)) false
+        (number? v)              (not (zero? v))
+        (or (string? v) (coll? v)) (boolean (seq v))
+        :else                    true))
+
+(defn- stream-event-error
+  "The typed ex-info for an in-stream error event, or nil. Two shapes, both
+   :tools.agents.openai/stream-error with :status nil, :body the raw data
+   string (nil from a pure accumulator) and :error the error object:
+     - any data object with a truthy top-level \"error\" (openai-python
+       _streaming.py raises APIError for it);
+     - the Responses `error` event {\"type\" \"error\" \"code\" \"message\"
+       \"param\"}, which has no \"error\" key. openai-python yields that one
+       as a ResponseErrorEvent; this client throws it."
+  [fn-name event raw]
+  (when (map? event)
+    (let [label (fn-label fn-name)
+          err   (get event "error")
+          fail  (fn [msg err]
+                  (ex-info (str label ": stream error: "
+                                (if (and (string? msg) (seq msg)) msg "An error occurred during streaming"))
+                           {:type :tools.agents.openai/stream-error :status nil :body raw :error err}))]
+      (cond
+        (py-truthy? err)              (fail (when (map? err) (get err "message")) err)
+        (= "error" (get event "type")) (fail (get event "message") (select-keys event ["code" "message" "param"]))))))
+
+(defn- open-sse-stream
+  "POST `request` with \"stream\" true to `path` and return the event
+   reducible. Opening goes through `request!` with `:as :stream` as
+   open-event-stream's `:send!`, so per-attempt headers, the retry policy,
+   the credential-source 401 retry and `status->type` typing are exactly
+   `request!`'s, and all of them happen before the first byte."
+  [client fn-name path request]
+  (let [label (fn-label fn-name)]
+    (stream/open-event-stream
+     {:request       {:method :post :path path
+                      :body   (-> (or request {}) (dissoc :stream) (assoc "stream" true))}
+      :send!         (fn [req] (request! client fn-name req))
+      ;; request! already throws the typed error for a final non-2xx.
+      :on-error      (fn [{:keys [status body]}]
+                       (let [msg (extract-error-message body)]
+                         (throw (ex-info (str label ": HTTP " status (when (or msg (seq body)) (str " " (or msg body))))
+                                         {:type (status->type status) :status status :body body}))))
+      :on-read-error (fn [e]
+                       (ex-info (str label ": connection failed mid-stream: " e)
+                                {:type :tools.agents.openai/api-connection-error :status nil :body nil}
+                                e))
+      :done?         #(str/starts-with? (str (:data %)) "[DONE]")
+      :decode        (fn [data]
+                       (if (str/blank? data)
+                         ::keep-alive
+                         (let [event (read-json data)]
+                           (when-let [e (stream-event-error fn-name event data)] (throw e))
+                           event)))
+      :xform         (comp (remove #(= ::keep-alive (:data %)))
+                           (map (fn [{:keys [event id data]}]
+                                  (if (map? data)
+                                    (with-meta data {:tools.agents.sse/event event :tools.agents.sse/id id})
+                                    data))))})))
+
+(defn responses-stream
+  "POST request (the `responses-create` map) with \"stream\" true to
+   {base-url}/responses: openai-python's
+   client.responses.create(**params, stream=True).
+
+   The request is sent NOW through `request!` (`:as :stream`): retries per
+   the client's policy, the credential-source 401 retry, and a final non-2xx
+   or connection failure thrown from this call with the same
+   :type/:status/:body/:retries-taken as `responses-create`. Nothing is
+   retried once a 2xx arrives.
+
+   Returns a SINGLE-USE reducible (tools.agents.stream/open-event-stream) of
+   decoded event maps (string keys; dispatch on \"type\", unknown types pass
+   through), each with its SSE frame's name and id as metadata
+   :tools.agents.sse/event / :tools.agents.sse/id:
+
+     (let [s (responses-stream client {\"model\" \"gpt-5\" \"input\" \"hi\"})]
+       (run! #(when (= \"response.output_text.delta\" (get % \"type\"))
+                (print (get % \"delta\")))
+             s))
+     (output-text (accumulate-response-stream (responses-stream client req)))
+
+   Reducing closes the connection (EOF, early termination, exception); a
+   stream never reduced must be released with (tools.agents.stream/close! s),
+   which is also the cross-thread cancel.
+
+   While reducing, throws :tools.agents.openai/stream-error for an `error`
+   event (or any event with a top-level \"error\" object),
+   :tools.agents.openai/api-connection-error for a mid-stream transport
+   failure, :tools.agents.openai/json-parse-error for undecodable data.
+
+   The stream ends at EOF (a data: [DONE], if a server sends one, also ends
+   it). A cut-off stream reduces like a complete one; check
+   `stream-complete?` on the accumulated response."
+  [client request]
+  (open-sse-stream client "responses-stream" "/responses" request))
+
+;; ---------------------------------------------------------------------------
+;; Stream accumulation — pure
+;; ---------------------------------------------------------------------------
+
+(defn stream-complete?
+  "True when `result`, from `accumulate-response-stream` /
+   `accumulate-response-event`, saw a terminal event: response.completed,
+   response.failed or response.incomplete. False for a stream that ended
+   (EOF, early termination, close!) without one, whose result is the partial
+   response assembled from deltas. Read from `result`'s metadata."
+  [result]
+  (true? (::stream-complete? (meta result))))
+
+(def ^:private terminal-response-types
+  #{"response.completed" "response.failed" "response.incomplete"})
+
+(def ^:private snapshot-response-types
+  #{"response.created" "response.in_progress" "response.queued"})
+
+(defn- assoc-grow
+  "assoc at index i, padding with nil when i is past the end."
+  [v i x]
+  (let [v (if (vector? v) v [])]
+    (if (< i (count v)) (assoc v i x) (conj (into v (repeat (- i (count v)) nil)) x))))
+
+(defn- response-items [acc] (or (::items (meta acc)) (sorted-map)))
+
+(defn- with-items
+  "acc with output_index -> item `items` kept in metadata and \"output\"
+   rebuilt from them in index order."
+  [acc items]
+  (vary-meta (assoc acc "output" (vec (vals items))) assoc ::items items))
+
+(defn- update-item
+  "Apply f to the output item at idx when it exists and (get item \"type\")
+   is in `types` (nil: any type)."
+  [acc idx types f]
+  (let [items (response-items acc)
+        item  (when (integer? idx) (get items idx))]
+    (if (and (map? item) (or (nil? types) (contains? types (get item "type"))))
+      (with-items acc (assoc items idx (f item)))
+      acc)))
+
+(defn- update-part
+  "Apply f to content part ci of a message item, starting from `default`
+   when no content_part.added created it."
+  [item ci default f]
+  (if (integer? ci)
+    (let [content (get item "content")
+          part    (get content ci)]
+      (assoc item "content" (assoc-grow content ci (f (if (map? part) part default)))))
+    item))
+
+(defn accumulate-response-event
+  "Reducing fn folding Responses stream events into the final Response map
+   (pure). Ported from openai-python lib/streaming/responses/_responses.py
+   `ResponseStreamState.accumulate_event` (@ d421d7a):
+
+     - response.completed | response.failed | response.incomplete: the
+       result IS that event's \"response\" (a failed response is returned,
+       not thrown, as `responses-create` returns one). When its \"output\" is
+       null or missing, the items from response.output_item.done are used,
+       as the SDK does. Marks the result complete (`stream-complete?`);
+       later events are ignored.
+     - without a terminal event the result is assembled from the deltas:
+       response.created / in_progress / queued give the top-level fields;
+       response.output_item.added/done place items by output_index (a null
+       item is ignored); content_part.added/done place parts by
+       content_index; output_text.delta / refusal.delta append to a message
+       part and function_call_arguments.delta to a function_call item's
+       \"arguments\"; every *.done replaces the accumulated value. A delta for
+       an item never added is ignored (the SDK raises).
+     - `error` event, or a top-level \"error\" object:
+       throws :tools.agents.openai/stream-error.
+     - other event types: ignored.
+
+   \"output\" and message \"content\" are vectors, so `output-text` works on
+   partial and final results. Arities: [] -> nil, [acc] -> acc,
+   [acc event] -> acc."
+  ([] nil)
+  ([acc] (when acc (vary-meta acc dissoc ::items ::done-items)))
+  ([acc event]
+   (when-let [e (stream-event-error "accumulate-response-event" event nil)] (throw e))
+   (let [acc (or acc {})
+         t   (when (map? event) (get event "type"))
+         idx (when (map? event) (get event "output_index"))
+         ci  (when (map? event) (get event "content_index"))
+         s   (fn [k] (let [v (get event k)] (when (string? v) v)))]
+     (cond
+       (or (nil? t) (stream-complete? acc)) acc
+
+       (contains? terminal-response-types t)
+       (let [resp (get event "response")]
+         (if (map? resp)
+           (let [done   (::done-items (meta acc))
+                 output (cond (vector? (get resp "output")) (get resp "output")
+                              (seq done) (vec (vals done))
+                              :else (vec (vals (response-items acc))))]
+             (with-meta (assoc resp "output" output) (assoc (meta acc) ::stream-complete? true)))
+           acc))
+
+       (contains? snapshot-response-types t)
+       (let [resp (get event "response")]
+         (if (map? resp)
+           (let [items (response-items acc)
+                 out   (get resp "output")
+                 items (if (and (empty? items) (vector? out))
+                         (into (sorted-map) (keep-indexed (fn [i x] (when (map? x) [i x]))) out)
+                         items)]
+             (with-items (merge acc (dissoc resp "output")) items))
+           acc))
+
+       :else
+       (case t
+         ("response.output_item.added" "response.output_item.done")
+         (let [item (get event "item")]
+           (if (and (map? item) (integer? idx))
+             (cond-> (with-items acc (assoc (response-items acc) idx item))
+               (= t "response.output_item.done")
+               (vary-meta update ::done-items (fnil assoc (sorted-map)) idx item))
+             acc))
+
+         ("response.content_part.added" "response.content_part.done")
+         (let [part (get event "part")]
+           (if (map? part)
+             (update-item acc idx nil #(update-part % ci part (constantly part)))
+             acc))
+
+         "response.output_text.delta"
+         (update-item acc idx #{"message"}
+                      #(update-part % ci {"type" "output_text" "text" "" "annotations" []}
+                                    (fn [p] (update p "text" str (s "delta")))))
+
+         "response.output_text.done"
+         (if-let [text (s "text")]
+           (update-item acc idx #{"message"}
+                        #(update-part % ci {"type" "output_text" "text" "" "annotations" []}
+                                      (fn [p] (assoc p "text" text))))
+           acc)
+
+         "response.refusal.delta"
+         (update-item acc idx #{"message"}
+                      #(update-part % ci {"type" "refusal" "refusal" ""}
+                                    (fn [p] (update p "refusal" str (s "delta")))))
+
+         "response.refusal.done"
+         (if-let [refusal (s "refusal")]
+           (update-item acc idx #{"message"}
+                        #(update-part % ci {"type" "refusal" "refusal" ""}
+                                      (fn [p] (assoc p "refusal" refusal))))
+           acc)
+
+         "response.function_call_arguments.delta"
+         (update-item acc idx #{"function_call"} #(update % "arguments" str (s "delta")))
+
+         "response.function_call_arguments.done"
+         (if-let [args (s "arguments")]
+           (update-item acc idx #{"function_call"} #(assoc % "arguments" args))
+           acc)
+
+         acc)))))
+
+(defn accumulate-response-stream
+  "Reduce `events` (a `responses-stream` reducible, consumed and closed, or
+   any collection of event maps) with `accumulate-response-event`. Returns
+   the Response map, or nil for no events. Never throws on truncation; check
+   `stream-complete?`."
+  [events]
+  (transduce identity accumulate-response-event events))
 
 ;; ---------------------------------------------------------------------------
 ;; Public API — response accessors

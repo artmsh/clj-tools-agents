@@ -222,7 +222,9 @@ header, no query string) plus Microsoft's documentation.
 | `OpenAI(max_retries=2)` / automatic backoff | `(client {:max-retries 2})`, default `default-max-retries` = 2 | Implemented — connection failures, 408, 409, 429 and 5xx are retried with the SDK's exact backoff, jitter and `Retry-After` handling. See Retries below. |
 | `client.with_options(max_retries=5)` | `(assoc client :max-retries 5)` | The client record is associative, so the per-call override needs no dedicated API. |
 | `timeout` (default 10 min) / `APITimeoutError` | *(not implemented)* | Each runtime's HTTP leaf uses its own default timeout; a timeout surfaces as `:tools.agents.openai/api-connection-error` (which is also where Python's `APITimeoutError` sits in the hierarchy, as a subclass of `APIConnectionError`) and is retried like any other transport failure, exactly as the SDK does. |
-| `client.responses.create(..., stream=True)` / `client.responses.stream(...)` | **rejected outright** | See Streaming below. |
+| `client.responses.create(..., stream=True)` | `(responses-stream client params)` | Single-use reducible of decoded event maps, opened (and retried) at call time through `request!`. `:stream true` on `responses-create` is still rejected. See Streaming below. |
+| `ResponseStreamState.accumulate_event` / `stream.get_final_response()` | `(accumulate-response-event acc event)` / `(accumulate-response-stream s)` + `(stream-complete? r)` | Final Response from `response.completed`/`failed`/`incomplete`; assembled from deltas when the stream is cut off. `output-text` works on both. |
+| `client.responses.stream(...)` helper events (`snapshot`, `parsed`, `text_format`) | *(not implemented)* | Raw events plus the accumulator only; no structured-output parsing. |
 | `client.embeddings.create(**params)` | `(tools.agents.openai.embeddings/embeddings-create client params)` | `POST /embeddings` (`resources/embeddings.py`). Omitted `encoding_format` → sent as `"base64"` and each string `data[].embedding` decoded as little-endian float32 into doubles (`lib/_parsing/_embeddings.py`); an explicit `"float"`/`"base64"` is returned untouched. Empty `data` with the implicit format → `:tools.agents.openai/invalid-response`. Helper: `decode-embedding-base64`. |
 | `client.webhooks.verify_signature(payload, headers, secret=, tolerance=300)` / `client.webhooks.unwrap(payload, headers, secret=)` | `(tools.agents.openai.webhooks/verify-signature payload headers {:secret :tolerance :now-s})` / `(tools.agents.openai.webhooks/unwrap payload headers opts)` | Pure, no HTTP (`lib/_webhooks.py`). Standard Webhooks HMAC-SHA256 over `{webhook-id}.{webhook-timestamp}.{body}`; `payload` must be the raw body (String or `byte[]`). Two-sided 300 s window, `whsec_` secrets base64-decoded (others used as raw bytes), space-separated `v1,<b64>` or bare signatures, constant-time compare. Secret: `:secret` → `(:webhook-secret client)` (pass `{:client c}` in opts; `client` resolves `:webhook-secret` → `OPENAI_WEBHOOK_SECRET`, as `_client.py` does for `webhook_secret`) → `OPENAI_WEBHOOK_SECRET`. `unwrap` returns the event parsed by `read-json`. |
 | `client.realtime.client_secrets.create(**params)` | `(tools.agents.openai.realtime/realtime-client-secrets-create client params)` | `POST /realtime/client_secrets` (`resources/realtime/client_secrets.py`); `expires_after` / `session` pass through verbatim. |
@@ -312,7 +314,9 @@ Non-status error types:
 | missing credentials (client construction or a hand-built client map) | `:tools.agents.openai/missing-credentials` |
 | `:credential-source` not a `TokenSource`, or combined with `:api-key` | `:tools.agents.openai/invalid-credentials` |
 | a callable `:api-key` returned a non-string or blank value (value never included) | `:tools.agents.openai/invalid-api-key` |
-| `:stream true` requested | `:tools.agents.openai/streaming-unsupported` |
+| `:stream true` requested from a non-streaming function | `:tools.agents.openai/streaming-unsupported` |
+| while reducing a stream: an `error` event, or an event with a top-level `"error"` object (`:error` in ex-data, `:body` the raw data, `:status` nil) | `:tools.agents.openai/stream-error` |
+| while reducing a stream: the connection fails mid-body | `:tools.agents.openai/api-connection-error` |
 | request rejected before any I/O (bad `:as`; files/images: missing/unsupported file or required field; an empty file, batch, fine-tuning job, checkpoint or permission id — the SDK's `ValueError`; batches: bad `custom_id` in `batch-input-jsonl`, no result file id in `batches-results`) | `:tools.agents.openai/invalid-request` |
 | `files-wait-for-processing` gave up after `:max-wait-ms` (the SDK's `RuntimeError`; not an HTTP timeout; never retried) | `:tools.agents.openai/wait-timeout` |
 | response has no `"output"` / `"choices"` array, or an empty `"choices"`; a batch result line without a string `custom_id`, or a repeated one | `:tools.agents.openai/invalid-response` |
@@ -402,11 +406,70 @@ sleep primitive wants anyway.
 
 See [divergences.md](divergences.md) for the per-contract table across all four clients.
 
-### Streaming is not supported
+### Streaming
 
-`:stream true` throws `{:type :tools.agents.openai/streaming-unsupported}`
-immediately, before any network request, rather than being silently ignored
-or hanging. SSE streaming is simply not implemented by this client.
+```clojure
+(let [s (oai/responses-stream client {"model" "gpt-6-astra" "input" "Tell me a story"})]
+  (oai/accumulate-response-stream
+    (eduction (map (fn [e]
+                     (when (= "response.output_text.delta" (get e "type"))
+                       (print (get e "delta")) (flush))
+                     e))
+              s)))
+;; => the final Response; (oai/output-text r), (oai/stream-complete? r)
+```
+
+`responses-stream` POSTs the `responses-create` map with `"stream" true`
+(a caller's `:stream` key is replaced). Sources: the streaming guide
+(`developers.openai.com/api/docs/guides/streaming-responses`), the Responses
+streaming-events reference, and openai-python @ `d421d7a`
+(`src/openai/_streaming.py`, `lib/streaming/responses/_responses.py`).
+
+- **Opening.** The request goes out when the function is called, through
+  `request!` with `:as :stream` as `tools.agents.stream/open-event-stream`'s
+  `:send!`: per-attempt headers, the retry policy, the `:credential-source`
+  401 retry and `status->type` typing are `request!`'s. A final non-2xx or
+  connection failure throws from the call. Nothing is retried after the
+  first byte, so a retry never replays events.
+- **Events.** A single-use reducible of decoded event maps (string keys,
+  dispatch on `"type"`; all ~60 types pass through untouched), each carrying
+  its SSE frame's name and id as metadata `:tools.agents.sse/event` /
+  `:tools.agents.sse/id`. Blank `data` frames are skipped. A `data` starting
+  with `[DONE]` ends the stream without decoding (the SDK's rule for every
+  stream).
+- **Errors while reducing.** An `error` event (`{"type" "error" "code"
+  "message" "param"}`) and any event with a truthy top-level `"error"`
+  (the SDK's `APIError` rule) throw `:tools.agents.openai/stream-error`. The
+  SDK raises only for the second shape and yields the `error` event as a
+  `ResponseErrorEvent`; this client throws both. A mid-stream transport
+  failure is `api-connection-error`.
+- **Lifecycle.** Reducing closes the body (EOF, `(take n)`, exception); a
+  second reduce throws `:tools.agents.stream/consumed`. An unreduced stream
+  is released with `(tools.agents.stream/close! s)`, also the cross-thread
+  cancel. No resume: a dropped stream is not reopened.
+- **Accumulator.** `accumulate-response-event` is a pure reducing fn
+  (`[]`, `[acc]`, `[acc event]`) ported from `ResponseStreamState`. The
+  result is the `response` of the terminal event (`response.completed`,
+  `response.failed`, `response.incomplete`); a failed or incomplete
+  response is returned, not thrown, as `responses-create` returns it. If
+  that `response` has a null `output`, the `response.output_item.done`
+  items are used, as the SDK does. Without a terminal event the result is
+  assembled from `response.created`/`in_progress`/`queued`,
+  `output_item.added/done` (by `output_index`), `content_part.added/done`
+  (by `content_index`), `output_text.delta`, `refusal.delta` and
+  `function_call_arguments.delta`, with each `*.done` replacing the
+  accumulated value. `output` and message `content` are vectors, so
+  `output-text` reads partial results too.
+- **Truncation.** A stream cut off at an event boundary reduces normally and
+  `(tools.agents.stream/outcome s)` is `:eof` for complete and cut-off
+  Responses streams alike. `stream-complete?` on the accumulated result
+  (metadata set by the terminal event) is the signal; the accumulator never
+  throws on truncation.
+- **Deviations from openai-python.** A delta for an output item that was
+  never added is ignored (the SDK raises `RuntimeError`); a text delta with
+  no `content_part.added` creates an `output_text` part; no
+  `text_format`/`parsed` structured-output parsing and no `snapshot` fields
+  on delta events.
 
 ### Requiring `examples/` from the tests
 
@@ -564,8 +627,17 @@ codec's error contract, credential
 resolution, client construction, `output-text`, `completion-text`, the full
 retry policy — `parse-retry-after-ms` including HTTP-dates and leap days,
 `should-retry?`, the `retry-delay-ms` backoff curve and jitter bounds —
-message helpers, `:stream true` rejection) — zero I/O, zero network, zero
-sleeping (the clock and the RNG are injected), identical on both runtimes.
+message helpers, `:stream true` rejection, the Responses stream accumulator)
+— zero I/O, zero network, zero sleeping (the clock and the RNG are
+injected), identical on both runtimes.
+
+`test/tools/agents/openai/stream_test.cljc` drives `responses-stream`
+against the streaming mock server on OS-assigned ports (bind 0, so it never
+collides with the fixed bands below): request body and headers, incremental
+delivery, the docs-derived `openai-responses-function-call.sse` fixture,
+failed/incomplete terminal events, `error` event typing, HTTP errors and
+retries before the stream, the credential-source 401 retry, truncation,
+`[DONE]`, a mid-stream transport failure, early termination and `close!`.
 
 `test/tools/agents/openai/live_test.cljc` runs a local mock server on both
 runtimes: request line and required headers, `OpenAI-Organization` /
