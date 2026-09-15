@@ -491,17 +491,21 @@ on every test alias's extra paths in `deps.edn`, and on `bb.edn`'s global
 
 ### JSON: a small hand-rolled codec, not a dependency
 
-`write-json`/`read-json` in `tools/agents/anthropic.cljc` are a small hand-written codec in
-the same data-transparency spirit as the original Zig builtin's own recursive
-`std.json` ↔ `CljVal` conversion. It supports exactly what the Messages API
-needs (nil/bool/number/string/keyword/vector/map) and decodes JSON objects
-into maps with **string** keys (matching the original builtin's contract).
-Known gap: control characters other than `\n \r \t` and backspace/form-feed
-are not `\u00XX`-escaped on output — vanishingly rare in real message text.
+`write-json`/`read-json`/`json-key->str` in `tools/agents/anthropic.cljc` are
+thin wrappers over the repo's shared hand-written codec, `tools.agents.json`
+(see the README's "JSON: one shared hand-rolled codec" section). It is in the
+same data-transparency spirit as the original Zig builtin's own recursive
+`std.json` ↔ `CljVal` conversion, and decodes JSON objects into maps with
+**string** keys (matching the original builtin's contract). The wrappers
+throw this namespace's own `:tools.agents.anthropic.error/json-encode` /
+`json-parse` with `tools.agents.anthropic/write-json: ` /
+`tools.agents.anthropic/read-json: ` message prefixes.
 
 ## Testing
 
-`test/tools/agents/anthropic_test.cljc` is pure logic (JSON codec, credential
+The shared JSON codec itself is covered by `test/tools/agents/json_test.cljc`
+in the core suite (`-M:test-core` / `bb test-core`). `test/tools/agents/anthropic_test.cljc` is pure logic (the JSON
+codec's error contract, credential
 resolution, error typing, `output-text`, message helpers, the content-block
 DSL, tool-calling helpers, `request-with-retries!`'s count/backoff/Retry-After
 selection via a fake attempt-fn, `:stream true` rejection, client fail-fast)

@@ -34,8 +34,9 @@ column means the same code path, not a copy.
 | retry-policy visibility | decision functions private; `request-with-retries!` and `*sleep-fn*` public | `should-retry?`, `retryable-status?`, `retry-delay-ms`, `parse-retry-after-ms` public and pure; no `*sleep-fn*` | none of its own; calls openai's public functions; no `*sleep-fn*` | `retryable-status?`, `retry-delay-ms` and `*sleep-fn*` public; no `should-retry?` |
 | streaming | `:stream true` on `messages-create` throws `:tools.agents.anthropic.error/streaming-unsupported` | `:stream true` throws `:tools.agents.openai/streaming-unsupported` | a `stream` true in any request body throws `:tools.agents.openai/streaming-unsupported`; poll turns instead | no flag and no function: streaming is the separate `:streamGenerateContent` endpoint |
 
-Shared by all four: the JSON codec's algorithm (verbatim string/keyword map
-keys, no case conversion), the single runtime-specific leaf for network I/O
+Shared by all four: the JSON codec, `tools.agents.json` (verbatim
+string/keyword map keys, no case conversion; only the error `:type` keywords
+and message prefixes are per client), the single runtime-specific leaf for network I/O
 behind `#?(:bb … :clj …)`, typed `ex-info` errors with a status→`:type`
 mapping (the keyword spellings differ, see above), and the two-runtime test
 harness.

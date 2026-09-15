@@ -9,116 +9,26 @@
 ;; JSON codec
 ;; ---------------------------------------------------------------------------
 
-(defn- a-read-json-obj
-  "Wrap text as the sole string value of a JSON object and decode it — the
-   shape a real API response puts a model's reply in."
-  [text]
-  (oai/read-json (str "{\"content\":" (oai/write-json text) "}")))
+;; Codec behaviour is tested once, in tools.agents.json-test. This pins the
+;; wrapper wiring and this namespace's documented error contract.
 
-(deftest write-json-scalars
-  (is (= "null" (oai/write-json nil)))
-  (is (= "true" (oai/write-json true)))
-  (is (= "false" (oai/write-json false)))
-  (is (= "42" (oai/write-json 42)))
-  (is (= "1.5" (oai/write-json 1.5)))
-  (is (= "\"hi\"" (oai/write-json "hi")))
-  (is (= "\"hi\"" (oai/write-json :hi))))
-
-(deftest write-json-string-escaping
-  (is (= "\"a\\nb\"" (oai/write-json "a\nb")))
-  (is (= "\"a\\tb\"" (oai/write-json "a\tb")))
-  (is (= "\"a\\\"b\"" (oai/write-json "a\"b")))
-  (is (= "\"a\\\\b\"" (oai/write-json "a\\b"))))
-
-(deftest write-json-collections
-  (is (= "[1,2,3]" (oai/write-json [1 2 3])))
-  (is (= "[1,2,3]" (oai/write-json '(1 2 3))))
-  (is (contains? #{"{\"a\":1,\"b\":2}" "{\"b\":2,\"a\":1}"} (oai/write-json {:a 1 "b" 2})))
-  (is (= "{\"max_output_tokens\":10}" (oai/write-json {:max_output_tokens 10}))))
-
-(deftest write-json-rejects-unsupported
-  (is (thrown? Exception (oai/write-json (fn [])))))
-
-(deftest write-json-rejects-ratios
-  ;; A bare ratio (e.g. from ordinary integer division on JVM/bb) would
-  ;; otherwise be stringified as unquoted `n/d` — syntactically invalid JSON.
-  (let [e (try (oai/write-json {"max_output_tokens" 2/3}) nil (catch Exception e e))]
-    (is (some? e))
-    (is (= :tools.agents.openai/json-encode-error (:type (ex-data e))))))
-
-(deftest read-json-scalars
-  (is (= nil (oai/read-json "null")))
-  (is (= true (oai/read-json "true")))
-  (is (= false (oai/read-json "false")))
-  (is (= 42 (oai/read-json "42")))
-  (is (integer? (oai/read-json "42")))
-  (is (= 1.5 (oai/read-json "1.5")))
-  (is (= "hi" (oai/read-json "\"hi\""))))
-
-(deftest read-json-string-escapes
-  (is (= "a\nb" (oai/read-json "\"a\\nb\"")))
-  (is (= "a\tb" (oai/read-json "\"a\\tb\"")))
-  (is (= "a\"b" (oai/read-json "\"a\\\"b\"")))
-  (is (= "a\\b" (oai/read-json "\"a\\\\b\"")))
-  (is (= "é" (oai/read-json "\"\\u00e9\""))))
-
-(deftest read-json-collections
-  (is (= [1 2 3] (oai/read-json "[1,2,3]")))
-  (is (vector? (oai/read-json "[1,2,3]")))
-  (is (= {} (oai/read-json "{}")))
-  (is (= [] (oai/read-json "[]")))
-  (is (= {"a" 1 "b" [1 2 {"c" true}]} (oai/read-json "{\"a\":1,\"b\":[1,2,{\"c\":true}]}"))))
-
-(deftest read-json-object-keys-are-strings
-  (let [decoded (oai/read-json "{\"model\":\"x\"}")]
-    (is (= "x" (get decoded "model")))
-    (is (not (contains? decoded :model)))))
-
-(deftest read-json-roundtrip
-  (let [v {"model" "gpt-5.5" "max_output_tokens" 10
-           "input" [{"role" "user" "content" "hi"}]
-           "temperature" 1.0 "store" true "previous_response_id" nil}]
-    (is (= v (oai/read-json (oai/write-json v))))))
-
-(deftest read-json-rejects-leading-zero-numbers
-  ;; JSON's number grammar forbids a leading zero followed by more digits;
-  ;; Clojure's reader would otherwise silently misread such a token as an
-  ;; *octal* literal ("010" -> 8) if handed straight to read-string.
-  (doseq [bad ["010" "-010" "{\"input_tokens\":010}"]]
-    (testing bad
+(deftest json-codec-error-contract
+  (is (= {"a" [1 "x"]} (oai/read-json (oai/write-json {:a [1 "x"]}))))
+  (testing "every character below 0x20 is \\u00XX-escaped"
+    (is (= "\"a\\u0001b\"" (oai/write-json (str "a" (char 1) "b")))))
+  (testing "encode"
+    (let [e (try (oai/write-json {"n" 2/3}) nil (catch Exception e e))]
+      (is (= :tools.agents.openai/json-encode-error (:type (ex-data e))))
+      (is (clojure.string/starts-with? (ex-message e) "tools.agents.openai/write-json: "))))
+  (testing "parse"
+    (doseq [bad ["{bad" "010"]]
       (let [e (try (oai/read-json bad) nil (catch Exception e e))]
-        (is (some? e))
-        (is (= :tools.agents.openai/json-parse-error (:type (ex-data e))))))))
-
-(deftest read-json-handles-long-strings
-  ;; Regression: parse-string used to accumulate one piece per character and
-  ;; join them with `(apply str pieces)` — one argument per character of the
-  ;; response. Both the escape-free fast path and the escaped slow path are
-  ;; exercised here at length.
-  (doseq [n [600 5000 50000]]
-    (testing (str "plain, " n " chars")
-      (let [payload (clojure.string/join "" (repeat n "x"))]
-        (is (= payload (get (a-read-json-obj payload) "content")))))
-    (testing (str "escaped, " n " chars")
-      ;; every 10th character is an escape, so the slow path runs too
-      (let [payload (clojure.string/join "" (repeat (quot n 10) "abcdefghi\n"))]
-        (is (= payload (get (a-read-json-obj payload) "content")))))))
-
-(deftest write-json-handles-long-strings
-  (let [payload (clojure.string/join "" (repeat 50000 "x"))]
-    (is (= payload (oai/read-json (oai/write-json payload))))))
+        (is (= :tools.agents.openai/json-parse-error (:type (ex-data e))) bad)
+        (is (clojure.string/starts-with? (ex-message e) "tools.agents.openai/read-json: ") bad)))))
 
 (deftest output-text-handles-many-blocks
   (let [blocks (vec (repeat 5000 {"type" "output_text" "text" "ab"}))]
     (is (= (* 2 5000) (count (oai/output-text {"output" [{"type" "message" "content" blocks}]}))))))
-
-(deftest read-json-malformed-throws
-  (doseq [bad ["{bad" "[1,2" "\"unterminated" "not json at all" "{\"a\":}" "{\"a\" 1}"]]
-    (testing bad
-      (let [e (try (oai/read-json bad) nil (catch Exception e e))]
-        (is (some? e))
-        (is (= :tools.agents.openai/json-parse-error (:type (ex-data e))))
-        (is (clojure.string/starts-with? (str (ex-message e)) "tools.agents.openai/read-json: "))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Credential resolution (pure — env access is injected, real env untouched)

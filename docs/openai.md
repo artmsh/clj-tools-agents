@@ -285,11 +285,13 @@ every test alias's extra paths in `deps.edn`, and on `bb.edn`'s global
 
 ### JSON: a small hand-rolled codec, not a dependency
 
-`write-json`/`read-json` in `tools/agents/openai.cljc` are a small hand-written codec. It
-supports exactly what these APIs need (nil/bool/number/string/keyword/vector/
-map) and decodes JSON objects into maps with **string** keys. Known gap:
-control characters other than `\n \r \t` and backspace/form-feed are not
-`\u00XX`-escaped on output — vanishingly rare in real message text.
+`write-json`/`read-json` in `tools/agents/openai.cljc` are thin wrappers over
+the repo's shared hand-written codec, `tools.agents.json` (see the README's
+"JSON: one shared hand-rolled codec" section). It decodes JSON objects into
+maps with **string** keys. The wrappers throw this namespace's own
+`:tools.agents.openai/json-encode-error` / `json-parse-error` with
+`tools.agents.openai/write-json: ` / `tools.agents.openai/read-json: `
+message prefixes.
 
 ### Isolating runtime-specific I/O
 
@@ -322,7 +324,9 @@ both runtimes on the same wire protocol.
 
 ## Testing
 
-`test/tools/agents/openai_test.cljc` is pure logic (JSON codec, credential
+The shared JSON codec itself is covered by `test/tools/agents/json_test.cljc`
+in the core suite (`-M:test-core` / `bb test-core`). `test/tools/agents/openai_test.cljc` is pure logic (the JSON
+codec's error contract, credential
 resolution, client construction, `output-text`, `completion-text`, the full
 retry policy — `parse-retry-after-ms` including HTTP-dates and leap days,
 `should-retry?`, the `retry-delay-ms` backoff curve and jitter bounds —

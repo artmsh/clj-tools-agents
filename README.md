@@ -31,6 +31,33 @@ each follows its own vendor SDK rather than the others. docs/mcp.md's
 "The everything server, row by row" does the same for the MCP library
 against the reference `everything` server.
 
+## JSON: one shared hand-rolled codec
+
+No JSON library is available on both runtimes without adding a dependency
+(Babashka bundles one, JVM Clojure does not), so every library here uses the
+small hand-written codec in `tools.agents.json` (`src/tools/agents/json.cljc`):
+
+- `write-json` encodes nil/bool/number/string/keyword/vector/seq/map. Map keys
+  (strings, keywords or symbols) pass through **verbatim**, with no
+  kebab↔snake conversion. A ratio is rejected rather than emitted as invalid
+  `n/d`. **Every** character below 0x20 is escaped as `\u00XX`, so the output
+  is always valid JSON (RFC 8259 §7) and never contains a raw newline, which
+  MCP's stdio framing depends on.
+- `read-json` decodes objects into maps with **string** keys, arrays into
+  vectors, and keeps integers as integers. It rejects leading-zero numbers
+  (`010`), which Clojure's reader would otherwise read as octal.
+- `read-jsonl` decodes JSON Lines from a String or `java.io.Reader` into a
+  lazy seq, skipping blank lines. A parse error's message names the 1-based
+  line, and its ex-data carries `:line`.
+- `(json/codec {:prefix :encode-type :parse-type})` returns
+  `{:read :write :read-jsonl :key->str}` bound to one error contract.
+
+Each client namespace keeps its own public `write-json`/`read-json` as thin
+wrappers over a codec bound to that namespace's documented error `:type`
+keywords and `<ns>/read-json: ` / `<ns>/write-json: ` message prefixes. For
+example, `tools.agents.openai` throws `:tools.agents.openai/json-parse-error`,
+and `tools.agents.anthropic` throws `:tools.agents.anthropic.error/json-parse`.
+
 ## Usage
 
 ```clojure
@@ -108,8 +135,9 @@ Clojure (`clojure -M:test-core` / `-M:test-anthropic` / `-M:test-openai` / `-M:t
 `-M:test-mcp` / `-M:test-fusion`) and Babashka (`bb test`), and fails
 loudly if either runtime is red for any suite. Hermetic — mock servers and
 in-process loopbacks only, no outbound network. See each doc's Testing
-section for what each suite covers; the core suite (`tools.agents.sse`, the
-pure SSE parser) is documented in its ns docstring.
+section for what each suite covers; the core suite (`tools.agents.json`, the
+shared JSON codec, and `tools.agents.sse`, the pure SSE parser) is
+documented in those namespaces' docstrings.
 
 `script/live-check.sh` is OpenAI's manual, non-CI live smoke check against a
 real endpoint — see docs/openai.md's Live smoke check section.

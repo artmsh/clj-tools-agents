@@ -2,77 +2,29 @@
   "Pure logic — zero I/O, zero network, identical on JVM Clojure and
    Babashka. Mock-server / transport-level coverage lives in
    tools.agents.gemini.live-test."
-  (:require [clojure.test :refer [deftest is]]
+  (:require [clojure.test :refer [deftest is testing]]
             [tools.agents.gemini :as g]))
 
 ;; ---------------------------------------------------------------------------
 ;; JSON codec
 ;; ---------------------------------------------------------------------------
 
-(deftest write-json-scalars
-  (is (= "null" (g/write-json nil)))
-  (is (= "true" (g/write-json true)))
-  (is (= "false" (g/write-json false)))
-  (is (= "42" (g/write-json 42)))
-  (is (= "1.5" (g/write-json 1.5)))
-  (is (= "\"hi\"" (g/write-json "hi")))
-  (is (= "\"hi\"" (g/write-json :hi))))
+;; Codec behaviour is tested once, in tools.agents.json-test. This pins the
+;; wrapper wiring and this namespace's documented error contract.
 
-(deftest write-json-string-escaping
-  (is (= "\"a\\nb\"" (g/write-json "a\nb")))
-  (is (= "\"a\\tb\"" (g/write-json "a\tb")))
-  (is (= "\"a\\\"b\"" (g/write-json "a\"b")))
-  (is (= "\"a\\\\b\"" (g/write-json "a\\b"))))
-
-(deftest write-json-collections
-  (is (= "[1,2,3]" (g/write-json [1 2 3])))
-  (is (= "[1,2,3]" (g/write-json '(1 2 3))))
-  (is (contains? #{"{\"a\":1,\"b\":2}" "{\"b\":2,\"a\":1}"} (g/write-json {:a 1 "b" 2})))
-  (is (= "{\"maxOutputTokens\":10}" (g/write-json {:maxOutputTokens 10}))))
-
-(deftest write-json-rejects-unsupported
-  (is (thrown? Exception (g/write-json (fn [])))))
-
-(deftest write-json-rejects-ratios
-  (let [e (try (g/write-json {"temperature" 2/3}) nil (catch Exception e e))]
-    (is (some? e))
-    (is (= :tools.agents.gemini/json-encode-error (:type (ex-data e))))))
-
-(deftest read-json-scalars
-  (is (= nil (g/read-json "null")))
-  (is (= true (g/read-json "true")))
-  (is (= false (g/read-json "false")))
-  (is (= 42 (g/read-json "42")))
-  (is (integer? (g/read-json "42")))
-  (is (= 1.5 (g/read-json "1.5")))
-  (is (= "hi" (g/read-json "\"hi\""))))
-
-(deftest read-json-string-escapes
-  (is (= "a\nb" (g/read-json "\"a\\nb\"")))
-  (is (= "a\tb" (g/read-json "\"a\\tb\"")))
-  (is (= "a\"b" (g/read-json "\"a\\\"b\"")))
-  (is (= "a\\b" (g/read-json "\"a\\\\b\"")))
-  (is (= "é" (g/read-json "\"\\u00e9\""))))
-
-(deftest read-json-collections
-  (is (= [1 2 3] (g/read-json "[1,2,3]")))
-  (is (vector? (g/read-json "[1,2,3]")))
-  (is (= {} (g/read-json "{}")))
-  (is (= [] (g/read-json "[]")))
-  (is (= {"a" 1 "b" [1 2 {"c" true}]} (g/read-json "{\"a\":1,\"b\":[1,2,{\"c\":true}]}"))))
-
-(deftest read-json-object-keys-are-strings
-  (let [decoded (g/read-json "{\"model\":\"x\"}")]
-    (is (= "x" (get decoded "model")))
-    (is (not (contains? decoded :model)))))
-
-(deftest read-json-rejects-leading-zero-numbers
-  (is (thrown? Exception (g/read-json "010"))))
-
-(deftest read-json-malformed-throws
-  (let [e (try (g/read-json "{bad") nil (catch Exception e e))]
-    (is (some? e))
-    (is (= :tools.agents.gemini/json-parse-error (:type (ex-data e))))))
+(deftest json-codec-error-contract
+  (is (= {"a" [1 "x"]} (g/read-json (g/write-json {:a [1 "x"]}))))
+  (testing "every character below 0x20 is \\u00XX-escaped"
+    (is (= "\"a\\u0001b\"" (g/write-json (str "a" (char 1) "b")))))
+  (testing "encode"
+    (let [e (try (g/write-json {"n" 2/3}) nil (catch Exception e e))]
+      (is (= :tools.agents.gemini/json-encode-error (:type (ex-data e))))
+      (is (clojure.string/starts-with? (ex-message e) "tools.agents.gemini/write-json: "))))
+  (testing "parse"
+    (doseq [bad ["{bad" "010"]]
+      (let [e (try (g/read-json bad) nil (catch Exception e e))]
+        (is (= :tools.agents.gemini/json-parse-error (:type (ex-data e))) bad)
+        (is (clojure.string/starts-with? (ex-message e) "tools.agents.gemini/read-json: ") bad)))))
 
 ;; ---------------------------------------------------------------------------
 ;; Credential resolution

@@ -318,7 +318,7 @@ and, where the schema fixes one, `:data`.
 | `::error/unsupported-protocol-version` | `-32022` — carries `data.supported` and `data.requested` |
 | `::error/api` | A server error whose code is not one of the above |
 | `::error/protocol` | Internal marker for "this ex-data already holds the wire shape" |
-| `::error/json-parse` / `::error/json-encode` | The codec |
+| `::error/json-parse` / `::error/json-encode` | The codec (`mcp/read-json`/`write-json`, thin wrappers over the shared `tools.agents.json` — see the README's "JSON: one shared hand-rolled codec" section) |
 | `::error/invalid-registration` / `::error/duplicate-name` | `server/server` rejected a bad descriptor |
 | `::error/invalid-input-required` | `mcp/input-required` was given neither `inputRequests` nor `requestState` |
 | `::error/mrtr-exhausted` / `::error/mrtr-unsupported-method` | The client's MRTR loop hit `:max-rounds`, or the server asked for MRTR on a method that may not use it |
@@ -476,15 +476,17 @@ bb test-mcp                                     # Babashka
 ./script/test-all.sh                            # every runtime, every library
 ```
 
-The MCP suite is green on both runtimes: 186 tests / 699 assertions. So is
-the rest of `test-all.sh` — anthropic 167/424, openai 84/304 and gemini
-47/126.
+The MCP suite is green on both runtimes: 186 tests / 687 assertions. So is
+the rest of `test-all.sh` — core 49/341, anthropic 156/368, openai 154/536,
+gemini 38/97 and fusion 5/19.
 
-Six suites, hermetic — no network, no fixed ports, and the only subprocess is
-this repo's own weather server.
+Six suites, hermetic — no network, no
+fixed ports, and the only subprocess is this repo's own weather server.
 
-- **`mcp_test.cljc`** — the core namespace: the JSON codec (round trips, full
-  C0 escaping, framing safety, surrogate pairs), JSON-RPC framing, typed
+- **`mcp_test.cljc`** — the core namespace: the JSON codec's error contract
+  and framing safety (codec behaviour itself — round trips, full C0 escaping,
+  surrogate pairs, JSON Lines — is `tools.agents.json-test` in the core
+  suite), JSON-RPC framing, typed
   errors, `_meta` construction and extraction, capability helpers, content
   blocks, notifications, MRTR constructors. Opens with literal-value
   assertions on every protocol constant.
