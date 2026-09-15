@@ -10,7 +10,7 @@
             [tools.agents.gemini :as g]
             [tools.agents.sse :as sse]
             [tools.agents.stream :as stream]
-            [tools.agents.test-support :refer [start-server! start-abort-server! rotating-token-cache]]))
+            [tools.agents.test-support :refer [start-server! start-abort-server! start-stall-server! rotating-token-cache]]))
 
 (defn- free-port []
   (with-open [ss (java.net.ServerSocket. 0 50 (java.net.InetAddress/getByName "127.0.0.1"))]
@@ -34,7 +34,7 @@
 (defn- sse [json] (str "data: " json "\r\n\r\n"))
 
 (defn- with-server [handler f]
-  (let [{:keys [port stop!]} (start-server! (free-port) model-path handler)]
+  (let [{:keys [port stop!]} (start-server! 0 model-path handler)]
     (try (f (g/client {:api-key "test-key" :base-url (base-url port)}))
          (finally (stop!)))))
 
@@ -180,7 +180,7 @@
             (is (= 1 @hits) "nothing is retried once the stream has started")))))))
 
 (deftest transport-failure-mid-stream-is-a-connection-error
-  (let [{:keys [port stop!]} (start-abort-server! (free-port)
+  (let [{:keys [port stop!]} (start-abort-server! 0
                                {:headers sse-headers
                                 :chunks  [(sse (chunk-json "cut"))]})]
     (try
@@ -241,7 +241,7 @@
   (testing "401 -> invalidate -> retry with the refreshed Bearer token, outside :max-retries"
     (let [auths (atom [])
           {:keys [source fetches]} (rotating-token-cache)
-          {:keys [port stop!]} (start-server! (free-port) model-path
+          {:keys [port stop!]} (start-server! 0 model-path
                                  (fn [req]
                                    (swap! auths conj [(get (:headers req) "authorization")
                                                       (get (:headers req) "x-goog-api-key")])
@@ -259,7 +259,7 @@
   (testing "a second 401 surfaces as the typed status error"
     (let [paths (atom [])
           {:keys [source]} (rotating-token-cache)
-          {:keys [port stop!]} (start-server! (free-port) model-path
+          {:keys [port stop!]} (start-server! 0 model-path
                                  (fn [req] (swap! paths conj (:path req)) {:status 401 :body "{\"error\":{\"message\":\"nope\"}}"}))]
       (try
         (let [client (g/client {:credential-source source :base-url (base-url port) :max-retries 0})
@@ -276,3 +276,32 @@
           (let [e (try (g/generate-content-stream client "gemini-2.5-flash" {}) nil (catch Exception e e))]
             (is (= 401 (:status (ex-data e))))
             (is (= 1 @hits))))))))
+
+;; ---------------------------------------------------------------------------
+;; Timeouts against a stalling server
+;; ---------------------------------------------------------------------------
+
+(deftest a-stalled-server-times-out-is-retried-and-typed
+  (let [{:keys [port stop! accepted]} (start-stall-server! {:mode :no-headers})
+        client (g/client {:api-key "k" :base-url (base-url port) :max-retries 1 :timeout-ms 200})]
+    (try
+      (doseq [[label f] [["create" #(g/generate-content client "m" {})]
+                         ["stream" #(g/generate-content-stream client "m" {})]]]
+        (reset! accepted 0)
+        (let [e (binding [g/*sleep-fn* (fn [_])] (try (f) nil (catch Exception e e)))]
+          (is (= :tools.agents.gemini/api-connection-error (:type (ex-data e))) label)
+          (is (true? (:timeout? (ex-data e))) label)
+          (is (= 2 @accepted) (str label ": one retry"))))
+      (finally (stop!)))))
+
+(deftest a-stream-is-not-cut-by-the-request-timeout
+  (let [chunks (mapv #(sse (chunk-json %)) ["a" "b" "c" "d" "e" "f"])
+        {:keys [port stop!]} (start-stall-server! {:mode :trickle :headers sse-headers
+                                                   :chunks (conj chunks (sse (chunk-json "!" :finish "STOP")))
+                                                   :delay-ms 60})
+        client (g/client {:api-key "k" :base-url (base-url port) :timeout-ms 150})]
+    (try
+      (let [r (g/accumulate-stream (g/generate-content-stream client "m" {}))]
+        (is (g/stream-complete? r))
+        (is (= "abcdef!" (g/output-text r))))
+      (finally (stop!)))))

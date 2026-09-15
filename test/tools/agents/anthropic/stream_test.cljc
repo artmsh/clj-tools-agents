@@ -9,7 +9,7 @@
             [clojure.test :refer [deftest is testing]]
             [tools.agents.anthropic :as a]
             [tools.agents.stream :as stream]
-            [tools.agents.test-support :refer [start-server! start-abort-server! rotating-token-cache]]))
+            [tools.agents.test-support :refer [start-server! start-abort-server! start-stall-server! sse-chunks rotating-token-cache]]))
 
 (defn- free-port []
   (with-open [ss (java.net.ServerSocket. 0 50 (java.net.InetAddress/getByName "127.0.0.1"))]
@@ -55,7 +55,7 @@
 (defn- with-server
   ([handler f] (with-server {} handler f))
   ([client-opts handler f]
-   (let [{:keys [port stop!]} (start-server! (free-port) path handler)]
+   (let [{:keys [port stop!]} (start-server! 0 path handler)]
      (try (f (a/client (merge {:api-key "test-key" :base-url (base-url port)} client-opts)))
           (finally (stop!))))))
 
@@ -83,7 +83,7 @@
             (is (not (str/includes? (:body req) "test-key"))))))))
   (testing "auth token: Bearer + oauth beta combined with :betas"
     (let [captured (atom nil)
-          {:keys [port stop!]} (start-server! (free-port) path (fn [req] (reset! captured req) (ok-stream "x")))]
+          {:keys [port stop!]} (start-server! 0 path (fn [req] (reset! captured req) (ok-stream "x")))]
       (try
         (let [client (a/client {:auth-token "tok" :betas ["b1"] :base-url (base-url port)})]
           (is (= "x" (a/output-text (a/accumulate-stream (a/messages-stream client request)))))
@@ -244,7 +244,7 @@
             (is (= 1 @hits))))))))
 
 (deftest transport-failure-mid-stream-is-a-connection-error
-  (let [{:keys [port stop!]} (start-abort-server! (free-port)
+  (let [{:keys [port stop!]} (start-abort-server! 0
                                {:headers sse-headers
                                 :chunks  [(sse "message_start" start-json)]})]
     (try
@@ -307,7 +307,7 @@
   (testing "401 -> invalidate -> retry with the refreshed Bearer token, outside :max-retries"
     (let [auths (atom [])
           {:keys [source fetches]} (rotating-token-cache)
-          {:keys [port stop!]} (start-server! (free-port) path
+          {:keys [port stop!]} (start-server! 0 path
                                  (fn [req]
                                    (swap! auths conj [(get (:headers req) "authorization")
                                                       (get (:headers req) "x-api-key")
@@ -325,7 +325,7 @@
   (testing "a second 401 surfaces as the typed status error"
     (let [hits (atom 0)
           {:keys [source]} (rotating-token-cache)
-          {:keys [port stop!]} (start-server! (free-port) path
+          {:keys [port stop!]} (start-server! 0 path
                                  (fn [_] (swap! hits inc) {:status 401 :body "{\"error\":{\"message\":\"nope\"}}"}))]
       (try
         (let [client (a/client {:credential-source source :base-url (base-url port) :max-retries 0})
@@ -347,3 +347,32 @@
         e      (caught #(a/messages-create client (assoc request "stream" true)))]
     (is (= :tools.agents.anthropic.error/streaming-unsupported (:type (ex-data e))))
     (is (str/includes? (ex-message e) "messages-stream"))))
+
+;; ---------------------------------------------------------------------------
+;; Timeouts against a stalling server
+;; ---------------------------------------------------------------------------
+
+(deftest a-stalled-server-times-out-is-retried-and-typed
+  (let [{:keys [port stop! accepted]} (start-stall-server! {:mode :no-headers})
+        client (a/client {:api-key "k" :base-url (base-url port) :max-retries 1 :timeout-ms 200})
+        req    {"model" "m" "max_tokens" 1 "messages" []}]
+    (try
+      (doseq [[label f] [["create" #(a/messages-create client req)]
+                         ["stream" #(a/messages-stream client req)]]]
+        (reset! accepted 0)
+        (let [e (binding [a/*sleep-fn* (fn [_])] (try (f) nil (catch Exception e e)))]
+          (is (= :tools.agents.anthropic.error/api-connection (:type (ex-data e))) label)
+          (is (true? (:timeout? (ex-data e))) label)
+          (is (= 2 @accepted) (str label ": one retry"))))
+      (finally (stop!)))))
+
+(deftest a-stream-is-not-cut-by-the-request-timeout
+  (let [{:keys [port stop!]} (start-stall-server! {:mode :trickle :headers sse-headers
+                                                   :chunks (sse-chunks (slurp "test/resources/sse/anthropic-text.sse"))
+                                                   :delay-ms 60})
+        client (a/client {:api-key "k" :base-url (base-url port) :timeout-ms 150})]
+    (try
+      (let [m (a/accumulate-stream (a/messages-stream client {"model" "m" "max_tokens" 1 "messages" []}))]
+        (is (a/stream-complete? m))
+        (is (= "Hello!" (a/output-text m))))
+      (finally (stop!)))))

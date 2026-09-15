@@ -562,6 +562,17 @@
    Notifications POST with no expectation of a body: 202 Accepted returns
    nil. A transport failure before any response propagates unwrapped.
 
+   TIMEOUTS: `:timeout-ms` (default 600000) and `:connect-timeout-ms`
+   (default 5000), the provider clients' SDK defaults; nil disables either.
+   Every POST is `:as :stream`, so `:timeout-ms` bounds only the wait for
+   the response headers: a JSON answer's body and an SSE stream's body are
+   never timed, and a `subscriptions/listen` stream lives as long as the
+   server keeps it open, provided the server sends its headers within
+   `:timeout-ms`. (This revision has no GET stream.) A timeout throws
+   ::error/transport with :timeout? true and the HttpTimeoutException as
+   cause; other transport failures propagate unwrapped. Anything but nil
+   or a positive number throws ::error/invalid-options.
+
    `:http` replaces tools.agents.http/request! for every POST: a request fn
    with request!'s contract, called with `:as :stream` (a String or byte[]
    body is accepted in place of an InputStream). Anything but a fn throws
@@ -579,8 +590,14 @@
                           "tools.agents.http/request!'s contract, got: " (pr-str (type http)))
                      {:type :tools.agents.mcp.error/invalid-options :option :http})))
    (mcp/validate-json-option! "tools.agents.mcp.http/connect!" opts)
+   (doseq [k [:timeout-ms :connect-timeout-ms]
+           :when (and (contains? opts k) (not (http/timeout-option? (get opts k))))]
+     (throw (ex-info (str "tools.agents.mcp.http/connect!: " k " must be nil or a positive number of milliseconds, got: "
+                          (pr-str (get opts k)))
+                     {:type :tools.agents.mcp.error/invalid-options :option k})))
    (let [send-http (or http http/request!)
          codec (mcp/codec-of opts)
+         timeouts (http/timeout-opts opts)
          in-flight (atom {})          ; stream -> request id
          close-where (fn [pred]
                        (doseq [[s id] @in-flight :when (pred id)]
@@ -596,8 +613,16 @@
             (close-where #(= target %))))
         (let [tool (get tools-by-name (get-in msg ["params" "name"]))
               req-headers (merge (request-headers msg tool) headers)
-              resp (-> (send-http {:method :post :url url :headers req-headers
-                                   :body ((:write codec) msg) :as :stream})
+              resp (-> (try
+                         (send-http (merge timeouts
+                                           {:method :post :url url :headers req-headers
+                                            :body ((:write codec) msg) :as :stream}))
+                         (catch Exception e
+                           (if (http/timeout-exception? e)
+                             (throw (ex-info (str "tools.agents.mcp.http: request timed out: " (ex-message e))
+                                             {:type :tools.agents.mcp.error/transport :timeout? true :request msg}
+                                             e))
+                             (throw e))))
                        (update :body http/stream-body))
               status (:status resp)
               ctype (let [c (get (:headers resp) "content-type")]

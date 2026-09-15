@@ -111,11 +111,12 @@
    which neither httpkit nor com.sun.net.httpserver can produce (both always
    write the terminating chunk). Identical code on both runtimes.
 
-   Every connection: read the request head (the body, if any, is ignored),
+   Every connection: read the request head and drain a Content-Length body,
    write `status` and `headers` with `transfer-encoding: chunked`, write each
    String of `chunks` as one flushed chunk with `delay-ms` between them, then
    close the socket WITHOUT the terminating zero-length chunk. Returns
-   {:port port :stop! (fn [])}."
+   {:port port :stop! (fn [])}; pass port 0 for an OS-assigned port, and
+   :port is the bound one."
   [port {:keys [status headers chunks delay-ms] :or {status 200 delay-ms 0}}]
   (let [ss      (java.net.ServerSocket. port 50 (java.net.InetAddress/getByName "127.0.0.1"))
         running (atom true)]
@@ -128,7 +129,17 @@
                 (let [rdr (java.io.BufferedReader.
                            (java.io.InputStreamReader. (.getInputStream sock) "UTF-8"))
                       os  (.getOutputStream sock)]
-                  (loop [] (when (seq (.readLine rdr)) (recur)))
+                  ;; Drain the request body too: closing a socket with unread
+                  ;; input sends RST, which can discard the chunks below
+                  ;; before the client reads them.
+                  (let [len (loop [len 0]
+                              (let [line (.readLine rdr)]
+                                (if (seq line)
+                                  (recur (if-let [[_ n] (re-matches #"(?i)content-length:\s*(\d+)\s*" line)]
+                                           (parse-long n)
+                                           len))
+                                  len)))]
+                    (dotimes [_ len] (.read rdr)))
                   (.write os (chunk-bytes
                               (str "HTTP/1.1 " status " X\r\n"
                                    (apply str (map (fn [[k v]] (str k ": " v "\r\n")) headers))
@@ -142,7 +153,82 @@
                       (.flush os)
                       (when (pos? delay-ms) (Thread/sleep (long delay-ms)))))))))
           (catch java.io.IOException _ nil))))
-    {:port port :stop! (fn [] (reset! running false) (.close ss))}))
+    {:port (.getLocalPort ss) :stop! (fn [] (reset! running false) (.close ss))}))
+
+(defn start-stall-server!
+  "Raw-socket HTTP/1.1 server on an OS-assigned port that stalls, for timeout
+   tests. Identical code on both runtimes. Every connection reads the request
+   head, then by `mode`:
+
+     :no-headers  sends nothing and holds the socket open until the client
+                  closes it (or `stop!`)
+     :body        sends `status`/`headers` with `content-length` 1000 and
+                  the first byte of the body, then stalls the same way
+     :trickle     sends `status`/`headers` chunked, then each String of
+                  `chunks` as one flushed chunk `delay-ms` apart, then the
+                  terminating chunk
+
+   Returns {:port :stop! :accepted atom (connections accepted) :closed atom
+   (connections the client closed while the server stalled)}."
+  [{:keys [mode status headers chunks delay-ms] :or {status 200 delay-ms 0}}]
+  (let [ss       (java.net.ServerSocket. 0 50 (java.net.InetAddress/getByName "127.0.0.1"))
+        running  (atom true)
+        accepted (atom 0)
+        closed   (atom 0)
+        socks    (atom #{})
+        head     (fn [extra]
+                   (chunk-bytes (str "HTTP/1.1 " status " X\r\n"
+                                     (apply str (map (fn [[k v]] (str k ": " v "\r\n")) headers))
+                                     extra "\r\n")))]
+    (future
+      (while @running
+        (try
+          (let [sock (.accept ss)]
+            (swap! accepted inc)
+            (swap! socks conj sock)
+            (future
+              (try
+                (with-open [sock sock]
+                  (let [in  (.getInputStream sock)
+                        rdr (java.io.BufferedReader. (java.io.InputStreamReader. in "UTF-8"))
+                        os  (.getOutputStream sock)
+                        ;; drain (and ignore) any request body until the client closes
+                        hold! (fn [] (loop [] (if (= -1 (.read rdr)) (swap! closed inc) (recur))))]
+                    (loop [] (when (seq (.readLine rdr)) (recur)))
+                    (case mode
+                      :no-headers (hold!)
+                      :body       (do (.write os (head "content-length: 1000\r\n"))
+                                      (.write os (chunk-bytes "x"))
+                                      (.flush os)
+                                      (hold!))
+                      :trickle    (do (.write os (head "transfer-encoding: chunked\r\n"))
+                                      (.flush os)
+                                      (doseq [c chunks]
+                                        (let [bs (chunk-bytes c)]
+                                          (.write os (chunk-bytes (str (Integer/toHexString (count bs)) "\r\n")))
+                                          (.write os bs)
+                                          (.write os (chunk-bytes "\r\n"))
+                                          (.flush os)
+                                          (when (pos? delay-ms) (Thread/sleep (long delay-ms)))))
+                                      (.write os (chunk-bytes "0\r\n\r\n"))
+                                      (.flush os)
+                                      (hold!)))))
+                (catch java.io.IOException _ nil)
+                (finally (swap! socks disj sock)))))
+          (catch java.io.IOException _ nil))))
+    {:port     (.getLocalPort ss)
+     :accepted accepted
+     :closed   closed
+     :stop!    (fn []
+                 (reset! running false)
+                 (.close ss)
+                 (doseq [^java.net.Socket s @socks] (try (.close s) (catch java.io.IOException _ nil))))}))
+
+(defn sse-chunks
+  "An SSE body split after each blank line, one String per event, for
+   `start-stall-server!`'s :trickle mode."
+  [^String body]
+  (vec (remove empty? (str/split body #"(?<=\r?\n\r?\n)"))))
 
 (defn recording-http
   "A fake `:http` request fn (tools.agents.http/request!'s contract) with no

@@ -84,6 +84,7 @@ model id) is used verbatim.
 | `HttpOptions(base_url=..., api_version=...)` | `:base-url` (default `https://generativelanguage.googleapis.com`), `:api-version` (default `"v1beta"`) | Kept as two separate client fields, joined at request time, rather than one pre-concatenated base-url string — see `client`'s docstring. |
 | `client.models.generate_content_stream(model=model, contents=..., config=request)` | `(generate-content-stream client model request)` | Same `{model}:streamGenerateContent?alt=sse` path. Returns a single-use reducible of chunk maps instead of a generator; `accumulate-stream` joins them (python-genai has no joiner). See Streaming below. |
 | tenacity-backed automatic retries, `_RETRY_ATTEMPTS = 5` | `:max-retries` client opt, default 4 | Implemented — see Retries below. |
+| `HttpOptions(timeout=ms)`, default `None` (no timeout at all: httpx `timeout=None`, `_api_client.py`) | `:timeout-ms` (default 600000) and `:connect-timeout-ms` (default 5000) client opts; nil disables either; `(assoc client :timeout-ms n)` per call | **Diverges on purpose:** python-genai has no default timeout, so a stalled server hangs it forever; this library uses openai-python's and anthropic-sdk-python's 600 s / 5 s for every client. `generate-content`/`count-tokens`: a deadline on the whole response; `generate-content-stream`: on the response headers only, the body is never timed. The SDK's `X-Server-Timeout` header (sent only for a user-set timeout) is not sent. A timeout is `:api-connection-error` with `:timeout? true`, retried like any transport failure. |
 | *(no SDK equivalent)* | `:json` client opt | A `{:read :write}` codec for request bodies, responses, error bodies and stream chunks; its exceptions become `:json-parse-error`/`:json-encode-error` with the cause kept. See README, Bring your own HTTP client / JSON codec. |
 | `HttpOptions(httpx_client=...)` | `:http` client opt | A request fn with `tools.agents.http/request!`'s contract, used for every exchange, streaming included. See README, Bring your own HTTP client. |
 | `client.chats.create(...)` (multi-turn chat session object) | *(not implemented)* | A stateful wrapper over `generate_content` with local history bookkeeping; `add-user-message`/`add-model-message` below give the same history-building ergonomics without the stateful object. |
@@ -133,7 +134,7 @@ spelling, not an oversight.
 | 429 | `:tools.agents.gemini/resource-exhausted-error` | `ClientError` (429 `RESOURCE_EXHAUSTED`) |
 | ≥500 | `:tools.agents.gemini/internal-server-error` | `ServerError` |
 | other non-2xx | `:tools.agents.gemini/api-status-error` | `APIError` (the generic base) |
-| no response at all (DNS/refused/TLS/timeout) | `:tools.agents.gemini/api-connection-error` | *(python-genai has no distinct connection-error class; the underlying `httpx`/`requests` exception propagates instead)* |
+| no response at all (DNS/refused/TLS/timeout); a timeout adds `:timeout? true` | `:tools.agents.gemini/api-connection-error` | *(python-genai has no distinct connection-error class; the underlying `httpx`/`requests` exception propagates instead)* |
 
 Non-status error types:
 

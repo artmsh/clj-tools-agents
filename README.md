@@ -70,8 +70,9 @@ through it too.
 
 The fn has exactly `request!`'s contract:
 
-- it takes `{:method :url :headers :body :multipart :query :as :timeout-ms}`;
-  `:as` is `:string`, `:bytes` or `:stream`;
+- it takes `{:method :url :headers :body :multipart :query :as :timeout-ms
+  :connect-timeout-ms}`; `:as` is `:string`, `:bytes` or `:stream`; clients
+  always pass both timeout keys, nil meaning disabled (see Timeouts below);
 - it returns `{:status :headers :body}` for **any** status, with lower-cased
   header names, and throws only when no response arrives (the client types
   that as its connection error and retries it);
@@ -123,6 +124,32 @@ client's `:http`: pass it to `tools.agents.openai.credentials/workload-identity-
 and the metadata providers (`:http`), or to
 `tools.agents.anthropic.credentials` constructors (`:http-fn`). See
 [docs/divergences.md](docs/divergences.md).
+
+## Timeouts
+
+Every client defaults to the official SDKs' timeouts (openai-python and
+anthropic-sdk-python: `httpx.Timeout(timeout=600, connect=5.0)`); python-genai
+has none, and the gemini client uses the same values:
+
+| option | default | meaning |
+|---|---|---|
+| `:connect-timeout-ms` | 5000 | TCP/TLS connect timeout |
+| `:timeout-ms` | 600000 | non-streaming calls: deadline for the whole response; streams: deadline for the response **headers** only |
+
+Both are client options on `anthropic/client`, `openai/client` (every openai
+resource namespace and openai.agents), `gemini/client`,
+`mcp.http/connect!` and fusion provider specs. nil disables either. Override
+per call with `(assoc client :timeout-ms n)`; `anthropic/request!` and
+`openai/request!` also take both keys per request.
+
+A stream body is never timed, so a long SSE stream or an MCP
+`subscriptions/listen` is not cut; bound a stalled stream with
+`tools.agents.stream/close!` from a watchdog. A timeout is retried like any
+connection failure (the SDKs retry `APITimeoutError`) and surfaces as the
+client's connection-error `:type` with `:timeout? true` in `ex-data` and the
+`java.net.http.HttpTimeoutException` as cause; MCP throws
+`:tools.agents.mcp.error/transport` with `:timeout? true`. Credential token
+exchanges keep their own SDK timeouts (anthropic 30 s, openai 10 s).
 
 ## Refreshable credentials: `tools.agents.token`
 

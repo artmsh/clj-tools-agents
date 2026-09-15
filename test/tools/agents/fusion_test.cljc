@@ -108,3 +108,12 @@
         result (fusion/provider-call {:provider :anthropic :model "m" :api-key "k" :http http :json codec} "p")]
     (is (= "a" (:text result)))
     (is (= 1 @writes))))
+
+(deftest provider-timeouts-are-forwarded-to-the-client
+  (let [seen (atom [])
+        http (fn [req] (swap! seen conj ((juxt :timeout-ms :connect-timeout-ms) req))
+               {:status 200 :headers {} :body "{\"content\":[{\"type\":\"text\",\"text\":\"a\"}]}"})]
+    (fusion/provider-call {:provider :anthropic :model "m" :api-key "k" :http http} "p")
+    (fusion/provider-call {:provider :anthropic :model "m" :api-key "k" :http http
+                           :timeout-ms 1234 :connect-timeout-ms nil} "p")
+    (is (= [[600000 5000] [1234 nil]] @seen))))

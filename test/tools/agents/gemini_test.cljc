@@ -301,3 +301,39 @@
 (deftest invalid-json-option-is-rejected-at-construction
   (let [e (try (g/client {:api-key "k" :json {:read g/read-json}}) nil (catch Exception e e))]
     (is (= :tools.agents.gemini/invalid-options (:type (ex-data e))))))
+
+;; ---------------------------------------------------------------------------
+;; Default timeouts (python-genai has none; this library uses the other SDKs')
+;; ---------------------------------------------------------------------------
+
+(deftest client-timeouts-default-to-600-s-and-5-s
+  (let [c (g/client {:api-key "k"})]
+    (is (= [600000 5000] [(:timeout-ms c) (:connect-timeout-ms c)])))
+  (let [c (g/client {:api-key "k" :timeout-ms nil :connect-timeout-ms 100})]
+    (is (= [nil 100] [(:timeout-ms c) (:connect-timeout-ms c)]) "nil disables, not defaults"))
+  (doseq [[k v] [[:timeout-ms 0] [:connect-timeout-ms "5"]]]
+    (let [e (try (g/client {:api-key "k" k v}) nil (catch Exception e e))]
+      (is (= :tools.agents.gemini/invalid-options (:type (ex-data e))) (pr-str [k v]))
+      (is (= k (:option (ex-data e)))))))
+
+(deftest timeouts-reach-the-http-fn
+  (let [{:keys [http calls]} (recording-http
+                              (fn [req] {:status 200 :headers {}
+                                         :body (if (= :stream (:as req)) (input-stream "") "{}")}))
+        c (fake-client http)]
+    (g/generate-content c "m" {})
+    (g/generate-content (assoc c :timeout-ms 42 :connect-timeout-ms nil) "m" {})
+    (into [] (g/generate-content-stream (assoc c :timeout-ms 9) "m" {}))
+    (is (= [[600000 5000] [42 nil] [9 5000]]
+           (mapv (juxt :timeout-ms :connect-timeout-ms) @calls)))))
+
+(deftest a-timeout-is-retried-then-typed-as-a-timed-out-connection-error
+  (let [{:keys [http calls]} (recording-http (fn [_] (throw (java.net.http.HttpTimeoutException. "request timed out"))))
+        e (binding [g/*sleep-fn* (fn [_])]
+            (try (g/generate-content (fake-client http :max-retries 2) "m" {}) nil
+                 (catch Exception e e)))]
+    (is (= :tools.agents.gemini/api-connection-error (:type (ex-data e))))
+    (is (true? (:timeout? (ex-data e))))
+    (is (= 2 (:retries-taken (ex-data e))))
+    (is (instance? java.net.http.HttpTimeoutException (ex-cause e)))
+    (is (= 3 (count @calls)))))

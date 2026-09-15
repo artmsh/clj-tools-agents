@@ -78,6 +78,9 @@
 (s/def ::profile string?)
 (s/def ::base-url string?)
 (s/def ::max-retries (s/and int? #(>= % 0)))
+;; nil disables; see tools.agents.http/timeout-option?.
+(s/def ::timeout-ms http/timeout-option?)
+(s/def ::connect-timeout-ms http/timeout-option?)
 ;; Injected transport and codec (README, Bring your own HTTP client / JSON codec).
 (s/def ::http http/request-fn?)
 (s/def ::json json/codec-map?)
@@ -88,7 +91,7 @@
 ;; concern resolve-credentials owns, not a static shape concern this spec
 ;; should duplicate.
 (s/def ::client-opts
-  (s/keys :opt-un [::api-key ::auth-token ::credential-source ::profile ::base-url ::max-retries ::http ::json]))
+  (s/keys :opt-un [::api-key ::auth-token ::credential-source ::profile ::base-url ::max-retries ::timeout-ms ::connect-timeout-ms ::http ::json]))
 
 ;; The AnthropicClient record `client` RETURNS — unlike ::client-opts,
 ;; credential resolution has

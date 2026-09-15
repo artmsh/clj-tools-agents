@@ -268,7 +268,7 @@ header, no query string) plus Microsoft's documentation.
 | `client.with_options(max_retries=5)` | `(assoc client :max-retries 5)` | The client record is associative, so the per-call override needs no dedicated API. |
 | *(no SDK equivalent)* | `:json` client opt | A `{:read :write}` codec used by `request!` (every resource namespace and stream), `batches-results` and `webhooks/unwrap` given `:client`; its exceptions become `:json-parse-error`/`:json-encode-error` with the cause kept. `batch-input-jsonl` (no client) and workload-identity exchanges stay built-in. See README, Bring your own HTTP client / JSON codec. |
 | `OpenAI(http_client=httpx.Client(...))` | `:http` client opt | A request fn with `tools.agents.http/request!`'s contract; `request!` sends every attempt through it, so all resource namespaces, openai.agents and streaming use it. `workload-identity-source` and the Azure/GCP metadata providers take their own `:http`. See README, Bring your own HTTP client. |
-| `timeout` (default 10 min) / `APITimeoutError` | *(not implemented)* | Each runtime's HTTP leaf uses its own default timeout; a timeout surfaces as `:tools.agents.openai/api-connection-error` (which is also where Python's `APITimeoutError` sits in the hierarchy, as a subclass of `APIConnectionError`) and is retried like any other transport failure, exactly as the SDK does. |
+| `timeout` (`DEFAULT_TIMEOUT = httpx.Timeout(timeout=600, connect=5.0)`) / `APITimeoutError` | `:timeout-ms` (default 600000) and `:connect-timeout-ms` (default 5000) client opts; nil disables either; `(assoc client :timeout-ms n)` is `with_options(timeout=n)`; `request!` also takes both per request | Non-streaming calls: a deadline on the whole response. Streams: a deadline on the response headers only; the body is never timed, so a long stream is not cut (httpx's 600 s is a per-read idle timeout; the JDK has none, see [divergences](divergences.md)). A timeout surfaces as `:tools.agents.openai/api-connection-error` with `:timeout? true` and the `HttpTimeoutException` as cause (Python's `APITimeoutError` is likewise a subclass of `APIConnectionError`) and is retried like any other transport failure, exactly as the SDK does. |
 | `client.responses.create(..., stream=True)` | `(responses-stream client params)` | Single-use reducible of decoded event maps, opened (and retried) at call time through `request!`. `:stream true` on `responses-create` is still rejected. See Streaming below. |
 | `ResponseStreamState.accumulate_event` / `stream.get_final_response()` | `(accumulate-response-event acc event)` / `(accumulate-response-stream s)` + `(stream-complete? r)` | Final Response from `response.completed`/`failed`/`incomplete`; assembled from deltas when the stream is cut off. `output-text` works on both. |
 | `client.chat.completions.create(..., stream=True)` | `(chat-completions-stream client params)` | Single-use reducible of decoded `chat.completion.chunk` maps until `data: [DONE]`; same opening, retries and errors as `responses-stream`. `:stream true` on `chat-completions-create` is still rejected. |
@@ -356,7 +356,7 @@ for accessor failures) and `ex-data`
 | 429 | `:tools.agents.openai/rate-limit-error` | `RateLimitError` |
 | ≥500 | `:tools.agents.openai/internal-server-error` | `InternalServerError` |
 | other non-2xx (e.g. 408) | `:tools.agents.openai/api-status-error` | `APIStatusError` (Python has no 408 subclass either) |
-| no response at all (DNS/refused/TLS/timeout) | `:tools.agents.openai/api-connection-error` | `APIConnectionError` / `APITimeoutError` |
+| no response at all (DNS/refused/TLS/timeout); a timeout adds `:timeout? true` | `:tools.agents.openai/api-connection-error` | `APIConnectionError` / `APITimeoutError` |
 
 Non-status error types:
 
@@ -595,8 +595,16 @@ classes, so both runtimes send identical bytes. The request map:
 | `:body` | `nil`, String, `byte[]`, `File`, `Path` or `InputStream` |
 | `:multipart` | `[{:name :content :filename :content-type}]` instead of `:body`; File/Path parts stream from disk and the body keeps a Content-Length; names are sent verbatim, so `image[]` twice is two parts |
 | `:as` | `:string` (default), `:bytes` (raw `byte[]`), `:stream` (`InputStream`) |
-| `:timeout-ms` | request timeout; none by default |
-| `:client` | an `HttpClient`; defaults to one shared, lazily built client (`tools.agents.http/client` builds another, e.g. with `:connect-timeout-ms`) |
+| `:timeout-ms` | deadline in ms: the whole response for `:string`/`:bytes`, the response headers only for `:stream` (a stream body is never timed); default 600000 when the key is absent, none when nil |
+| `:connect-timeout-ms` | connect timeout in ms; default 5000 when absent, none when nil; ignored with `:client` |
+| `:client` | an `HttpClient`; defaults to one shared, lazily built client per `:connect-timeout-ms` value (`tools.agents.http/client` builds another) |
+
+The deadline is `sendAsync` plus a bounded `CompletableFuture.get`, not
+`HttpRequest.timeout`: on JDK 26 the latter also times the body read and
+closes an `:as :stream` body mid-stream, while Babashka's native image stops
+it at the headers. Expiry cancels the exchange (closing its connection) and
+throws `java.net.http.HttpTimeoutException`; `tools.agents.http/timeout-exception?`
+recognizes it anywhere in a cause chain.
 
 Response headers have lower-case names on both runtimes; a header sent once
 is a String and a header sent more than once is a vector. With `:as :stream`
@@ -679,7 +687,8 @@ exceptions; a second reduce throws `:tools.agents.stream/consumed`.
 read, which then returns what it accumulated. On JVM the value is also
 `java.io.Closeable` (`with-open`); Babashka's `reify` allows one Java
 interface only, so `close!` is the portable call. There is no read-idle
-timeout; a watchdog calling `close!` is the way to bound a stalled stream.
+timeout (a client's `:timeout-ms` bounds only the wait for the response
+headers); a watchdog calling `close!` is the way to bound a stalled stream.
 
 **Truncation is the caller's concern.** EOF without a terminal event
 reduces exactly like a complete stream, and an unterminated final event is

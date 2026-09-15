@@ -743,3 +743,43 @@
                     nil (catch Exception e e))]
          (is (= :tools.agents.openai/json-parse-error (:type (ex-data e))))
          (is (some? (ex-cause e)))))))
+
+;; ---------------------------------------------------------------------------
+;; SDK default timeouts
+;; ---------------------------------------------------------------------------
+
+(deftest client-timeouts-default-to-the-sdk-values
+  (let [c (oai/client {:api-key "k"})]
+    (is (= [600000 5000] [(:timeout-ms c) (:connect-timeout-ms c)])))
+  (let [c (oai/client {:api-key "k" :timeout-ms 1000 :connect-timeout-ms nil})]
+    (is (= [1000 nil] [(:timeout-ms c) (:connect-timeout-ms c)]) "nil disables, not defaults"))
+  (doseq [[k v] [[:timeout-ms 0] [:timeout-ms "600"] [:connect-timeout-ms -5]]]
+    (let [e (try (oai/client {:api-key "k" k v}) nil (catch Exception e e))]
+      (is (= :tools.agents.openai/invalid-options (:type (ex-data e))) (pr-str [k v]))
+      (is (= k (:option (ex-data e)))))))
+
+(deftest timeouts-reach-the-http-fn-with-client-and-per-request-overrides
+  (let [{:keys [http calls]} (recording-http
+                              (fn [req] {:status 200 :headers {}
+                                         :body (if (= :stream (:as req)) (input-stream "") "{\"output\":[]}")}))
+        c (fake-client http)]
+    (oai/responses-create c {"model" "m"})
+    (oai/responses-create (assoc c :timeout-ms 42) {"model" "m"})
+    (oai/request! c {:method :get :path "/models" :timeout-ms nil :connect-timeout-ms 7})
+    (into [] (oai/responses-stream (fake-client http :timeout-ms 9) {"model" "m"}))
+    (is (= [[600000 5000] [42 5000] [nil 7] [9 5000]]
+           (mapv (juxt :timeout-ms :connect-timeout-ms) @calls)))))
+
+(deftest a-timeout-is-retried-then-typed-as-a-timed-out-connection-error
+  (let [{:keys [http calls]} (recording-http (fn [_] (throw (java.net.http.HttpTimeoutException. "request timed out"))))
+        e (with-redefs [oai/sleep! (fn [_])]
+            (try (oai/responses-create (fake-client http :max-retries 2) {"model" "m"}) nil
+                 (catch Exception e e)))]
+    (is (= :tools.agents.openai/api-connection-error (:type (ex-data e))))
+    (is (true? (:timeout? (ex-data e))))
+    (is (= 2 (:retries-taken (ex-data e))))
+    (is (instance? java.net.http.HttpTimeoutException (ex-cause e)))
+    (is (= 3 (count @calls)) "timeouts are retried like other transport failures, as in the SDK"))
+  (let [{:keys [http]} (recording-http (fn [_] (throw (java.net.ConnectException. "refused"))))
+        e (try (oai/responses-create (fake-client http :max-retries 0) {"model" "m"}) nil (catch Exception e e))]
+    (is (not (contains? (ex-data e) :timeout?)) "only a timeout is flagged")))

@@ -254,6 +254,19 @@
                    (falls back to OPENAI_WEBHOOK_SECRET; key absent when
                    unset). An explicit `:secret` passed to verify-signature /
                    unwrap still wins.
+     :timeout-ms   request deadline in ms, default 600000 (openai-python's
+                   `DEFAULT_TIMEOUT` 600 s); nil disables it. Covers the whole
+                   response for non-streaming calls and only the wait for the
+                   response headers for streams, whose body is never timed
+                   (see tools.agents.http). `(assoc client :timeout-ms n)` is
+                   the `with_options(timeout=...)` per-call override;
+                   `request!` also takes it per request.
+     :connect-timeout-ms  connect timeout in ms, default 5000 (the SDK's
+                   `connect=5.0`); nil disables it.
+                   A timeout is a transport failure: retried like any other,
+                   then :tools.agents.openai/api-connection-error with
+                   :timeout? true. Anything but nil or a positive number
+                   throws {:type :tools.agents.openai/invalid-options}.
      :http         request fn replacing tools.agents.http/request! for every
                    exchange through this client (all resource namespaces and
                    streaming). Same contract as request!: takes its request
@@ -284,6 +297,11 @@
      (throw (ex-info (str "tools.agents.openai/client: :json must be a map {:read (fn [s]) :write (fn [v])}, got: "
                           (pr-str (:json opts)))
                      {:type :tools.agents.openai/invalid-options :option :json})))
+   (doseq [k [:timeout-ms :connect-timeout-ms]
+           :when (and (contains? opts k) (not (http/timeout-option? (get opts k))))]
+     (throw (ex-info (str "tools.agents.openai/client: " k " must be nil or a positive number of milliseconds, got: "
+                          (pr-str (get opts k)))
+                     {:type :tools.agents.openai/invalid-options :option k})))
    (let [creds (resolve-client-credentials opts getenv)
          org   (or (:organization opts) (getenv "OPENAI_ORG_ID"))
          proj  (or (:project opts) (getenv "OPENAI_PROJECT_ID"))
@@ -293,6 +311,7 @@
                       :max-retries (if (number? (:max-retries opts))
                                      (max 0 (long (:max-retries opts)))
                                      default-max-retries)}
+                     (http/timeout-opts opts)
                      creds)
         (seq org)  (assoc :organization org)
         (seq proj)    (assoc :project proj)
@@ -659,6 +678,8 @@
                  :stream (return the whole 2xx response {:status :headers
                  :body InputStream}; the caller owns and must close the body;
                  a non-2xx body is read and closed here)
+     :timeout-ms / :connect-timeout-ms
+                 per-request override of the client's values (nil disables)
 
    A `stream` true body field or multipart part throws
    :tools.agents.openai/streaming-unsupported before any network I/O, except
@@ -679,7 +700,8 @@
    401 is never retried."
   ([client req] (request! client "request!" req))
   ([client fn-name {:keys [method path query body multipart headers as]
-                    :or   {method :post as :json}}]
+                    :or   {method :post as :json}
+                    :as   req}]
    (let [label (fn-label fn-name)]
      (when-not (contains? #{:json :string :bytes :stream} as)
        (throw (ex-info (str label ": unsupported :as " (pr-str as) " — expected :json, :string, :bytes or :stream")
@@ -694,11 +716,13 @@
          (let [credential (attempt-credential label client)
                outcome    (try
                             {:resp (slurp-error-stream as ((or (:http client) http/request!)
-                                    (cond-> {:method  method
-                                             :url     url
-                                             :query   query
-                                             :headers (request-headers credential client (some? multipart) headers)
-                                             :as      (case as (:bytes :stream) as :string)}
+                                    (cond-> (http/with-timeouts
+                                             {:method  method
+                                              :url     url
+                                              :query   query
+                                              :headers (request-headers credential client (some? multipart) headers)
+                                              :as      (case as (:bytes :stream) as :string)}
+                                             client req)
                                       body-str  (assoc :body body-str)
                                       multipart (assoc :multipart multipart))))}
                             (catch Exception e
@@ -709,9 +733,12 @@
              (if (< retries-taken max-retries)
                (do (sleep! (retry-delay-ms retries-taken nil (now-ms)))
                    (recur (inc retries-taken) auth-retried?))
-               (throw (ex-info (str label ": connection failed: " (:error outcome))
-                               {:type :tools.agents.openai/api-connection-error :status nil :body nil
-                                :retries-taken retries-taken})))
+               (throw (ex-info (str label ": " (if (http/timeout-exception? (:error outcome)) "request timed out" "connection failed")
+                                    ": " (:error outcome))
+                               (cond-> {:type :tools.agents.openai/api-connection-error :status nil :body nil
+                                        :retries-taken retries-taken}
+                                 (http/timeout-exception? (:error outcome)) (assoc :timeout? true))
+                               (:error outcome))))
              (let [{:keys [status] resp-hdrs :headers resp-body :body} (:resp outcome)]
                (cond
                  (and status (>= status 200) (< status 300))

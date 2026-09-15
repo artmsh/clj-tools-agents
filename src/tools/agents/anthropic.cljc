@@ -276,6 +276,22 @@
                    documented non-negative as the contract, this just
                    enforces it on the real, non-instrumented call path).
                    See messages-create's retry note.
+     :timeout-ms   request deadline in ms, default 600000
+                   (anthropic-sdk-python's `DEFAULT_TIMEOUT` 600 s); nil
+                   disables it. Covers the whole response for non-streaming
+                   calls and only the wait for the response headers for
+                   `messages-stream`, whose body is never timed (see
+                   tools.agents.http). Override per call with
+                   `(assoc client :timeout-ms n)`, or per request in
+                   `request!`'s opts.
+     :connect-timeout-ms  connect timeout in ms, default 5000 (the SDK's
+                   `connect=5.0`); nil disables it.
+                   A timeout is a connection failure: retried, then
+                   :tools.agents.anthropic.error/api-connection with
+                   :timeout? true. Not used by the profile / workload-identity
+                   token exchanges, which keep their own 30 s timeout.
+                   Anything but nil or a positive number throws
+                   {:type :tools.agents.anthropic.error/invalid-options}.
      :http         request fn replacing tools.agents.http/request! for every
                    exchange this client makes: API calls, streaming, batches
                    and the profile / workload-identity token exchanges
@@ -308,6 +324,11 @@
                        (throw (ex-info (str "tools.agents.anthropic/client: :json must be a map "
                                             "{:read (fn [s]) :write (fn [v])}, got: " (pr-str (:json opts)))
                                        {:type :tools.agents.anthropic.error/invalid-options :option :json})))
+         _           (doseq [k [:timeout-ms :connect-timeout-ms]
+                             :when (and (contains? opts k) (not (http/timeout-option? (get opts k))))]
+                       (throw (ex-info (str "tools.agents.anthropic/client: " k " must be nil or a positive "
+                                            "number of milliseconds, got: " (pr-str (get opts k)))
+                                       {:type :tools.agents.anthropic.error/invalid-options :option k})))
          creds       (resolve-client-credentials opts getenv (or explicit default-base-url)
                                                  (or http-opt http/request!))
          ;; kwarg > ANTHROPIC_BASE_URL > profile base_url > default (_client.py:231-240,260-274)
@@ -321,6 +342,7 @@
      (map->AnthropicClient
       (cond-> (merge {:base-url base-url
                       :max-retries max-retries}
+                     (http/timeout-opts opts)
                      creds)
         (seq (:betas opts)) (assoc :betas (vec (:betas opts)))
         http-opt            (assoc :http http-opt)
@@ -564,17 +586,24 @@
    transport failure (DNS/refused/TLS/timeout — no response at all) as
    :tools.agents.anthropic.error/api-connection. caller-name (e.g.
    \"tools.agents.anthropic/messages-create\") prefixes that error's message.
+   A timeout adds :timeout? true; the transport exception is the cause.
    An already-typed tools.agents.anthropic.error/* ex-info surfaces verbatim
-   instead — those are permanent, not connection failures."
+   instead — those are permanent, not connection failures.
+
+   req gets the client's :timeout-ms / :connect-timeout-ms unless it already
+   carries them (a per-request override)."
   [client caller-name req]
   (try
-    ((or (:http client) http/request!) req)
+    ((or (:http client) http/request!) (http/with-timeouts req client req))
     (catch Exception e
       (let [data (ex-data e)]
         (if (and data (keyword? (:type data)) (= "tools.agents.anthropic.error" (namespace (:type data))))
           (throw e)
-          (throw (ex-info (str caller-name ": connection failed: " (str e))
-                           {:type :tools.agents.anthropic.error/api-connection :status nil :body nil})))))))
+          (let [timeout? (http/timeout-exception? e)]
+            (throw (ex-info (str caller-name ": " (if timeout? "request timed out" "connection failed") ": " (str e))
+                            (cond-> {:type :tools.agents.anthropic.error/api-connection :status nil :body nil}
+                              timeout? (assoc :timeout? true))
+                            e))))))))
 
 (defn- post-json!
   "POST body-str to url with headers — send-http! with :method :post."
@@ -651,10 +680,12 @@
                as metadata (request-id works on it);
                :response -> the 2xx response map {:status :headers :body} with
                :body an undecoded String
+     :timeout-ms / :connect-timeout-ms
+               per-request override of the client's values (nil disables)
 
    `content-type: application/json` is sent on bodyless requests too, as
    anthropic-sdk-python's default_headers do."
-  [client caller-name {:keys [method path query body headers as] :or {method :post as :json}}]
+  [client caller-name {:keys [method path query body headers as] :or {method :post as :json} :as opts}]
   (let [url        (api-url (:base-url client) path)
         codec      (client-codec client)
         body-str   (when (some? body) ((:write codec) body))
@@ -665,9 +696,11 @@
      (fn []
        (let [auth (auth-headers client (fn [tok] (vreset! used-token tok)))]
          (decode-or-throw! codec caller-name
-                           (send-http! client caller-name {:method method :url url :query query
-                                                    :headers (merge auth headers)
-                                                    :body body-str})
+                           (send-http! client caller-name
+                                       (merge (select-keys opts [:timeout-ms :connect-timeout-ms])
+                                              {:method method :url url :query query
+                                               :headers (merge auth headers)
+                                               :body body-str}))
                            as)))
      (when src
        {:on-unauthorized #(boolean (token/invalidate! src @used-token))}))))

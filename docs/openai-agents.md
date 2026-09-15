@@ -296,8 +296,9 @@ Contract, shared by both:
   Whether the turn ended is known only from its events: `root-turn-finished?`.
   `await-root-turn` turns an end before the root turn's terminal event into
   `:tools.agents.openai/stream-truncated` (`:outcome` in `ex-data`).
-- **No read-idle timeout.** A stalled server blocks the reduce until someone
-  calls `close!`.
+- **No read-idle timeout.** The client's `:timeout-ms` (default 600 s)
+  bounds only the wait for the response headers; once events flow, a
+  stalled server blocks the reduce until someone calls `close!`.
 
 `await-root-turn` ports the events guide's `stream_session` helper. It
 continues on `agent.session.idle` and every other event, ignores subagent
