@@ -11,9 +11,9 @@ and a typed error hierarchy matching the SDK's exception classes.
 Sibling of [tools.agents.anthropic](anthropic.md) in this same repo — same
 architecture (single leaf for network I/O, hand-rolled portable JSON codec,
 `ex-info`-with-`:type` error hierarchy, two-runtime test matrix). The
-handful of places where the two libraries deliberately behave *differently*
-are called out in "Divergences from tools.agents.anthropic" below; they all come
-from following the respective vendor SDK rather than each other.
+places where the clients deliberately behave *differently* are tabulated in
+[divergences.md](divergences.md); they all come from following the respective
+vendor SDK rather than each other.
 
 For OpenAI's separate (beta) Agents API — managed sessions/turns and
 OpenAI-hosted or self-hosted sandboxes, distinct from the Responses/Chat
@@ -189,7 +189,7 @@ tuning, on by default with `:max-retries` 2.
   `(assoc client :max-retries n)` per-call override is clamped too. This is a
   divergence from `tools.agents.anthropic`, which throws
   `:tools.agents.anthropic.error/invalid-max-retries` for every one of those —
-  see Divergences below. Consequence worth knowing if you write specs: a
+  see [divergences.md](divergences.md). Consequence worth knowing if you write specs: a
   `::max-retries` spec copied from the sibling (`(s/and int? #(>= % 0))`)
   wrongly rejects `{:max-retries -3}`, a call this library treats as legal
   and pins in its own test suite.
@@ -217,23 +217,9 @@ Delay arithmetic is integer-milliseconds throughout (the jitter numerator is
 drawn from `[751, 1000]` over 1000) — integer ms is what every runtime's
 sleep primitive wants anyway.
 
-### Divergences from tools.agents.anthropic
+### Divergences from the sibling clients
 
-Both libraries follow their own vendor SDK, so a few contracts differ on
-purpose. If you use both, these are the places not to assume symmetry:
-
-| | tools.agents.anthropic | tools.agents.openai |
-|---|---|---|
-| `:base-url` shape | host only (`https://api.anthropic.com`); library appends `/v1/messages` | **includes `/v1`** (`https://api.openai.com/v1`); library appends `/responses` |
-| no text in the response | `output-text` **throws** `:no-text-content` (never returns nil/empty) | `output-text` **returns `""`** — the documented contract of Python's `Response.output_text`. Structurally malformed responses still throw. |
-| auth | `x-api-key` **or** `Authorization: Bearer` + `anthropic-beta`, chosen by which credential resolved | always `Authorization: Bearer` |
-| 409 | folded into the generic `:api-status-error` (Anthropic's SDK has no `ConflictError`) | its own `:conflict-error` |
-| retry policy | implemented, but **not exposed** — the decision functions are private; `Retry-After` is clamped to `[0, 60]`s | implemented **and exposed** — `should-retry?`, `retryable-status?`, `retry-delay-ms`, `parse-retry-after-ms` are public and pure; `x-should-retry` and `retry-after-ms` are honored, and a `Retry-After` over 2 minutes vetoes the retry rather than being clamped |
-| invalid `:max-retries` | **throws** `:invalid-max-retries` — must be a non-negative integer | **never throws** — negatives clamp to `0`, fractions truncate, non-numbers fall back to the default `2`; see Retries above |
-
-Everything else — the JSON codec, the leaf-I/O split, `ex-info` typing style,
-message-list helpers, the `:stream true` refusal, and the two-runtime test
-harness — is intentionally identical.
+See [divergences.md](divergences.md) for the per-contract table across all four clients.
 
 ### Streaming is not supported
 

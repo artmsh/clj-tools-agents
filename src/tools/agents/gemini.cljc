@@ -7,8 +7,9 @@
 
    Sibling of tools.agents.anthropic and tools.agents.openai — same
    architecture, same two runtimes, same leaf-I/O and JSON-codec design.
-   See README's parity tables for the google-genai parity and the deliberate
-   divergences from the other two providers.
+   See docs/gemini.md 'Parity with python-genai' for the SDK parity table,
+   and docs/divergences.md for the deliberate divergences from the sibling
+   clients.
 
    Runs unmodified on JVM Clojure and Babashka. The 'client object' here is a
    `GeminiClient` record built by `client`; it retains Clojure's map-style
@@ -54,7 +55,8 @@
    confirmed to honor a server-sent `Retry-After`/`X-Should-Retry` header —
    python-genai's retry predicate is a bare status-code set with no header
    inspection found in `_api_client.py`, so none is implemented here either.
-   `should-retry?`/`retry-delay-ms` are pure, with the RNG injected.
+   `retryable-status?`/`retry-delay-ms` are pure, with the RNG injected;
+   there is no `should-retry?`, since no header input exists to decide on.
 
    JSON: there is no JSON library available on both runtimes without
    adding a dependency, so `write-json`/`read-json` below are the same small
@@ -63,12 +65,14 @@
    conversion — camelCase request/response keys like \"generationConfig\"/
    \"maxOutputTokens\" are typed exactly as the REST API expects). Known gap:
    control characters other than \\n \\r \\t and backspace/form-feed are not
-   \\u00XX-escaped on output — see README.
+   \\u00XX-escaped on output — see docs/gemini.md 'JSON: a small
+   hand-rolled codec, not a dependency'.
 
    STREAMING: not offered. The Gemini REST API's streaming variant is a
    SEPARATE endpoint (`:streamGenerateContent`), not a `:stream true` request
    flag the way anthropic/openai model it — so there is no flag to reject
-   here, only an absent function. See README's platform-limitations section."
+   here, only an absent function. See docs/gemini.md 'Streaming is not
+   supported'."
   (:require [clojure.string :as str]
             #?@(:bb [[babashka.http-client :as http]] :clj [])))
 
@@ -593,7 +597,7 @@
 
    Throws ex-info on any failure, message prefixed
    \"tools.agents.gemini/generate-content: \", ex-data
-   {:type <keyword — see the error-hierarchy table in README> :status
+   {:type <keyword — see docs/gemini.md 'Error hierarchy'> :status
    <http-status-or-nil> :body <raw-response-body-or-nil> :retries-taken
    <int>}."
   [client model request]

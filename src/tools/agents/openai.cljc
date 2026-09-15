@@ -6,9 +6,9 @@
    hierarchy).
 
    Sibling of tools.agents.anthropic — same architecture, same two runtimes,
-   same leaf-I/O and JSON-codec design. See README's parity tables for both
-   the openai-python parity and the (few) deliberate divergences from
-   tools.agents.anthropic.
+   same leaf-I/O and JSON-codec design. See docs/openai.md 'Parity with
+   openai-python' for the SDK parity table, and docs/divergences.md for the
+   deliberate divergences from the sibling clients.
 
    Runs unmodified on JVM Clojure and Babashka. The 'client object' here is an
    `OpenAIClient` record built by `client`; it retains Clojure's map-style
@@ -39,10 +39,11 @@
    with literal dict keys like \"max_output_tokens\"). Known gap: control
    characters other than \\n \\r \\t and backspace/form-feed are not
    \\u00XX-escaped on output (vanishingly rare in real message text) — see
-   README.
+   docs/openai.md 'JSON: a small hand-rolled codec, not a dependency'.
 
    STREAMING: not implemented. :stream true is rejected with a clear error
-   rather than silently ignored. See README's platform-limitations section."
+   rather than silently ignored. See docs/openai.md 'Streaming is not
+   supported'."
   (:require [clojure.string :as str]
             #?@(:bb [[babashka.http-client :as http]] :clj [])))
 
@@ -721,7 +722,7 @@
 
    Throws ex-info on any failure, message prefixed
    \"tools.agents.openai/responses-create: \", ex-data
-   {:type <keyword — see the error-hierarchy table in README> :status
+   {:type <keyword — see docs/openai.md 'Error hierarchy'> :status
    <http-status-or-nil> :body <raw-response-body-or-nil>}."
   [client request]
   (post-json! client "responses-create" "/responses" request))
@@ -757,7 +758,8 @@
    Returns \"\" when there are no output_text blocks (a reasoning-only or
    refusal-only response), matching that property's documented contract.
    NOTE this deliberately DIVERGES from tools.agents.anthropic/output-text,
-   which throws rather than ever returning an empty result — see README.
+   which throws rather than ever returning an empty result — see
+   docs/divergences.md.
 
    Structurally malformed responses still throw: a missing/non-vector
    \"output\", a \"message\" item with a non-vector \"content\", or an

@@ -25,9 +25,9 @@ one `tools.agents.*` namespace root instead of two `corevector.*` ones.
 
 Each doc covers that library's usage, full API parity table against its
 vendor SDK, error hierarchy, retries, and platform notes (streaming, HTTP
-server hosting). "Divergences from tools.agents.anthropic" in docs/openai.md
-covers the handful of places the two deliberately behave differently —
-each follows its own vendor SDK rather than the other. docs/mcp.md's
+server hosting). [docs/divergences.md](docs/divergences.md) tabulates every
+contract where the four provider clients deliberately behave differently —
+each follows its own vendor SDK rather than the others. docs/mcp.md's
 "The everything server, row by row" does the same for the MCP library
 against the reference `everything` server.
 
