@@ -199,6 +199,54 @@ Not supported: the legacy `AzureOpenAI` client shape, i.e.
 `api-version` query parameter, and the `AZURE_OPENAI_*` / `OPENAI_API_VERSION`
 env vars. Use the v1 API.
 
+### Workload Identity Federation
+
+`tools.agents.openai.credentials/workload-identity-source` ports
+openai-python's `workload_identity=` (3.14.0 @d421d7ab, `auth/_workload.py`).
+It returns a `tools.agents.token` source; pass it as `:credential-source`:
+
+```clojure
+(require '[tools.agents.openai.credentials :as creds])
+
+(oai/client
+  {:credential-source
+   (creds/workload-identity-source
+     {:identity-provider-id "idp_..."            ; identity_provider_id
+      :service-account-id   "sa_..."             ; service_account_id
+      :provider (creds/k8s-service-account-token-provider)})})
+;; other providers: (creds/gcp-id-token-provider {:audience ...}),
+;; (creds/azure-managed-identity-token-provider {:resource ... :client-id ...}),
+;; or your own {:token-type :jwt|:id :get-token (fn [] subject-token)}
+```
+
+| behaviour | openai-python | this library |
+|---|---|---|
+| config | `workload_identity={identity_provider_id, service_account_id, provider: {token_type, get_token}, refresh_buffer_seconds?}` (`_workload.py:26-43`), mutually exclusive with `api_key` (`_client.py:235-236`) | same keys, kebab-case; with `:api-key` → `invalid-credentials` |
+| env vars | none | none |
+| exchange | `POST https://auth.openai.com/oauth/token` (fixed, not `base_url`), JSON `{grant_type: urn:ietf:params:oauth:grant-type:token-exchange, subject_token, subject_token_type, identity_provider_id, service_account_id}`, 10 s timeout, no redirects (`_workload.py:355-380`) | same; `:token-exchange-url` overrides the URL (the SDK's `WorkloadIdentityAuth(token_exchange_url=)`) |
+| `subject_token_type` | `jwt` → `urn:ietf:params:oauth:token-type:jwt`, `id` → `…:id_token` (`_workload.py:20-23`) | same (`:jwt`/`:id` or the strings) |
+| response | 400/401/403 → `OAuthError` (message = `error_description`); other non-2xx → `OpenAIError`; 2xx needs a non-empty string `access_token` and numeric `expires_in` (`_workload.py:283-310`) | `:tools.agents.openai/oauth-error` `{:status :error}`; `:tools.agents.openai/token-exchange-error` `{:status}`. Neither the subject token, the access token nor the body is ever in a message or `ex-data` |
+| cache / refresh | single-flight; refresh at `expires_in - min(buffer, expires_in/2)`, buffer 1200 s (`_workload.py:227-254,325-328`) | `token-cache` with `:refresh-skew-ms` = buffer, same formula, single-flight |
+| API 401 | invalidate the token sent, retry once (`_client.py:579-589`) | `invalidate!` returns true → `request!` retries once outside `:max-retries` |
+| exchange retries | runs inside the API request's retry loop: a non-`OpenAIError` (transport failure, timeout, raw provider exception) is retried with the client's `max_retries`, then `APIConnectionError`; `OpenAIError`s are not retried (`_base_client.py:1076-1111`) | the source retries the same failures with its own `:max-retries` (default 2), then `:tools.agents.openai/api-connection-error`; typed errors are not retried |
+| providers | `k8s_service_account_token_provider` (file, default `/var/run/secrets/kubernetes.io/serviceaccount/token`), `azure_managed_identity_token_provider` (IMDS), `gcp_id_token_provider` (metadata server) (`_workload.py:78-204`) | `k8s-service-account-token-provider`, `azure-managed-identity-token-provider`, `gcp-id-token-provider`; failures → `:tools.agents.openai/subject-token-provider-error`. `:url` override instead of `http_client` |
+
+Divergences:
+- Options are validated at construction (`invalid-credentials`); the SDK
+  finds an unsupported `token_type` only at exchange time (`_workload.py:359-362`).
+- Wall clock (`System/currentTimeMillis`, or `:now-ms`) instead of
+  `time.monotonic()` (`_workload.py:271-278`).
+- The exchange's retry budget is the source's `:max-retries`, not the API
+  call's: the client asks for its token before its own retry loop. A client
+  with `:max-retries 0` still retries a failed exchange unless the source
+  also gets `:max-retries 0`; in the SDK that is one knob.
+- On a second consecutive 401 the SDK invalidates the token again
+  (`_client.py:582`, before its `retried` check); `request!` does not, so the
+  next call reuses the cached token until it expires or another 401.
+- X.509 (mTLS) workload identity (`auth/_x509.py`) is not ported.
+
+Not verified against the live `auth.openai.com`; tests use a local mock.
+
 **Not verified against a live Azure resource.** Coverage is the mock-server
 test for `examples/openai/azure.clj` (path `/openai/v1/responses`, Bearer
 header, no query string) plus Microsoft's documentation.
@@ -249,7 +297,8 @@ header, no query string) plus Microsoft's documentation.
 | `client.fine_tuning.checkpoints.permissions.create(ckpt, project_ids=)` / `.list(ckpt, after=, limit=, order=, project_id=)` / `.delete(permission_id, fine_tuned_model_checkpoint=)` | `(checkpoints-permissions-create client ckpt {"project_ids" [...]})` / `(checkpoints-permissions-list client ckpt params)` / `(checkpoints-permissions-delete client ckpt permission-id)` | `POST`/`GET /fine_tuning/checkpoints/{ckpt}/permissions`, `DELETE .../permissions/{id}` (`checkpoints/permissions.py`). Require an **admin API key**: build the client with it as `:api-key`. The checkpoint keeps its `:`s in the path, as the SDK's `path_template`. `delete` takes arguments in URL order (checkpoint first). The deprecated `permissions.retrieve` sends the same GET as `list` and is not ported separately. |
 | `client.fine_tuning.alpha.graders.run` / `.validate` | *(not implemented)* | Alpha (`POST /fine_tuning/alpha/graders/run\|validate`, `resources/fine_tuning/alpha/graders.py`); out of scope. |
 | Assistants / Realtime `connect` + `calls.*` | *(not implemented)* | Not yet ported. `request!` is the shared transport (any method, `:query`, JSON or multipart body, `:as :json`/`:string`/`:bytes`), so a new resource method is a single call. See Shared transport below. |
-| `admin_api_key` / `OPENAI_ADMIN_KEY`, Workload Identity Federation | *(not implemented)* | The credential chain here is explicit `:credential-source` → explicit `:api-key` → `OPENAI_API_KEY` → throw. Admin keys and the token exchange are not ported; the cache, per-attempt token and 401 retry they need are (`:credential-source`, see README, Refreshable credentials). The checkpoint-permission endpoints accept an admin key passed as `:api-key`. |
+| `OpenAI(workload_identity={...})`, `k8s_service_account_token_provider` / `azure_managed_identity_token_provider` / `gcp_id_token_provider` | `(client {:credential-source (tools.agents.openai.credentials/workload-identity-source {...})})`, `k8s-service-account-token-provider` / `azure-managed-identity-token-provider` / `gcp-id-token-provider` | Token exchange at `auth.openai.com/oauth/token`, cached with the 1200 s refresh buffer, 401 → re-exchange once. No env vars (the SDK has none). X.509 workload identity not ported. See Workload Identity Federation above. |
+| `admin_api_key` / `OPENAI_ADMIN_KEY` | *(not implemented)* | Dropped: the SDK sends it only on `resources/admin/organization/*` endpoints, none of which are ported. The checkpoint-permission endpoints use the normal bearer (`security={"bearer_auth": True}`), so pass an admin key as `:api-key`. |
 | Azure OpenAI v1: `OpenAI(base_url="https://<resource>.openai.azure.com/openai/v1/", api_key=...)` | `(client {:base-url "https://<resource>.openai.azure.com/openai/v1" :api-key ...})` | Works through `:base-url`; no Azure-specific code. API key, static Entra ID token or an Entra token-provider fn (callable `:api-key`), all as `Authorization: Bearer`. Not verified against a live Azure resource. See Azure OpenAI (v1 API) above. |
 | `AzureOpenAI(azure_endpoint=, azure_deployment=, api_version=)` (legacy) | *(not supported)* | Deployment path rewriting, the required `api-version` query and `AZURE_OPENAI_*` / `OPENAI_API_VERSION` env vars are not ported. Use the v1 API. |
 
@@ -259,7 +308,9 @@ Precedence, first match wins: explicit `:api-key` (a String or a zero-arg
 fn) → `OPENAI_API_KEY` env var → throw. An explicit `:credential-source` (a `tools.agents.token/TokenSource`)
 replaces this chain: its token is fetched before every attempt and sent as
 `Authorization: Bearer`; combining it with `:api-key` throws
-`invalid-credentials`. See README, Refreshable credentials.
+`invalid-credentials`. Workload identity is such a source
+(`tools.agents.openai.credentials/workload-identity-source`); nothing is
+discovered from the environment. See README, Refreshable credentials.
 
 Callable `:api-key` (openai-python 3.14.0 `api_key: str | Callable[[], str]`,
 `_client.py:164,253-255`):
@@ -314,7 +365,10 @@ Non-status error types:
 |---|---|
 | malformed request/response JSON | `:tools.agents.openai/json-encode-error` / `:tools.agents.openai/json-parse-error` |
 | missing credentials (client construction or a hand-built client map) | `:tools.agents.openai/missing-credentials` |
-| `:credential-source` not a `TokenSource`, or combined with `:api-key` | `:tools.agents.openai/invalid-credentials` |
+| `:credential-source` not a `TokenSource`, or combined with `:api-key`; invalid `workload-identity-source` options | `:tools.agents.openai/invalid-credentials` |
+| workload identity token exchange: HTTP 400/401/403 (`OAuthError`; `ex-data` `{:type :status :error}`) | `:tools.agents.openai/oauth-error` |
+| workload identity token exchange: other non-2xx, malformed 2xx body, empty subject token, `expires_in` ≤ 0 (`ex-data` `{:type :status}`, never a token) | `:tools.agents.openai/token-exchange-error` |
+| built-in subject token provider failed (k8s file, Azure IMDS, GCP metadata; `SubjectTokenProviderError`) | `:tools.agents.openai/subject-token-provider-error` |
 | a callable `:api-key` returned a non-string or blank value (value never included) | `:tools.agents.openai/invalid-api-key` |
 | `:stream true` requested from a non-streaming function | `:tools.agents.openai/streaming-unsupported` |
 | while reducing a stream: an `error` event, or an event with a top-level `"error"` object (`:error` in ex-data, `:body` the raw data, `:status` nil) | `:tools.agents.openai/stream-error` |
@@ -703,7 +757,10 @@ tests, `19391` for the Azure v1 example, and `19400`–`19405` for the
 `:string`, empty 2xx body, multipart, streaming rejection, static-key 401 not
 retried), `19350`–`19354` for `:credential-source` (401
 invalidate-and-retry, token per attempt), OS-assigned ports for callable
-`:api-key` (per-attempt calls, 401, bad return, streaming open), `19280`–`19285` for the
+`:api-key` (per-attempt calls, 401, bad return, streaming open) and for
+`tools.agents.openai.credentials` (exchange shape, refresh buffer,
+single-flight, 401 re-exchange, typed non-leaking failures, providers,
+agents, responses/chat/agents streaming opens), `19280`–`19285` for the
 `tools.agents.openai.files` tests (multipart wire format, File streamed from
 disk, list query, retrieve/delete, 404 typing, binary content round-trip,
 wait-for-processing), and `19300`–`19303` for the

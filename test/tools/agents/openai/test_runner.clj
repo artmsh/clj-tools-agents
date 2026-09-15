@@ -12,7 +12,8 @@
             tools.agents.openai.batches-test
             tools.agents.openai.fine-tuning-test
             tools.agents.openai.webhooks-test
-            tools.agents.openai.realtime-test))
+            tools.agents.openai.realtime-test
+            tools.agents.openai.credentials-test))
 
 (def suites
   ['tools.agents.openai-test
@@ -26,7 +27,8 @@
    'tools.agents.openai.batches-test
    'tools.agents.openai.fine-tuning-test
    'tools.agents.openai.webhooks-test
-   'tools.agents.openai.realtime-test])
+   'tools.agents.openai.realtime-test
+   'tools.agents.openai.credentials-test])
 
 (defn -main [& _]
   (let [{:keys [fail error]} (apply t/run-tests suites)]

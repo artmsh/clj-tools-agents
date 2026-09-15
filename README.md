@@ -103,6 +103,14 @@ openai (and so openai.agents) and gemini clients:
   `ANTHROPIC_ORGANIZATION_ID` and `ANTHROPIC_IDENTITY_TOKEN[_FILE]` when no
   static Anthropic key or token is set. See
   [docs/anthropic.md](docs/anthropic.md#workload-identity-federation).
+- **OpenAI Workload Identity Federation** (#38):
+  `tools.agents.openai.credentials/workload-identity-source` with a subject
+  token provider (`k8s-service-account-token-provider`,
+  `gcp-id-token-provider`, `azure-managed-identity-token-provider` or a fn),
+  passed explicitly as `:credential-source`; no env vars, as in the SDK.
+  Exchanges at `auth.openai.com/oauth/token`, refreshes 1200 s before expiry,
+  re-exchanges once on a 401. `admin_api_key` is still not ported. See
+  [docs/openai.md](docs/openai.md#workload-identity-federation).
 
 ## Usage
 
