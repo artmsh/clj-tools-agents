@@ -16,7 +16,7 @@ one `tools.agents.*` namespace root instead of two `corevector.*` ones.
 
 | Library | Namespace | Docs |
 |---|---|---|
-| Anthropic Messages API | `tools.agents.anthropic` (+ `.visualize`, `.spec`) | [docs/anthropic.md](docs/anthropic.md) |
+| Anthropic Messages API | `tools.agents.anthropic` (+ `.batches`, `.visualize`, `.spec`) | [docs/anthropic.md](docs/anthropic.md) |
 | OpenAI Responses & Chat Completions APIs | `tools.agents.openai` | [docs/openai.md](docs/openai.md) |
 | OpenAI Agents API (beta) — managed sessions, turns, OpenAI-hosted & self-hosted sandboxes | `tools.agents.openai.agents` | [docs/openai-agents.md](docs/openai-agents.md) |
 | Gemini Developer API | `tools.agents.gemini` | [docs/gemini.md](docs/gemini.md) |

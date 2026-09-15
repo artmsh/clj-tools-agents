@@ -9,7 +9,7 @@
    -> parse-content-block, format_json -> format-json, visualize_message ->
    visualize-message (side-effecting: prints), class `visualize` ->
    `visualizer` (a plain map holding an atom, same 'no OO here' translation
-   this library already applies to `client` — see README's parity table for
+   this library already applies to `client` — see docs/anthropic.md's parity table for
    that precedent), show_response -> show-response.
 
    NO DEPENDENCY: the Python original leans on the `rich` library (Tree,
@@ -464,7 +464,7 @@
 ;; ---------------------------------------------------------------------------
 ;; Stateful capture session — port of the Python `visualize` context-manager
 ;; class. Same translation this library already applies to `client`: a plain
-;; map (here holding an atom), not an object — see README's parity table.
+;; map (here holding an atom), not an object — see docs/anthropic.md's parity table.
 ;; ---------------------------------------------------------------------------
 
 (defn visualizer
