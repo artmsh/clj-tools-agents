@@ -75,3 +75,8 @@
     (is (= "first\nthird" (:answer result)))
     (is (= ["first" "third"] (:texts result)))
     (is (= [:a :b :c] (mapv :id (:results result))))))
+
+(deftest provider-options-forwards-credential-source
+  (let [src (Object.)]
+    (is (identical? src (:credential-source (#'fusion/provider-options {:provider :openai :credential-source src}))))
+    (is (not (contains? (#'fusion/provider-options {:provider :openai :api-key "k"}) :credential-source)))))

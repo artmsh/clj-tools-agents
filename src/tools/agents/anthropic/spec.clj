@@ -26,7 +26,8 @@
    spec-form) with no docstring slot — the explanatory comments below sit
    ABOVE each s/def rather than inside it."
   (:require [clojure.spec.alpha :as s]
-            [tools.agents.anthropic :as a]))
+            [tools.agents.anthropic :as a]
+            [tools.agents.token :as token]))
 
 ;; ---------------------------------------------------------------------------
 ;; Wire-shaped (string-keyed) helpers — NOT s/keys, see ns docstring.
@@ -71,6 +72,7 @@
 
 (s/def ::api-key string?)
 (s/def ::auth-token string?)
+(s/def ::credential-source token/token-source?)
 (s/def ::base-url string?)
 (s/def ::max-retries (s/and int? #(>= % 0)))
 
@@ -80,15 +82,15 @@
 ;; concern resolve-credentials owns, not a static shape concern this spec
 ;; should duplicate.
 (s/def ::client-opts
-  (s/keys :opt-un [::api-key ::auth-token ::base-url ::max-retries]))
+  (s/keys :opt-un [::api-key ::auth-token ::credential-source ::base-url ::max-retries]))
 
 ;; The AnthropicClient record `client` RETURNS — unlike ::client-opts,
 ;; credential resolution has
-;; already run by this point, so exactly one of :api-key/:auth-token is
-;; guaranteed present (resolve-credentials' whole contract). The xor
-;; predicate is load-bearing: `s/or` alone only enforces "at least one" (a
-;; map with BOTH keys satisfies either branch and would wrongly pass), which
-;; is weaker than "exactly one".
+;; already run by this point, so exactly one of :api-key/:auth-token/
+;; :credential-source is guaranteed present (`client`'s contract). The
+;; at-most-one predicate is load-bearing: `s/or` alone only enforces "at
+;; least one" (a map with two credential keys satisfies several branches and
+;; would wrongly pass), which is weaker than "exactly one".
 ;;
 ;; The predicate must come BEFORE the `s/or` in this `s/and`, not after:
 ;; `s/and` threads each spec's CONFORMED value into the next, and `s/or`
@@ -102,9 +104,10 @@
 ;; (still seeing the real map) works.
 (s/def ::resolved-client
   (s/and (s/keys :req-un [::base-url ::max-retries])
-         (fn [m] (not (and (:api-key m) (:auth-token m))))
+         (fn [m] (>= 1 (count (filter #(some? (get m %)) [:api-key :auth-token :credential-source]))))
          (s/or :api-key (s/keys :req-un [::api-key])
-               :auth-token (s/keys :req-un [::auth-token]))))
+               :auth-token (s/keys :req-un [::auth-token])
+               :credential-source (s/keys :req-un [::credential-source]))))
 
 ;; ---------------------------------------------------------------------------
 ;; Errors
@@ -127,6 +130,7 @@
     :tools.agents.anthropic.error/json-encode
     :tools.agents.anthropic.error/json-parse
     :tools.agents.anthropic.error/missing-credentials
+    :tools.agents.anthropic.error/invalid-credentials
     :tools.agents.anthropic.error/invalid-max-retries
     :tools.agents.anthropic.error/streaming-unsupported
     :tools.agents.anthropic.error/invalid-response

@@ -45,7 +45,8 @@
    supported'."
   (:require [clojure.string :as str]
             [tools.agents.http :as http]
-            [tools.agents.json :as json]))
+            [tools.agents.json :as json]
+            [tools.agents.token :as token]))
 
 ;; openai-python's default base_url INCLUDES the /v1 path segment (unlike
 ;; anthropic-sdk-python's host-only base_url) — endpoints are appended to it
@@ -126,6 +127,25 @@
                               "or set the OPENAI_API_KEY environment variable")
                          {:type :tools.agents.openai/missing-credentials}))))))
 
+(defn- resolve-client-credentials
+  "The full credential chain `client` uses: an explicit :credential-source,
+   else `resolve-credentials` (explicit :api-key > OPENAI_API_KEY > throw).
+   Returns {:credential-source src} or {:api-key s}. Later refreshable
+   sources (#36 workload identity, #37 callable :api-key) plug in here as
+   further steps that return {:credential-source <TokenSource>}."
+  [opts getenv-fn]
+  (if (contains? opts :credential-source)
+    (let [src (:credential-source opts)]
+      (when-not (token/token-source? src)
+        (throw (ex-info (str "tools.agents.openai/client: :credential-source must satisfy "
+                             "tools.agents.token/TokenSource, got: " (type src))
+                        {:type :tools.agents.openai/invalid-credentials})))
+      (when (some? (:api-key opts))
+        (throw (ex-info "tools.agents.openai/client: pass either :api-key or :credential-source, not both"
+                        {:type :tools.agents.openai/invalid-credentials})))
+      {:credential-source src})
+    (resolve-credentials opts getenv-fn)))
+
 (defn client
   "Build an OpenAIClient record — the 'client object' analogue of Python's
    OpenAI(...) constructor. Resolves credentials eagerly (fails fast with a
@@ -134,6 +154,13 @@
    opts:
      :api-key      explicit API key -> sent as `Authorization: Bearer <key>`
                    (falls back to OPENAI_API_KEY)
+     :credential-source  a tools.agents.token/TokenSource (e.g.
+                   `tools.agents.token/token-cache`) asked for a token before
+                   every attempt -> `Authorization: Bearer <token>`. Replaces
+                   :api-key and OPENAI_API_KEY; passing both throws
+                   {:type :tools.agents.openai/invalid-credentials}. A 401
+                   invalidates the token and retries once outside
+                   :max-retries. The key is absent from the client otherwise.
      :organization optional org id -> sent as the `OpenAI-Organization` header
                    (falls back to OPENAI_ORG_ID; header omitted entirely when
                    unset, matching the SDK's Omit() behavior)
@@ -153,7 +180,7 @@
                    unwrap still wins."
   ([] (client {}))
   ([opts]
-   (let [creds (resolve-credentials opts getenv)
+   (let [creds (resolve-client-credentials opts getenv)
          org   (or (:organization opts) (getenv "OPENAI_ORG_ID"))
          proj  (or (:project opts) (getenv "OPENAI_PROJECT_ID"))
          whsec (if (some? (:webhook-secret opts)) (:webhook-secret opts) (getenv "OPENAI_WEBHOOK_SECRET"))]
@@ -393,21 +420,29 @@
   [fn-name]
   (if (str/includes? (str fn-name) "/") (str fn-name) (str "tools.agents.openai/" fn-name)))
 
+(defn- attempt-credential
+  "The bearer credential for ONE attempt: a token from the client's
+   :credential-source (fetched or refreshed as needed; a fetch failure
+   propagates untyped, never retried as a connection error), else :api-key."
+  [label client]
+  (if-let [src (:credential-source client)]
+    (token/token! src)
+    (or (:api-key client)
+        (throw (ex-info (str label ": client has no :api-key — build it via "
+                             "tools.agents.openai/client")
+                        {:type :tools.agents.openai/missing-credentials})))))
+
 (defn- request-headers
   "Headers for ONE attempt. `request!` calls this before every attempt and
    never reuses a previous attempt's map, so credentials that change between
-   attempts (a refreshed token, #34) land on the retry. `extra` is merged
+   attempts (a refreshed token) land on the retry. `extra` is merged
    last and may override any default."
-  [label client multipart? extra]
-  (when-not (:api-key client)
-    (throw (ex-info (str label ": client has no :api-key — build it via "
-                          "tools.agents.openai/client")
-                     {:type :tools.agents.openai/missing-credentials})))
+  [credential client multipart? extra]
   ;; OpenAI-Organization / OpenAI-Project must be ABSENT (not empty-valued)
   ;; when unset — the SDK emits Omit() for them. cond->, never assoc-of-nil.
   ;; A multipart body gets its content-type (with boundary) from
   ;; tools.agents.http/request!, so the JSON one is not set there.
-  (merge (cond-> {"authorization" (str "Bearer " (:api-key client))}
+  (merge (cond-> {"authorization" (str "Bearer " credential)}
            (not multipart?)             (assoc "content-type" "application/json")
            (seq (:organization client)) (assoc "openai-organization" (:organization client))
            (seq (:project client))      (assoc "openai-project" (:project client)))
@@ -445,16 +480,16 @@
     (if (number? n) (max 0 (long n)) default-max-retries)))
 
 (defn- invalidate-credentials!
-  "SEAM FOR #34 (refreshable credentials). NOT ACTIVE YET.
-
-   `request!` calls this on a 401, at most once per call. Returning true
-   means the cached credential was invalidated and the next `request-headers`
-   call will produce a fresh one; `request!` then retries once, OUTSIDE the
-   :max-retries budget (credentials plan §4-5). Static :api-key credentials
-   have nothing to refresh, so this returns false and a 401 surfaces at once
-   as :tools.agents.openai/authentication-error, as before."
-  [_client]
-  false)
+  "`request!` calls this on a 401, at most once per call, with the credential
+   that attempt sent. True means the client's :credential-source dropped that
+   token and the next attempt may get a fresh one; `request!` then retries
+   once, OUTSIDE the :max-retries budget. Static :api-key credentials have
+   nothing to refresh, so this returns false and a 401 surfaces at once as
+   :tools.agents.openai/authentication-error."
+  [client used-credential]
+  (if-let [src (:credential-source client)]
+    (boolean (token/invalidate! src used-credential))
+    false))
 
 (defn- body->string
   "A response body as a String: `:as :bytes` yields byte[], the rest a String."
@@ -507,9 +542,9 @@
      - malformed 2xx JSON: :tools.agents.openai/json-parse-error, not retried
        (the SDK decodes after its retry loop)
 
-   401 SEAM (#34): on a 401 the loop asks `invalidate-credentials!` once and,
-   if it reports an invalidated credential, retries once outside :max-retries.
-   It reports false today, so a 401 is never retried."
+   401: with a :credential-source client, the first 401 invalidates the token
+   that attempt sent and retries once, outside :max-retries and without
+   backoff; a second 401 throws. A static :api-key 401 is never retried."
   ([client req] (request! client "request!" req))
   ([client fn-name {:keys [method path query body multipart headers as]
                     :or   {method :post as :json}}]
@@ -523,17 +558,18 @@
            max-retries (resolve-max-retries client)]
        (loop [retries-taken 0
               auth-retried? false]
-         (let [outcome (try
-                         {:resp (http/request!
-                                 (cond-> {:method  method
-                                          :url     url
-                                          :query   query
-                                          :headers (request-headers label client (some? multipart) headers)
-                                          :as      (if (= as :bytes) :bytes :string)}
-                                   body-str  (assoc :body body-str)
-                                   multipart (assoc :multipart multipart)))}
-                         (catch Exception e
-                           (if (own-error? e) (throw e) {:error e})))]
+         (let [credential (attempt-credential label client)
+               outcome    (try
+                            {:resp (http/request!
+                                    (cond-> {:method  method
+                                             :url     url
+                                             :query   query
+                                             :headers (request-headers credential client (some? multipart) headers)
+                                             :as      (if (= as :bytes) :bytes :string)}
+                                      body-str  (assoc :body body-str)
+                                      multipart (assoc :multipart multipart)))}
+                            (catch Exception e
+                              (if (own-error? e) (throw e) {:error e})))]
            (if (:error outcome)
              ;; No response at all: DNS, connection refused, TLS handshake,
              ;; timeout. The SDK retries these without consulting _should_retry.
@@ -548,7 +584,7 @@
                  (and status (>= status 200) (< status 300))
                  (decode-success as resp-body)
 
-                 (and (= status 401) (not auth-retried?) (invalidate-credentials! client))
+                 (and (= status 401) (not auth-retried?) (invalidate-credentials! client credential))
                  (recur retries-taken true)
 
                  (and (< retries-taken max-retries) (should-retry? status resp-hdrs (now-ms)))

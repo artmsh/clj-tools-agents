@@ -34,7 +34,9 @@
    env var -> throw (same precedence and same two env vars as python-genai's
    `get_env_api_key`, which logs a warning and prefers GOOGLE_API_KEY when
    both are set — this library just picks GOOGLE_API_KEY silently, since the
-   two runtimes share no common logging facility).
+   two runtimes share no common logging facility). A :credential-source
+   (tools.agents.token/TokenSource, e.g. an OAuth access-token cache) is sent
+   as `Authorization: Bearer <token>` instead, fetched per attempt.
 
    URL SHAPE: unlike anthropic/openai, the model is part of the URL path, not
    the request body — `client.models.generate_content(model=\"gemini-2.5-
@@ -82,7 +84,8 @@
   (:require [clojure.string :as str]
             [tools.agents.http :as http]
             [tools.agents.json :as json]
-            [tools.agents.stream :as stream]))
+            [tools.agents.stream :as stream]
+            [tools.agents.token :as token]))
 
 ;; python-genai's HttpOptions defaults (Gemini Developer API, not Vertex):
 ;; base_url = 'https://generativelanguage.googleapis.com/', api_version =
@@ -171,6 +174,23 @@
                                     "or set the GOOGLE_API_KEY or GEMINI_API_KEY environment variable")
                                {:type :tools.agents.gemini/missing-credentials}))))))
 
+(defn- resolve-client-credentials
+  "The full credential chain `client` uses: an explicit :credential-source,
+   else `resolve-credentials`. Returns {:credential-source src} or
+   {:api-key s}; further refreshable sources plug in here."
+  [opts getenv-fn]
+  (if (contains? opts :credential-source)
+    (let [src (:credential-source opts)]
+      (when-not (token/token-source? src)
+        (throw (ex-info (str "tools.agents.gemini/client: :credential-source must satisfy "
+                             "tools.agents.token/TokenSource, got: " (type src))
+                        {:type :tools.agents.gemini/invalid-credentials})))
+      (when (some? (:api-key opts))
+        (throw (ex-info "tools.agents.gemini/client: pass either :api-key or :credential-source, not both"
+                        {:type :tools.agents.gemini/invalid-credentials})))
+      {:credential-source src})
+    (resolve-credentials opts getenv-fn)))
+
 (defn client
   "Build a GeminiClient record — the 'client object' analogue of Python's
    genai.Client(api_key=...) constructor. Resolves credentials eagerly (fails
@@ -179,6 +199,13 @@
    opts:
      :api-key      explicit API key -> sent as the `x-goog-api-key` header
                    (falls back to GOOGLE_API_KEY, then GEMINI_API_KEY)
+     :credential-source  a tools.agents.token/TokenSource asked for a token
+                   before every attempt -> `Authorization: Bearer <token>`
+                   (e.g. an OAuth access token). Replaces :api-key and the
+                   env vars; passing both throws
+                   {:type :tools.agents.gemini/invalid-credentials}. A 401
+                   invalidates the token and retries once outside
+                   :max-retries.
      :base-url     override API root, default
                    `https://generativelanguage.googleapis.com` (also resolved
                    from GOOGLE_GEMINI_BASE_URL — not an official env var name,
@@ -190,7 +217,7 @@
                    (`default-max-retries`). 0 disables retries."
   ([] (client {}))
   ([opts]
-   (let [creds (resolve-credentials opts getenv)]
+   (let [creds (resolve-client-credentials opts getenv)]
      (map->GeminiClient
       (merge {:base-url    (or (:base-url opts) (getenv "GOOGLE_GEMINI_BASE_URL") default-base-url)
               :api-version (or (:api-version opts) default-api-version)
@@ -290,13 +317,23 @@
   (let [base (if (str/ends-with? base-url "/") (subs base-url 0 (dec (count base-url))) base-url)]
     (str base "/" api-version "/" (model-path model) ":" method)))
 
-(defn- request-headers [fn-name client]
-  (when-not (:api-key client)
-    (throw (ex-info (str "tools.agents.gemini/" fn-name ": client has no :api-key — build it via "
-                          "tools.agents.gemini/client")
-                     {:type :tools.agents.gemini/missing-credentials})))
-  {"x-goog-api-key" (:api-key client)
-   "content-type"   "application/json"})
+(defn- request-headers
+  "Headers for ONE attempt, plus the token they carry (nil for a static key):
+   [headers used-token]. A :credential-source fetch failure propagates as-is."
+  [fn-name client]
+  (if-let [src (:credential-source client)]
+    (let [tok (token/token! src)]
+      [{"authorization" (str "Bearer " tok)
+        "content-type"  "application/json"}
+       tok])
+    (do
+      (when-not (:api-key client)
+        (throw (ex-info (str "tools.agents.gemini/" fn-name ": client has no :api-key — build it via "
+                             "tools.agents.gemini/client")
+                        {:type :tools.agents.gemini/missing-credentials})))
+      [{"x-goog-api-key" (:api-key client)
+        "content-type"   "application/json"}
+       nil])))
 
 (defn- own-error?
   "True for an already-typed tools.agents.gemini/* ex-info — an SDK-side
@@ -331,18 +368,22 @@
 
    Non-retryable failures, and retryable ones once the budget is spent, throw
    with :retries-taken in ex-data. A malformed body on an otherwise-successful
-   2xx is NOT retried."
+   2xx is NOT retried. A :credential-source client's first 401 invalidates
+   the token it sent and retries once outside the budget; a static key's 401
+   is never retried."
   [client fn-name model method request]
   (let [url         (endpoint-url client model method)
         body-str    (write-json request)
         max-retries (resolve-max-retries client)]
-    (loop [retries-taken 0]
+    (loop [retries-taken 0
+           auth-retried? false]
       ;; Headers are rebuilt on every attempt, so credentials that change
-      ;; between attempts (a refreshed token) land on the retry. The typed
-      ;; :missing-credentials throw passes through own-error?.
-      (let [outcome (try
+      ;; between attempts (a refreshed token) land on the retry. Built outside
+      ;; the try: a token fetch failure is not a connection failure.
+      (let [[headers used-token] (request-headers fn-name client)
+            outcome (try
                       {:resp (http/request! {:method :post :url url
-                                             :headers (request-headers fn-name client)
+                                             :headers headers
                                              :body body-str})}
                       (catch Exception e
                         (if (own-error? e) (throw e) {:error e})))]
@@ -351,19 +392,27 @@
           ;; timeout. Retried the same as a retryable status.
           (if (< retries-taken max-retries)
             (do (*sleep-fn* (retry-delay-ms retries-taken))
-                (recur (inc retries-taken)))
+                (recur (inc retries-taken) auth-retried?))
             (throw (ex-info (str "tools.agents.gemini/" fn-name ": connection failed: " (str (:error outcome)))
                              {:type :tools.agents.gemini/api-connection-error :status nil :body nil
                               :retries-taken retries-taken})))
           (let [resp      (:resp outcome)
                 status    (:status resp)
                 resp-body (:body resp)]
-            (if (and status (>= status 200) (< status 300))
+            (cond
+              (and status (>= status 200) (< status 300))
               (read-json resp-body)
-              (if (and (< retries-taken max-retries) (retryable-status? status))
-                (do (*sleep-fn* (retry-delay-ms retries-taken))
-                    (recur (inc retries-taken)))
-                (throw (http-status-error fn-name status resp-body retries-taken))))))))))
+
+              (and (= status 401) (not auth-retried?) (:credential-source client)
+                   (token/invalidate! (:credential-source client) used-token))
+              (recur retries-taken true)
+
+              (and (< retries-taken max-retries) (retryable-status? status))
+              (do (*sleep-fn* (retry-delay-ms retries-taken))
+                  (recur (inc retries-taken) auth-retried?))
+
+              :else
+              (throw (http-status-error fn-name status resp-body retries-taken)))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Public API — resource methods
@@ -461,30 +510,44 @@
   (let [fn-name     "generate-content-stream"
         url         (str (endpoint-url client model "streamGenerateContent") "?alt=sse")
         body-str    (write-json request)
-        headers     (request-headers fn-name client)
         max-retries (resolve-max-retries client)
         retries     (atom 0)
+        ;; Headers for the attempt about to run, set by open! before each
+        ;; (attempt) and read by send!, so a refreshed token lands on retries.
+        headers     (volatile! nil)
         backoff!    (fn [n] (*sleep-fn* (retry-delay-ms n)) (swap! retries inc))
         open!       (fn [attempt]
-                      (loop []
-                        (let [n       @retries
+                      (loop [auth-retried? false]
+                        ;; Outside the try: a token fetch failure is not a
+                        ;; connection failure.
+                        (let [[hs used-token] (request-headers fn-name client)
+                              _       (vreset! headers hs)
+                              n       @retries
                               outcome (try {:resp (attempt)}
                                            (catch Exception e
                                              (if (own-error? e) (throw e) {:error e})))]
                           (if-let [e (:error outcome)]
                             (if (< n max-retries)
-                              (do (backoff! n) (recur))
+                              (do (backoff! n) (recur auth-retried?))
                               (throw (ex-info (str "tools.agents.gemini/" fn-name ": connection failed: " e)
                                               {:type :tools.agents.gemini/api-connection-error :status nil
                                                :body nil :retries-taken n})))
                             (let [status (:status (:resp outcome))]
-                              (if (and (not (and status (<= 200 status 299)))
-                                       (retryable-status? status)
-                                       (< n max-retries))
-                                (do (backoff! n) (recur))
+                              (cond
+                                (and (= status 401) (not auth-retried?) (:credential-source client)
+                                     (token/invalidate! (:credential-source client) used-token))
+                                (recur true)
+
+                                (and (not (and status (<= 200 status 299)))
+                                     (retryable-status? status)
+                                     (< n max-retries))
+                                (do (backoff! n) (recur auth-retried?))
+
+                                :else
                                 (:resp outcome)))))))]
     (stream/open-event-stream
-     {:request       {:method :post :url url :headers headers :body body-str}
+     {:request       {:method :post :url url :body body-str}
+      :send!         (fn [req] (http/request! (assoc req :headers @headers)))
       :open!         open!
       :on-error      (fn [{:keys [status body]}]
                        (throw (http-status-error fn-name status body @retries)))

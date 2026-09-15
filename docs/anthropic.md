@@ -65,7 +65,7 @@ Programmatic Tool Calling below.
 | `client.messages.stream(...)` / `stream=True` | **rejected outright** | Not resolved — this is  an open TODO. |
 | `client.messages.count_tokens(...)` | `(count-tokens client request)` | **Resolved, implemented** — same request shape as `messages-create` minus `max_tokens`, same retry policy and error hierarchy, POSTs to `/v1/messages/count_tokens`. |
 | `client.messages.batches.create/retrieve/list/cancel/delete/results` | `tools.agents.anthropic.batches`: `batches-create`, `batches-retrieve`, `batches-list` (+ `next-page-params`, `batches-list-all`), `batches-cancel`, `batches-delete`, `batches-results` | **Resolved, implemented.** Same client, retries and error typing as `messages-create`. SDK deviations (no pre-flight `retrieve` in `results`, no `workspace_id`/`user_profile_id` kwargs, results buffered then decoded lazily) are listed in Message Batches below. |
-| Workload Identity Federation / `ant auth login` OAuth profile / `ANTHROPIC_PROFILE` | *(not implemented)* | The credential chain here is explicit-arg → `ANTHROPIC_API_KEY` → `ANTHROPIC_AUTH_TOKEN` → throw. The Python SDK's fuller chain (OAuth profile, WIF env vars, default disk profile) is out of scope. |
+| Workload Identity Federation / `ant auth login` OAuth profile / `ANTHROPIC_PROFILE` | *(not implemented)* | The credential chain here is explicit `:credential-source` → explicit-arg → `ANTHROPIC_API_KEY` → `ANTHROPIC_AUTH_TOKEN` → throw. The Python SDK's fuller chain (OAuth profile, WIF env vars, default disk profile) is not ported; the refresh machinery it needs (token cache, per-attempt token, 401 invalidate-and-retry) is, as `:credential-source`. See README, Refreshable credentials. |
 | `tools=[...]` / manual `tool_use`/`tool_result` handling | `"tools"` passes straight through `messages-create`; `tool-use?`/`tool-calls`/`add-tool-results`/`add-tool-result` add the response-side/reply-side ergonomics | **New.** See Tool calling below. |
 | `client.beta.messages.create(..., betas=[...])` (Programmatic Tool Calling and other beta features) | `:betas` client opt → comma-joined `anthropic-beta` header | **New.** See Credential resolution below and Programmatic Tool Calling below. |
 | `message._request_id` | `(request-id response)` | **Resolved.** The Python SDK hangs this off a hidden attribute on the response object; `messages-create`/`count-tokens` return a plain map, verbatim, per the data-transparency contract above — so the `request-id` response header is carried as Clojure metadata on that same map instead (out of the way of equality, printing, and JSON re-encoding) and `request-id` reads it back. Returns `nil` for a hand-built map or a response genuinely missing the header. For most logging/correlation purposes the response body's own `"id"` field (`msg_...`) needs no accessor and works just as well. |
@@ -74,6 +74,9 @@ Programmatic Tool Calling below.
 
 Precedence, first match wins: explicit `:api-key` → explicit `:auth-token` →
 `ANTHROPIC_API_KEY` env var → `ANTHROPIC_AUTH_TOKEN` env var → throw.
+An explicit `:credential-source` replaces this chain (combining it with
+`:api-key`/`:auth-token` throws `invalid-credentials`); `resolve-credentials`
+itself is unchanged.
 
 - `:api-key` / `ANTHROPIC_API_KEY` → sent as the `x-api-key` header (the
   standard API-key auth path).
@@ -81,6 +84,10 @@ Precedence, first match wins: explicit `:api-key` → explicit `:auth-token` →
   <token>` — **not** `x-api-key`. This is the OAuth/bearer-token path, and it
   additionally requires the `anthropic-beta: oauth-2025-04-20` header, which
   `messages-create` sets automatically whenever `:auth-token` is used.
+- `:credential-source` (a `tools.agents.token/TokenSource`) → the same
+  Bearer + `oauth-2025-04-20` headers, with the token fetched before every
+  attempt. A 401 invalidates it and retries once outside `:max-retries`.
+  See README, Refreshable credentials.
 - Every request also sends `anthropic-version: 2023-06-01` and
   `content-type: application/json`.
 - `:base-url` defaults to `https://api.anthropic.com` (also resolvable from
@@ -136,7 +143,10 @@ silently failing to parse and falling back to the shorter computed backoff.
 
 Permanent failures — `:streaming-unsupported` and
 any other non-retryable 4xx (400/401/403/404/422) — are never retried and
-never sleep, regardless of `:max-retries`.
+never sleep, regardless of `:max-retries`. One exception: a
+`:credential-source` client's first 401 invalidates the token and retries
+once, immediately and outside `:max-retries`
+(`request-with-retries!`'s 3-arity `{:on-unauthorized f}`).
 
 ```clojure
 (a/client {:api-key "..." :max-retries 5})   ;; more persistent
@@ -189,6 +199,7 @@ for those functions' own failures) and `ex-data` `{:type <keyword> :status
 | malformed request/response JSON | `:tools.agents.anthropic.error/json-encode` / `:tools.agents.anthropic.error/json-parse` |
 | empty or non-string message batch id (`tools.agents.anthropic.batches`, before any request) | `:tools.agents.anthropic.error/invalid-argument` |
 | missing credentials (client construction) | `:tools.agents.anthropic.error/missing-credentials` |
+| `:credential-source` not a `TokenSource`, or combined with `:api-key`/`:auth-token` | `:tools.agents.anthropic.error/invalid-credentials` |
 | `:max-retries` is not a non-negative integer (client construction) | `:tools.agents.anthropic.error/invalid-max-retries` |
 | `:stream true` requested | `:tools.agents.anthropic.error/streaming-unsupported` |
 | response has no `"content"` array | `:tools.agents.anthropic.error/invalid-response` |

@@ -58,6 +58,42 @@ keywords and `<ns>/read-json: ` / `<ns>/write-json: ` message prefixes. For
 example, `tools.agents.openai` throws `:tools.agents.openai/json-parse-error`,
 and `tools.agents.anthropic` throws `:tools.agents.anthropic.error/json-parse`.
 
+## Refreshable credentials: `tools.agents.token`
+
+Static keys (`:api-key`, `:auth-token`) are resolved once by `client`. A
+token that expires goes in `:credential-source` instead, on the anthropic,
+openai (and so openai.agents) and gemini clients:
+
+```clojure
+(require '[tools.agents.token :as token])
+
+(def src (token/token-cache {:fetch! (fn [] {:token (exchange!) :expires-at epoch-ms})
+                             :refresh-skew-ms 60000}))
+(oai/client {:credential-source src})
+```
+
+- The client calls `(token/token! src)` before **every** attempt, retries
+  included. The body is still encoded once.
+- `token-cache` returns the cached token until `expires-at` minus the skew
+  (capped at half the token's lifetime); `nil` `:expires-at` never expires.
+  Refresh is single-flight: concurrent callers share one in-flight `fetch!`.
+  A failed fetch throws to every waiter and leaves nothing cached, so the
+  next call fetches again. Fetch failures propagate as-is; they are not
+  retried as connection errors.
+- On a 401 the client calls `(token/invalidate! src used-token)` and retries
+  **once**, outside `:max-retries` and without backoff. A second 401 throws
+  the usual authentication error. Static keys never retry a 401.
+- `:credential-source` replaces `:api-key`/`:auth-token` and the env vars;
+  combining them throws `invalid-credentials` (per-client `:type`).
+  Anthropic sends the token as `Authorization: Bearer` plus
+  `anthropic-beta: oauth-2025-04-20`, openai as `Authorization: Bearer`,
+  gemini as `Authorization: Bearer` instead of `x-goog-api-key`.
+- **Extension point.** Anything satisfying the `tools.agents.token/TokenSource`
+  protocol (`-token`, `-invalidate`) is accepted. Workload identity, profile
+  files and callable keys (#35–#38) are constructors returning a source,
+  wired into each client's private `resolve-client-credentials`; the public
+  `resolve-credentials` functions are unchanged.
+
 ## Usage
 
 ```clojure

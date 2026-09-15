@@ -27,7 +27,8 @@
    not supported\"."
   (:require [clojure.string :as str]
             [tools.agents.http :as http]
-            [tools.agents.json :as json]))
+            [tools.agents.json :as json]
+            [tools.agents.token :as token]))
 
 (def default-base-url "https://api.anthropic.com")
 (def ^:private anthropic-version "2023-06-01")
@@ -38,7 +39,8 @@
 (def default-max-retries 2)
 
 ;; Only keys present on every resolved client are record fields. Credentials
-;; are mutually exclusive and :betas is optional, so map->AnthropicClient keeps
+;; (:api-key, :auth-token or :credential-source) are mutually exclusive and
+;; :betas is optional, so map->AnthropicClient keeps
 ;; them in the record's extension map and preserves the old `contains?` shape.
 (defrecord AnthropicClient [base-url max-retries])
 
@@ -121,6 +123,27 @@
                               ":auth-token, or set the ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN env var")
                          {:type :tools.agents.anthropic.error/missing-credentials}))))))
 
+(defn- resolve-client-credentials
+  "The full credential chain `client` uses: an explicit :credential-source,
+   else `resolve-credentials` (explicit :api-key > :auth-token >
+   ANTHROPIC_API_KEY > ANTHROPIC_AUTH_TOKEN > throw). Returns
+   {:credential-source src}, {:api-key s} or {:auth-token s}. Refreshable
+   sources from #35 (workload identity) and #38 (profiles) plug in here as
+   further steps returning {:credential-source <TokenSource>}."
+  [opts getenv-fn]
+  (if (contains? opts :credential-source)
+    (let [src (:credential-source opts)]
+      (when-not (token/token-source? src)
+        (throw (ex-info (str "tools.agents.anthropic/client: :credential-source must satisfy "
+                             "tools.agents.token/TokenSource, got: " (type src))
+                        {:type :tools.agents.anthropic.error/invalid-credentials})))
+      (when (or (some? (:api-key opts)) (some? (:auth-token opts)))
+        (throw (ex-info (str "tools.agents.anthropic/client: pass only one of :api-key, :auth-token "
+                             "or :credential-source")
+                        {:type :tools.agents.anthropic.error/invalid-credentials})))
+      {:credential-source src})
+    (resolve-credentials opts getenv-fn)))
+
 (defn client
   "Build an AnthropicClient record — the 'client object' analogue of Python's
    Anthropic(...) constructor. Resolves credentials eagerly (fails fast with
@@ -131,6 +154,14 @@
      :api-key      explicit API key -> sent as `x-api-key`
      :auth-token   explicit bearer/OAuth token -> sent as `Authorization: Bearer`
                    (+ the required `anthropic-beta: oauth-2025-04-20` header)
+     :credential-source  a tools.agents.token/TokenSource (e.g.
+                   `tools.agents.token/token-cache`) asked for a token before
+                   every attempt, sent like :auth-token (Bearer + oauth beta).
+                   Replaces :api-key/:auth-token and the env vars; combining
+                   it with either throws
+                   {:type :tools.agents.anthropic.error/invalid-credentials}.
+                   A 401 invalidates the token and retries once outside
+                   :max-retries.
      :base-url     override API host, default `https://api.anthropic.com`
                    (also resolved from ANTHROPIC_BASE_URL if unset)
      :betas        seq of beta-feature flag strings (e.g.
@@ -157,7 +188,7 @@
                    See messages-create's retry note."
   ([] (client {}))
   ([opts]
-   (let [creds       (resolve-credentials opts getenv)
+   (let [creds       (resolve-client-credentials opts getenv)
          max-retries (or (:max-retries opts) default-max-retries)]
      (when-not (and (integer? max-retries) (>= max-retries 0))
        (throw (ex-info (str "tools.agents.anthropic/client: :max-retries must be a non-negative "
@@ -303,23 +334,44 @@
    resolve-credentials is: testability without a real mock server — pass a
    fake attempt-fn and bind *sleep-fn* to a no-op to unit-test retry counting
    and backoff/Retry-After selection with zero I/O. messages-create and
-   count-tokens are both just attempt-fn callers around this."
-  [max-retries attempt-fn]
-  (loop [attempt 0]
-    (let [outcome (try {:ok (attempt-fn)}
-                        (catch Exception e
-                          (let [data      (ex-data e)
-                                status    (:status data)
-                                type      (:type data)
-                                retryable (or (= type :tools.agents.anthropic.error/api-connection)
-                                              (retryable-status? status))]
-                            (if (and retryable (< attempt max-retries))
-                              {:retry e}
-                              (throw e)))))]
-      (if (contains? outcome :retry)
-        (do (*sleep-fn* (backoff-seconds attempt (parse-retry-after (:headers (ex-data (:retry outcome))))))
-            (recur (inc attempt)))
-        (:ok outcome)))))
+   count-tokens are both just attempt-fn callers around this.
+
+   opts (3-arity):
+     :on-unauthorized  (fn [] boolean), called on the first 401 only. Truthy
+                       means the credential was invalidated: attempt-fn runs
+                       once more at once, without backoff and without
+                       consuming a retry. A second 401, or a falsy return,
+                       throws. Absent (the 2-arity), a 401 is never retried."
+  ([max-retries attempt-fn] (request-with-retries! max-retries attempt-fn nil))
+  ([max-retries attempt-fn {:keys [on-unauthorized]}]
+   (loop [attempt 0
+          auth-retried? false]
+     (let [outcome (try {:ok (attempt-fn)}
+                         (catch Exception e
+                           (let [data      (ex-data e)
+                                 status    (:status data)
+                                 type      (:type data)
+                                 retryable (or (= type :tools.agents.anthropic.error/api-connection)
+                                               (retryable-status? status))]
+                             (cond
+                               (and (= status 401) on-unauthorized (not auth-retried?) (on-unauthorized))
+                               {:auth-retry e}
+
+                               (and retryable (< attempt max-retries))
+                               {:retry e}
+
+                               :else
+                               (throw e)))))]
+       (cond
+         (contains? outcome :auth-retry)
+         (recur attempt true)
+
+         (contains? outcome :retry)
+         (do (*sleep-fn* (backoff-seconds attempt (parse-retry-after (:headers (ex-data (:retry outcome))))))
+             (recur (inc attempt) auth-retried?))
+
+         :else
+         (:ok outcome))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Public API
@@ -345,24 +397,37 @@
   (let [all (cond-> [] required (conj required) (seq betas) (into betas))]
     (when (seq all) (str/join "," all))))
 
-(defn- auth-headers [client]
-  (cond
-    (:api-key client)
-    (cond-> {"x-api-key" (:api-key client)
-             "anthropic-version" anthropic-version
-             "content-type" "application/json"}
-      (seq (:betas client)) (assoc "anthropic-beta" (beta-header-value nil (:betas client))))
+(defn- bearer-headers [client token]
+  {"authorization" (str "Bearer " token)
+   "anthropic-version" anthropic-version
+   "anthropic-beta" (beta-header-value oauth-beta-header (:betas client))
+   "content-type" "application/json"})
 
-    (:auth-token client)
-    {"authorization" (str "Bearer " (:auth-token client))
-     "anthropic-version" anthropic-version
-     "anthropic-beta" (beta-header-value oauth-beta-header (:betas client))
-     "content-type" "application/json"}
+(defn- auth-headers
+  "Headers for ONE attempt. A :credential-source client fetches its token
+   here (a fetch failure propagates as-is) and reports it via `on-token`, so
+   a 401 can invalidate exactly the token that attempt sent."
+  ([client] (auth-headers client (fn [_])))
+  ([client on-token]
+   (cond
+     (:api-key client)
+     (cond-> {"x-api-key" (:api-key client)
+              "anthropic-version" anthropic-version
+              "content-type" "application/json"}
+       (seq (:betas client)) (assoc "anthropic-beta" (beta-header-value nil (:betas client))))
 
-    :else
-    (throw (ex-info (str "tools.agents.anthropic: client has neither :api-key nor "
-                          ":auth-token — build it via tools.agents.anthropic/client")
-                     {:type :tools.agents.anthropic.error/missing-credentials}))))
+     (:auth-token client)
+     (bearer-headers client (:auth-token client))
+
+     (:credential-source client)
+     (let [tok (token/token! (:credential-source client))]
+       (on-token tok)
+       (bearer-headers client tok))
+
+     :else
+     (throw (ex-info (str "tools.agents.anthropic: client has neither :api-key nor "
+                           ":auth-token — build it via tools.agents.anthropic/client")
+                      {:type :tools.agents.anthropic.error/missing-credentials})))))
 
 (defn- send-http!
   "One tools.agents.http/request! exchange for req, classifying a genuine
@@ -421,14 +486,20 @@
 (defn- post-request!
   "Shared body of every resource method: build the URL, encode the request,
    POST it under the client's retry policy with headers rebuilt per attempt.
+   A :credential-source client's first 401 invalidates the token it sent and
+   retries once outside :max-retries; static credentials never retry a 401.
    caller-name prefixes any error message; path is appended to the client's
    base-url."
   [client caller-name path request]
   (let [url        (api-url (:base-url client) path)
-        headers-fn #(auth-headers client)
+        src        (:credential-source client)
+        used-token (volatile! nil)
+        headers-fn #(auth-headers client (fn [tok] (vreset! used-token tok)))
         body-str   (write-json request)]
     (request-with-retries! (or (:max-retries client) default-max-retries)
-                           #(attempt-request! caller-name url headers-fn body-str))))
+                           #(attempt-request! caller-name url headers-fn body-str)
+                           (when src
+                             {:on-unauthorized #(boolean (token/invalidate! src @used-token))}))))
 
 (defn request!
   "The general request function every Anthropic resource method can build on
@@ -454,16 +525,21 @@
    `content-type: application/json` is sent on bodyless requests too, as
    anthropic-sdk-python's default_headers do."
   [client caller-name {:keys [method path query body headers as] :or {method :post as :json}}]
-  (let [url      (api-url (:base-url client) path)
-        body-str (when (some? body) (write-json body))]
+  (let [url        (api-url (:base-url client) path)
+        body-str   (when (some? body) (write-json body))
+        src        (:credential-source client)
+        used-token (volatile! nil)]
     (request-with-retries!
      (or (:max-retries client) default-max-retries)
      (fn []
-       (decode-or-throw! caller-name
-                         (send-http! caller-name {:method method :url url :query query
-                                                  :headers (merge (auth-headers client) headers)
-                                                  :body body-str})
-                         as)))))
+       (let [auth (auth-headers client (fn [tok] (vreset! used-token tok)))]
+         (decode-or-throw! caller-name
+                           (send-http! caller-name {:method method :url url :query query
+                                                    :headers (merge auth headers)
+                                                    :body body-str})
+                           as)))
+     (when src
+       {:on-unauthorized #(boolean (token/invalidate! src @used-token))}))))
 
 (defn messages-create
   "POST request (a plain map, passed through to JSON almost verbatim — model,
@@ -480,7 +556,8 @@
    408/409/429/5xx and connection failures, with exponential backoff honoring
    a Retry-After header — see request-with-retries!. Permanent refusals
    (:streaming-unsupported, 4xx other than 408/409/429)
-   are never retried.
+   are never retried, except a :credential-source client's first 401,
+   retried once after invalidating its token (see post-request!).
 
    Throws ex-info on any failure, message prefixed
    \"tools.agents.anthropic/messages-create: \", ex-data

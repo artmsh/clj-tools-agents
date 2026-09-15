@@ -6,7 +6,8 @@
             [clojure.spec.alpha :as s]
             [clojure.spec.test.alpha :as stest]
             [tools.agents.anthropic :as a]
-            [tools.agents.anthropic.spec :as spec]))
+            [tools.agents.anthropic.spec :as spec]
+            [tools.agents.token :as token]))
 
 ;; ---------------------------------------------------------------------------
 ;; The central lesson: s/keys is blind to string keys. Prove it both ways —
@@ -49,7 +50,15 @@
 
 (deftest resolved-client-accepts-real-client-output
   (is (s/valid? ::spec/resolved-client (a/client {:api-key "k"})))
-  (is (s/valid? ::spec/resolved-client (a/client {:auth-token "t"}))))
+  (is (s/valid? ::spec/resolved-client (a/client {:auth-token "t"})))
+  (is (s/valid? ::spec/resolved-client
+                (a/client {:credential-source (token/token-cache {:fetch! (fn [] {:token "x"})})}))))
+
+(deftest resolved-client-rejects-credential-source-plus-static-credential
+  (is (not (s/valid? ::spec/resolved-client
+                      {:base-url a/default-base-url :max-retries 2 :api-key "k"
+                       :credential-source (token/token-cache {:fetch! (fn [] {:token "x"})})})))
+  (is (not (s/valid? ::spec/client-opts {:credential-source "not-a-source"}))))
 
 (deftest resolved-client-rejects-map-with-neither-credential
   (is (not (s/valid? ::spec/resolved-client {:base-url a/default-base-url :max-retries 2}))))

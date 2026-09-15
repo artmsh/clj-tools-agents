@@ -15,7 +15,8 @@
             [examples.gemini.basic-chat :as ex-basic]
             [examples.gemini.count-tokens :as ex-count]
             [examples.gemini.custom-gateway :as ex-gateway]
-            [tools.agents.test-support :refer [start-server!]]))
+            [tools.agents.token :as token]
+            [tools.agents.test-support :refer [start-server! rotating-token-cache per-call-token-source]]))
 
 (defn- base-url [port] (str "http://127.0.0.1:" port))
 
@@ -179,6 +180,70 @@
   (let [e (try (g/client {:base-url "http://127.0.0.1:18999"}) nil (catch Exception e e))]
     (is (some? e))
     (is (= :tools.agents.gemini/missing-credentials (:type (ex-data e))))))
+
+;; ---------------------------------------------------------------------------
+;; :credential-source (tools.agents.token): per-attempt tokens, 401 retry once
+;; ---------------------------------------------------------------------------
+
+(def ^:private generate-path "/v1beta/models/gemini-2.5-flash:generateContent")
+
+(deftest credential-source-401-invalidates-and-retries-once-outside-budget
+  (let [seen (atom [])
+        {:keys [source fetches]} (rotating-token-cache)
+        {:keys [port stop!]} (start-server! 19360 generate-path
+                                (fn [req]
+                                  (let [auth (get (:headers req) "authorization")]
+                                    (swap! seen conj [auth (get (:headers req) "x-goog-api-key")])
+                                    (if (= auth "Bearer tok-1")
+                                      {:status 401 :body "{\"error\":{\"message\":\"expired\"}}"}
+                                      {:status 200 :body (canned-response)}))))]
+    (try
+      (binding [g/*sleep-fn* (fn [_] (throw (ex-info "auth retry must not sleep" {})))]
+        (let [client (g/client {:credential-source source :base-url (base-url port) :max-retries 0})]
+          (is (= "hello back" (g/output-text (g/generate-content client "gemini-2.5-flash" {"contents" []}))))
+          (is (= [["Bearer tok-1" nil] ["Bearer tok-2" nil]] @seen))
+          (is (= 2 @fetches))))
+      (finally (stop!)))))
+
+(deftest credential-source-second-401-surfaces-and-static-key-401-is-not-retried
+  (let [hits (atom 0)
+        {:keys [port stop!]} (start-server! 19361 generate-path
+                                (fn [_] (swap! hits inc) {:status 401 :body "{\"error\":{\"message\":\"no\"}}"}))]
+    (try
+      (let [call (fn [opts]
+                   (reset! hits 0)
+                   (let [e (try (g/generate-content (g/client (assoc opts :base-url (base-url port)))
+                                                    "gemini-2.5-flash" {"contents" []})
+                                nil (catch Exception e e))]
+                     [(:type (ex-data e)) @hits (boolean (re-find #"tok-" (pr-str (ex-data e))))]))]
+        (is (= [:tools.agents.gemini/authentication-error 2 false]
+               (call {:credential-source (:source (rotating-token-cache))})))
+        (is (= [:tools.agents.gemini/authentication-error 1 false] (call {:api-key "k"}))))
+      (finally (stop!)))))
+
+(deftest credential-source-token-requested-per-attempt
+  (let [seen (atom [])
+        {:keys [port stop!]} (start-server! 19362 generate-path
+                                (fn [req]
+                                  (swap! seen conj (get (:headers req) "authorization"))
+                                  (if (= 1 (count @seen))
+                                    {:status 503 :body "{}"}
+                                    {:status 200 :body (canned-response)})))]
+    (try
+      (binding [g/*sleep-fn* (fn [_] nil)]
+        (let [client (g/client {:credential-source (per-call-token-source) :base-url (base-url port)})]
+          (is (= "hello back" (g/output-text (g/generate-content client "gemini-2.5-flash" {"contents" []}))))
+          (is (= ["Bearer call-1" "Bearer call-2"] @seen))))
+      (finally (stop!)))))
+
+(deftest credential-source-conflicts-and-fetch-failures
+  (is (= :tools.agents.gemini/invalid-credentials
+         (:type (ex-data (try (g/client {:api-key "k" :credential-source (:source (rotating-token-cache))})
+                              nil (catch Exception e e))))))
+  (let [source (token/token-cache {:fetch! (fn [] (throw (ex-info "exchange failed" {:type ::exchange-failed})))})
+        client (g/client {:credential-source source :base-url "http://127.0.0.1:18999"})
+        e      (try (g/generate-content client "gemini-2.5-flash" {"contents" []}) nil (catch Exception e e))]
+    (is (= ::exchange-failed (:type (ex-data e))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Retry loop — g/*sleep-fn* bound to a no-op throughout, see ns docstring.

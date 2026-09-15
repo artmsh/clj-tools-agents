@@ -3,7 +3,8 @@
    Babashka. Mock-server / transport-level coverage lives in
    tools.agents.openai.live-test."
   (:require [clojure.test :refer [deftest is testing]]
-            [tools.agents.openai :as oai]))
+            [tools.agents.openai :as oai]
+            [tools.agents.token :as token]))
 
 ;; ---------------------------------------------------------------------------
 ;; JSON codec
@@ -293,6 +294,19 @@
   (is (= 0 (:max-retries (oai/client {:api-key "k" :base-url "http://x/v1" :max-retries 0}))))
   ;; negative is clamped, not honored
   (is (= 0 (:max-retries (oai/client {:api-key "k" :base-url "http://x/v1" :max-retries -3})))))
+
+(deftest client-accepts-credential-source
+  (let [src (token/token-cache {:fetch! (fn [] (throw (ex-info "must not fetch at construction" {})))})
+        c   (oai/client {:credential-source src :base-url "http://x/v1"})]
+    (is (identical? src (:credential-source c)))
+    (is (nil? (:api-key c))))
+  (testing "conflicts and non-sources are rejected"
+    (doseq [opts [{:credential-source (token/token-cache {:fetch! (fn [])}) :api-key "k"}
+                  {:credential-source "not-a-source"}
+                  {:credential-source nil}]]
+      (is (= :tools.agents.openai/invalid-credentials
+             (:type (ex-data (try (oai/client (assoc opts :base-url "http://x/v1")) nil
+                                  (catch Exception e e)))))))))
 
 (deftest client-returns-openai-client-record
   (let [client (oai/client {:api-key "k" :base-url "http://x/v1"})]
