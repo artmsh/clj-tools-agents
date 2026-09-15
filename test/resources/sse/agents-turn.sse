@@ -1,12 +1,29 @@
-data: {"type":"agent.session.turn.created","event_id":"event_1","session_id":"session_1","turn_id":"turn_1","turn":{"id":"turn_1","object":"agent.session.turn","session_id":"session_1","agent_id":"agent_1","subagent_id":null,"status":"queued","created_at":0,"started_at":null,"completed_at":null,"error":null}}
+: SYNTHETIC, not a live capture. Built from the AgentSessionEvent schemas in the
+: API reference (agents/subresources/sessions/subresources/events/methods/stream)
+: and the abbreviated output_text delta/done examples in
+: guides/agents-api/sessions/events.md. Frames carry no event: line (not documented).
 
-data: {"type":"agent.session.turn.output_text.delta","event_id":"event_2","session_id":"session_1","turn_id":"turn_1","item_id":"item_1","output_index":0,"content_index":0,"delta":"Hel"}
+data: {"type":"agent.session.in_progress","event_id":"evt_1","session":{"id":"sess_1","object":"agent.session","agent":{"id":"agent_1","model":"gpt-6-astra","instructions":null},"environment":{"type":"none"},"created_at":1757930000,"last_active_at":1757930000,"status":"in_progress","error":null,"metadata":{},"required_actions":[],"usage":null,"vault_ids":[]}}
 
-data: {"type":"agent.session.turn.output_text.delta","event_id":"event_3","session_id":"session_1","turn_id":"turn_1","item_id":"item_1","output_index":0,"content_index":0,"delta":"lo"}
+data: {"type":"agent.session.turn.created","event_id":"evt_2","session_id":"sess_1","turn_id":"turn_1","turn":{"id":"turn_1","object":"agent.session.turn","session_id":"sess_1","agent_id":"agent_1","subagent_id":null,"status":"queued","created_at":1757930000,"started_at":null,"completed_at":null,"error":null,"usage":null}}
 
-data: {"type":"agent.session.turn.output_text.done","event_id":"event_4","session_id":"session_1","turn_id":"turn_1","item_id":"item_1","output_index":0,"content_index":0,"text":"Hello"}
+data: {"type":"agent.session.turn.in_progress","event_id":"evt_3","session_id":"sess_1","turn_id":"turn_1","turn":{"id":"turn_1","object":"agent.session.turn","session_id":"sess_1","agent_id":"agent_1","subagent_id":null,"status":"in_progress","created_at":1757930000,"started_at":1757930001,"completed_at":null,"error":null,"usage":null}}
 
-data: {"type":"agent.session.turn.completed","event_id":"event_5","session_id":"session_1","turn_id":"turn_1","turn":{"id":"turn_1","object":"agent.session.turn","session_id":"session_1","agent_id":"agent_1","subagent_id":null,"status":"completed","created_at":0,"started_at":0,"completed_at":1,"error":null}}
+data: {"type":"agent.session.turn.item.added","event_id":"evt_4","session_id":"sess_1","turn_id":"turn_1","output_index":0,"item":{"id":"msg_1","type":"message","role":"assistant","phase":"final_answer","status":"in_progress","turn_id":"turn_1","content":[]}}
 
-data: {"type":"agent.session.idle","event_id":"event_6","session":{"metadata":{},"id":"session_1","object":"agent.session","created_at":0,"last_active_at":1,"status":"idle"}}
+data: {"type":"agent.session.turn.content_part.added","event_id":"evt_5","session_id":"sess_1","turn_id":"turn_1","item_id":"msg_1","output_index":0,"content_index":0,"part":{"type":"output_text","text":""}}
+
+data: {"type":"agent.session.turn.output_text.delta","event_id":"evt_6","session_id":"sess_1","turn_id":"turn_1","item_id":"msg_1","output_index":0,"content_index":0,"delta":"Acme competes"}
+
+data: {"type":"agent.session.turn.output_text.delta","event_id":"evt_7","session_id":"sess_1","turn_id":"turn_1","item_id":"msg_1","output_index":0,"content_index":0,"delta":" on price and distribution."}
+
+data: {"type":"agent.session.turn.output_text.done","event_id":"evt_8","session_id":"sess_1","turn_id":"turn_1","item_id":"msg_1","output_index":0,"content_index":0,"text":"Acme competes on price and distribution."}
+
+data: {"type":"agent.session.turn.content_part.done","event_id":"evt_9","session_id":"sess_1","turn_id":"turn_1","item_id":"msg_1","output_index":0,"content_index":0,"part":{"type":"output_text","text":"Acme competes on price and distribution."}}
+
+data: {"type":"agent.session.turn.item.done","event_id":"evt_10","session_id":"sess_1","turn_id":"turn_1","output_index":0,"item":{"id":"msg_1","type":"message","role":"assistant","phase":"final_answer","status":"completed","turn_id":"turn_1","content":[{"type":"output_text","text":"Acme competes on price and distribution."}]}}
+
+data: {"type":"agent.session.turn.completed","event_id":"evt_11","session_id":"sess_1","turn_id":"turn_1","turn":{"id":"turn_1","object":"agent.session.turn","session_id":"sess_1","agent_id":"agent_1","subagent_id":null,"status":"completed","created_at":1757930000,"started_at":1757930001,"completed_at":1757930004,"error":null,"usage":{"input_tokens":812,"input_tokens_details":{"cached_tokens":0},"output_tokens":9,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":821}},"usage":{"input_tokens":812,"input_tokens_details":{"cached_tokens":0},"output_tokens":9,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":821}}
+
+data: {"type":"agent.session.idle","event_id":"evt_12","session":{"id":"sess_1","object":"agent.session","agent":{"id":"agent_1","model":"gpt-6-astra","instructions":null},"environment":{"type":"none"},"created_at":1757930000,"last_active_at":1757930004,"status":"idle","error":null,"metadata":{},"required_actions":[],"usage":null,"vault_ids":[]}}
 

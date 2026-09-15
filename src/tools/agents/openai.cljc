@@ -507,6 +507,14 @@
         (bytes? body) (String. ^bytes body "UTF-8")
         :else         (str body)))
 
+(defn- slurp-error-stream
+  "`:as :stream` only: a non-2xx response's InputStream body read to a String
+   and closed, so the retry and error paths below see a String as for :string."
+  [as {:keys [status body] :as resp}]
+  (if (and (= as :stream) (instance? java.io.InputStream body) (not (and status (<= 200 status 299))))
+    (assoc resp :body (with-open [^java.io.InputStream in body] (String. (.readAllBytes in) "UTF-8")))
+    resp))
+
 (defn- decode-success [as body]
   (case as
     :json   (when (seq body) (read-json body))
@@ -539,10 +547,16 @@
      :headers    extra headers merged over the defaults on every attempt,
                  e.g. {\"openai-beta\" \"agents=v1\"}
      :as         :json (default: decode a 2xx body, empty body -> nil) |
-                 :string (raw String, no decode) | :bytes (raw byte[])
+                 :string (raw String, no decode) | :bytes (raw byte[]) |
+                 :stream (return the whole 2xx response {:status :headers
+                 :body InputStream}; the caller owns and must close the body;
+                 a non-2xx body is read and closed here)
 
    A `stream` true body field or multipart part throws
-   :tools.agents.openai/streaming-unsupported before any network I/O.
+   :tools.agents.openai/streaming-unsupported before any network I/O, except
+   with `:as :stream`, the one mode that can read an SSE body. Streaming
+   callers pass `request!` as tools.agents.stream/open-event-stream's `:send!`,
+   so opening a stream gets this same retry loop and error typing.
 
    Throws ex-info:
      - non-2xx (not retryable, or budget spent): {:type (status->type status)
@@ -558,10 +572,10 @@
   ([client fn-name {:keys [method path query body multipart headers as]
                     :or   {method :post as :json}}]
    (let [label (fn-label fn-name)]
-     (when-not (contains? #{:json :string :bytes} as)
-       (throw (ex-info (str label ": unsupported :as " (pr-str as) " — expected :json, :string or :bytes")
+     (when-not (contains? #{:json :string :bytes :stream} as)
+       (throw (ex-info (str label ": unsupported :as " (pr-str as) " — expected :json, :string, :bytes or :stream")
                        {:type :tools.agents.openai/invalid-request})))
-     (reject-streaming! label body multipart)
+     (when-not (= as :stream) (reject-streaming! label body multipart))
      (let [url         (endpoint-url (:base-url client) path)
            body-str    (when (some? body) (write-json body))
            max-retries (resolve-max-retries client)]
@@ -569,14 +583,14 @@
               auth-retried? false]
          (let [credential (attempt-credential label client)
                outcome    (try
-                            {:resp (http/request!
+                            {:resp (slurp-error-stream as (http/request!
                                     (cond-> {:method  method
                                              :url     url
                                              :query   query
                                              :headers (request-headers credential client (some? multipart) headers)
-                                             :as      (if (= as :bytes) :bytes :string)}
+                                             :as      (case as (:bytes :stream) as :string)}
                                       body-str  (assoc :body body-str)
-                                      multipart (assoc :multipart multipart)))}
+                                      multipart (assoc :multipart multipart))))}
                             (catch Exception e
                               (if (own-error? e) (throw e) {:error e})))]
            (if (:error outcome)
@@ -591,7 +605,7 @@
              (let [{:keys [status] resp-hdrs :headers resp-body :body} (:resp outcome)]
                (cond
                  (and status (>= status 200) (< status 300))
-                 (decode-success as resp-body)
+                 (if (= as :stream) (:resp outcome) (decode-success as resp-body))
 
                  (and (= status 401) (not auth-retried?) (invalidate-credentials! client credential))
                  (recur retries-taken true)

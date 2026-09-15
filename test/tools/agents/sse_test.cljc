@@ -12,8 +12,9 @@
      gemini-text            SYNTHETIC: hand-built GenerateContentResponse chunks
                             (docs show only the ?alt=sse curl, no response
                             body); also reduced by gemini-test's accumulator
-     agents-turn            per-event schema Examples from the agents
-                            streaming-events reference, placeholders replaced"
+     agents-turn            synthetic: AgentSessionEvent schemas from the
+                            agents events-stream reference plus the events
+                            guide's abbreviated output_text delta/done examples"
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [tools.agents.sse :as sse]))
@@ -232,11 +233,13 @@
 
 (deftest openai-agents-fixture
   (let [evs (check-fixture-framings (fixture "agents-turn"))]
-    (is (= 6 (count evs)))
+    (is (= 12 (count evs)) "leading comment lines are not events")
     (is (every? #(= "message" (:event %)) evs) "dispatch on data type, not event name")
-    (is (= ["agent.session.turn.created" "agent.session.turn.output_text.delta"
-            "agent.session.turn.output_text.delta" "agent.session.turn.output_text.done"
-            "agent.session.turn.completed" "agent.session.idle"]
+    (is (= ["agent.session.in_progress" "agent.session.turn.created" "agent.session.turn.in_progress"
+            "agent.session.turn.item.added" "agent.session.turn.content_part.added"
+            "agent.session.turn.output_text.delta" "agent.session.turn.output_text.delta"
+            "agent.session.turn.output_text.done" "agent.session.turn.content_part.done"
+            "agent.session.turn.item.done" "agent.session.turn.completed" "agent.session.idle"]
            (map #(second (re-find #"^\{\"type\":\"([^\"]+)\"" (:data %))) evs)))))
 
 (deftest truncated-vendor-stream-drops-last-event

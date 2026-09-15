@@ -439,7 +439,7 @@ public function, so there is exactly one copy of the retry loop:
                :body    {...}           ;; JSON value, encoded once; or
                ;; :multipart [{:name :content :filename :content-type}]
                :headers {"openai-beta" "agents=v1"}  ;; merged over defaults
-               :as      :json})         ;; :json (default) | :string | :bytes
+               :as      :json})         ;; :json (default) | :string | :bytes | :stream
 ```
 
 - Headers (`Authorization`, `OpenAI-Organization`/`OpenAI-Project`,
@@ -454,8 +454,14 @@ public function, so there is exactly one copy of the retry loop:
   and the error table. The `fn-name` argument labels messages: a bare name gets
   the `tools.agents.openai/` prefix, a qualified name
   (`"tools.agents.openai.agents/sessions-create"`) is used verbatim.
+- `:as :stream` returns the whole 2xx response `{:status :headers :body
+  InputStream}` (caller closes the body) after the same retry loop; a non-2xx
+  body is read to a String and closed before the retry/error decision. It is
+  the `:send!` a streaming function hands to
+  `tools.agents.stream/open-event-stream` (see
+  `tools.agents.openai.agents/sessions-events-stream`).
 - A `stream` true body field or multipart part throws `streaming-unsupported`
-  before any I/O.
+  before any I/O, except with `:as :stream`.
 - `post-json!` stays public as `(request! client fn-name {:path path :body request})`.
 - **401:** for a `:credential-source` client the loop invalidates the token
   the failed attempt sent and retries once outside `:max-retries`; a second
