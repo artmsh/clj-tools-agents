@@ -377,3 +377,138 @@
                nil (catch Exception e e))]
     (is (some? e))
     (is (= :tools.agents.openai/streaming-unsupported (:type (ex-data e))))))
+
+;; ---------------------------------------------------------------------------
+;; Responses stream accumulation (pure)
+;; ---------------------------------------------------------------------------
+
+(def ^:private msg-item {"id" "msg_1" "type" "message" "role" "assistant" "status" "in_progress" "content" []})
+(def ^:private fc-item {"id" "fc_1" "type" "function_call" "call_id" "call_1" "name" "lookup"
+                        "arguments" "" "status" "in_progress"})
+
+(defn- created [] {"type" "response.created"
+                   "response" {"id" "resp_1" "object" "response" "status" "in_progress" "output" [] "error" nil}})
+
+(def ^:private delta-events
+  [(created)
+   {"type" "response.output_item.added" "output_index" 0 "item" msg-item}
+   {"type" "response.content_part.added" "output_index" 0 "content_index" 0
+    "part" {"type" "output_text" "text" "" "annotations" []}}
+   {"type" "response.output_item.added" "output_index" 1 "item" fc-item}
+   {"type" "response.output_text.delta" "output_index" 0 "content_index" 0 "delta" "{\"answer\":"}
+   {"type" "response.function_call_arguments.delta" "output_index" 1 "delta" "{\"q\":"}
+   {"type" "response.output_text.delta" "output_index" 0 "content_index" 0 "delta" "4}"}
+   {"type" "response.function_call_arguments.delta" "output_index" 1 "delta" "1}"}])
+
+(deftest accumulate-response-event-arities
+  (is (nil? (oai/accumulate-response-event)))
+  (is (nil? (oai/accumulate-response-stream [])))
+  (is (nil? (oai/accumulate-response-stream nil)))
+  (is (= {"a" 1} (oai/accumulate-response-event {"a" 1})))
+  (is (false? (oai/stream-complete? nil)))
+  (is (false? (oai/stream-complete? {"status" "completed"})) "only a folded terminal event counts"))
+
+(deftest accumulate-response-assembles-from-deltas-when-truncated
+  (let [r (oai/accumulate-response-stream delta-events)]
+    (is (false? (oai/stream-complete? r)))
+    (is (= "in_progress" (get r "status")))
+    (is (= "{\"answer\":4}" (oai/output-text r)))
+    (is (vector? (get r "output")))
+    (is (= [(assoc msg-item "content" [{"type" "output_text" "text" "{\"answer\":4}" "annotations" []}])
+            (assoc fc-item "arguments" "{\"q\":1}")]
+           (get r "output")))
+    (is (empty? (dissoc (meta r) :tools.agents.openai/stream-complete?))
+        "side state is stripped by the completion arity"))
+  (testing "*.done values replace the accumulated ones"
+    (let [r (oai/accumulate-response-stream
+             (conj delta-events
+                   {"type" "response.output_text.done" "output_index" 0 "content_index" 0 "text" "final"}
+                   {"type" "response.function_call_arguments.done" "output_index" 1 "arguments" "{}"}))]
+      (is (= "final" (oai/output-text r)))
+      (is (= "{}" (get-in r ["output" 1 "arguments"])))))
+  (testing "output_item.done replaces the item"
+    (let [done (assoc fc-item "status" "completed" "arguments" "{\"q\":2}")
+          r    (oai/accumulate-response-stream
+                (conj delta-events {"type" "response.output_item.done" "output_index" 1 "item" done}))]
+      (is (= done (get-in r ["output" 1])))))
+  (testing "text delta without content_part.added creates the part"
+    (let [r (oai/accumulate-response-stream
+             [(created)
+              {"type" "response.output_item.added" "output_index" 0 "item" msg-item}
+              {"type" "response.output_text.delta" "output_index" 0 "content_index" 0 "delta" "hi"}])]
+      (is (= "hi" (oai/output-text r)))))
+  (testing "refusal deltas"
+    (let [r (oai/accumulate-response-stream
+             [(created)
+              {"type" "response.output_item.added" "output_index" 0 "item" msg-item}
+              {"type" "response.refusal.delta" "output_index" 0 "content_index" 0 "delta" "I can't"}
+              {"type" "response.refusal.delta" "output_index" 0 "content_index" 0 "delta" " help."}])]
+      (is (= [{"type" "refusal" "refusal" "I can't help."}] (get-in r ["output" 0 "content"])))
+      (is (= "" (oai/output-text r))))))
+
+(deftest accumulate-response-tolerates-null-items-and-orphan-deltas
+  (let [r (oai/accumulate-response-stream
+           [(created)
+            {"type" "response.output_item.added" "output_index" 0}
+            {"type" "response.output_item.added" "output_index" 0 "item" nil}
+            {"type" "response.output_text.delta" "output_index" 0 "content_index" 0 "delta" "lost"}
+            {"type" "response.output_item.added" "output_index" 2 "item" msg-item}
+            {"type" "response.output_text.delta" "output_index" 2 "content_index" 0 "delta" "kept"}
+            {"type" "response.function_call_arguments.delta" "output_index" 2 "delta" "wrong item type"}
+            {"type" "response.reasoning_summary_text.delta" "output_index" 2 "delta" "unknown to the fold"}])]
+    (is (= 1 (count (get r "output"))) "index gaps do not create nil items")
+    (is (= "kept" (oai/output-text r)))
+    (is (not (contains? (get-in r ["output" 0]) "arguments")))))
+
+(deftest accumulate-response-terminal-events
+  (testing "response.completed is the result, and later events are ignored"
+    (let [final {"id" "resp_1" "status" "completed"
+                 "output" [{"type" "message" "content" [{"type" "output_text" "text" "T"}]}]
+                 "usage" {"total_tokens" 3}}
+          r     (oai/accumulate-response-stream
+                 (conj delta-events
+                       {"type" "response.completed" "response" final}
+                       {"type" "response.output_text.delta" "output_index" 0 "content_index" 0 "delta" "late"}))]
+      (is (= final r))
+      (is (oai/stream-complete? r))
+      (is (= "T" (oai/output-text r)))))
+  (testing "a null or missing output is recovered from output_item.done items"
+    (let [done-msg (assoc msg-item "status" "completed" "content" [{"type" "output_text" "text" "done text"}])
+          events   (conj delta-events
+                         {"type" "response.output_item.done" "output_index" 1 "item" fc-item}
+                         {"type" "response.output_item.done" "output_index" 0 "item" done-msg})]
+      (doseq [resp [{"id" "resp_1" "status" "completed" "output" nil}
+                    {"id" "resp_1" "status" "completed"}]]
+        (let [r (oai/accumulate-response-stream (conj events {"type" "response.completed" "response" resp}))]
+          (is (= [done-msg fc-item] (get r "output")))
+          (is (= "done text" (oai/output-text r)))
+          (is (oai/stream-complete? r))))))
+  (testing "response.failed and response.incomplete are returned, not thrown"
+    (doseq [[t resp] [["response.failed" {"id" "resp_1" "status" "failed" "output" []
+                                          "error" {"code" "server_error"
+                                                   "message" "The model failed to generate a response."}}]
+                      ["response.incomplete" {"id" "resp_1" "status" "incomplete" "output" []
+                                              "incomplete_details" {"reason" "max_tokens"}}]]]
+      (let [r (oai/accumulate-response-stream [(created) {"type" t "response" resp}])]
+        (is (= resp r) t)
+        (is (oai/stream-complete? r) t)
+        (is (= "" (oai/output-text r)) t)))))
+
+(deftest accumulate-response-throws-on-error-events
+  (let [e (try (oai/accumulate-response-stream
+                [(created) {"type" "error" "code" "ERR_SOMETHING" "message" "Something went wrong"
+                            "param" nil "sequence_number" 1}])
+               nil (catch Exception e e))]
+    (is (= :tools.agents.openai/stream-error (:type (ex-data e))))
+    (is (nil? (:status (ex-data e))))
+    (is (= {"code" "ERR_SOMETHING" "message" "Something went wrong" "param" nil} (:error (ex-data e))))
+    (is (= "tools.agents.openai/accumulate-response-event: stream error: Something went wrong" (ex-message e))))
+  (testing "a top-level error object (openai-python _streaming.py rule)"
+    (let [e (try (oai/accumulate-response-event nil {"error" {"message" "boom" "type" "server_error"}})
+                 nil (catch Exception e e))]
+      (is (= :tools.agents.openai/stream-error (:type (ex-data e))))
+      (is (= {"message" "boom" "type" "server_error"} (:error (ex-data e))))))
+  (testing "a null error, or one nested inside response, is not an error"
+    (is (map? (oai/accumulate-response-event nil {"type" "x" "error" nil})))
+    (is (map? (oai/accumulate-response-event nil {"type" "response.failed"
+                                                  "response" {"status" "failed" "error" {"message" "m"}}})))))

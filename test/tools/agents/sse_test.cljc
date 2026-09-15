@@ -9,6 +9,15 @@
      openai-responses-text  per-event Example JSON (response.created,
                             output_text.delta), trimmed; completed/done events
                             assembled from the same schema
+     openai-responses-function-call
+                            docs-derived: per-event Example JSON of the
+                            responses streaming-events reference
+                            (output_item.added/done, content_part.added/done,
+                            output_text.delta/done,
+                            function_call_arguments.delta/done), ids and
+                            texts made consistent; function_call item fields
+                            from its schema; also reduced by
+                            openai.stream-test's accumulator
      gemini-text            SYNTHETIC: hand-built GenerateContentResponse chunks
                             (docs show only the ?alt=sse curl, no response
                             body); also reduced by gemini-test's accumulator
@@ -217,6 +226,13 @@
             "response.output_text.done" "response.completed"]
            (map :event evs)))
     (is (every? #(str/starts-with? (:data %) "{\"type\":") evs))))
+
+(deftest openai-responses-function-call-fixture
+  (let [evs (check-fixture-framings (fixture "openai-responses-function-call"))]
+    (is (= 14 (count evs)))
+    (testing "SSE event name matches data type"
+      (doseq [{:keys [event data]} evs]
+        (is (str/starts-with? data (str "{\"type\":\"" event "\"")) event)))))
 
 (deftest openai-chat-fixture
   (let [evs (check-fixture-framings (fixture "openai-chat-text"))]

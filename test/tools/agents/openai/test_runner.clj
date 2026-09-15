@@ -3,6 +3,7 @@
   (:require [clojure.test :as t]
             tools.agents.openai-test
             tools.agents.openai.live-test
+            tools.agents.openai.stream-test
             tools.agents.openai.agents-test
             tools.agents.openai.agents.live-test
             tools.agents.openai.embeddings-test
@@ -16,6 +17,7 @@
 (def suites
   ['tools.agents.openai-test
    'tools.agents.openai.live-test
+   'tools.agents.openai.stream-test
    'tools.agents.openai.agents-test
    'tools.agents.openai.agents.live-test
    'tools.agents.openai.embeddings-test
