@@ -278,6 +278,8 @@
          (throw (ex-info (str prefix "/read-json: malformed JSON: " (str e))
                          {:type parse-type})))))))
 
+(declare ^:private read-lines)
+
 (defn read-jsonl
   "Decode JSON Lines (one JSON value per line) from a String or a
    java.io.Reader into a LAZY seq of decoded values. Blank (whitespace-only)
@@ -287,19 +289,22 @@
    `:line`. A Reader is consumed lazily and is NOT closed here — the caller
    owns it and must realize the seq before closing it."
   ([src] (read-jsonl default-opts src))
-  ([{:keys [prefix parse-type] :as opts} src]
-   (let [rdr (java.io.BufferedReader.
-              (if (string? src) (java.io.StringReader. ^String src) ^java.io.Reader src))]
-     (->> (line-seq rdr)
-          (map-indexed vector)
-          (remove (fn [[_ line]] (str/blank? line)))
-          (map (fn [[idx line]]
-                 (try
-                   (read-json opts line)
-                   (catch Exception e
-                     (throw (ex-info (str prefix "/read-jsonl: line " (inc idx) ": " (ex-message e))
-                                     {:type parse-type :line (inc idx)}
-                                     e))))))))))
+  ([opts src] (read-lines (partial read-json opts) opts src)))
+
+(defn- read-lines
+  [read-fn {:keys [prefix parse-type]} src]
+  (let [rdr (java.io.BufferedReader.
+             (if (string? src) (java.io.StringReader. ^String src) ^java.io.Reader src))]
+    (->> (line-seq rdr)
+         (map-indexed vector)
+         (remove (fn [[_ line]] (str/blank? line)))
+         (map (fn [[idx line]]
+                (try
+                  (read-fn line)
+                  (catch Exception e
+                    (throw (ex-info (str prefix "/read-jsonl: line " (inc idx) ": " (ex-message e))
+                                    {:type parse-type :line (inc idx)}
+                                    e)))))))))
 
 (defn codec
   "A codec map for one error contract (see the ns docstring):
@@ -311,3 +316,42 @@
       :write      (partial write-json opts)
       :read-jsonl (partial read-jsonl opts)
       :key->str   (partial json-key->str opts)})))
+
+;; ---------------------------------------------------------------------------
+;; Caller-supplied codecs (a client's :json option)
+;; ---------------------------------------------------------------------------
+
+(defn codec-map?
+  "True when x can serve as a client's `:json` option: a map whose :read and
+   :write are fns (:read String -> value, :write value -> String)."
+  [x]
+  (boolean (and (map? x)
+                (let [ok? (fn [f] (or (fn? f) (var? f)))]
+                  (and (ok? (:read x)) (ok? (:write x)))))))
+
+(defn- wrap-errors [f prefix fn-name type]
+  (fn [x]
+    (try
+      (f x)
+      (catch Exception e
+        (if (= type (:type (ex-data e)))
+          (throw e)
+          (throw (ex-info (str prefix "/" fn-name ": " (or (ex-message e) (.getName (class e))))
+                          {:type type}
+                          e)))))))
+
+(defn wrap-codec
+  "Bind a caller-supplied codec {:read (fn [s]) :write (fn [v])} to one error
+   contract (opts as for `codec`), returning a full codec map. Any exception
+   the caller's fns throw becomes this contract's typed ex-info (message
+   `<prefix>/read-json: ` / `<prefix>/write-json: `, the original as cause);
+   one already carrying the contract's :type passes through. :read-jsonl is
+   derived from :read with `read-jsonl`'s laziness, blank-line and `:line`
+   rules. :key->str stays the built-in coercion. Wrapping twice is harmless."
+  [user-codec opts]
+  (let [{:keys [prefix encode-type parse-type] :as opts} (merge default-opts opts)
+        rd (wrap-errors (:read user-codec) prefix "read-json" parse-type)]
+    {:read       rd
+     :write      (wrap-errors (:write user-codec) prefix "write-json" encode-type)
+     :read-jsonl (partial read-lines rd opts)
+     :key->str   (partial json-key->str opts)}))

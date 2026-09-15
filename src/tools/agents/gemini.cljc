@@ -108,10 +108,21 @@
 ;; JSON codec — tools.agents.json, bound to this namespace's error contract.
 ;; ---------------------------------------------------------------------------
 
-(def ^:private json-codec
-  (json/codec {:prefix      "tools.agents.gemini"
-               :encode-type :tools.agents.gemini/json-encode-error
-               :parse-type  :tools.agents.gemini/json-parse-error}))
+(def ^:private json-opts
+  {:prefix      "tools.agents.gemini"
+   :encode-type :tools.agents.gemini/json-encode-error
+   :parse-type  :tools.agents.gemini/json-parse-error})
+
+(def ^:private json-codec (json/codec json-opts))
+
+(defn client-codec
+  "The JSON codec `client` uses for its wire traffic: the built-in one, or
+   the client's injected :json bound to this namespace's error contract
+   (tools.agents.json/wrap-codec). A map {:read :write :read-jsonl :key->str}."
+  [client]
+  (if-let [j (:json client)]
+    (json/wrap-codec j json-opts)
+    json-codec))
 
 (defn write-json
   "Encode a Clojure value as a JSON string (tools.agents.json/write-json). Map
@@ -221,9 +232,20 @@
                    for any status, throws only on transport failure; an :as
                    :stream body should be an InputStream (a String or byte[]
                    is accepted). Anything but a fn throws
+                   {:type :tools.agents.gemini/invalid-options}.
+     :json         JSON codec {:read (fn [String]) :write (fn [value])} for
+                   request bodies, responses, error bodies and stream chunks.
+                   :read must yield string-keyed maps. Anything it throws
+                   becomes :json-parse-error / :json-encode-error with the
+                   original as cause. The public read-json/write-json stay
+                   built-in. A non-codec throws
                    {:type :tools.agents.gemini/invalid-options}."
   ([] (client {}))
   ([opts]
+   (when (and (contains? opts :json) (not (json/codec-map? (:json opts))))
+     (throw (ex-info (str "tools.agents.gemini/client: :json must be a map {:read (fn [s]) :write (fn [v])}, got: "
+                          (pr-str (:json opts)))
+                     {:type :tools.agents.gemini/invalid-options :option :json})))
    (when (and (contains? opts :http) (not (http/request-fn? (:http opts))))
      (throw (ex-info (str "tools.agents.gemini/client: :http must be a request fn with "
                           "tools.agents.http/request!'s contract, got: " (pr-str (type (:http opts))))
@@ -236,7 +258,8 @@
                                      (max 0 (long (:max-retries opts)))
                                      default-max-retries)}
                      creds)
-        (:http opts) (assoc :http (:http opts)))))))
+        (:http opts) (assoc :http (:http opts))
+        (:json opts) (assoc :json (:json opts)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Error typing
@@ -295,10 +318,10 @@
    flat `{\"message\":...}` shape (confirmed from errors.py: top level is
    checked first, then falls back to `.error.message`). Returns nil (never
    throws) on any parse failure."
-  [body]
+  [codec body]
   (when (seq body)
     (try
-      (let [parsed (read-json body)]
+      (let [parsed ((:read codec) body)]
         (when (map? parsed)
           (let [msg (get parsed "message")]
             (if (string? msg)
@@ -365,8 +388,8 @@
 
 (defn- http-status-error
   "The typed ex-info for a final non-2xx response."
-  [fn-name status resp-body retries-taken]
-  (let [err-msg (extract-error-message resp-body)
+  [codec fn-name status resp-body retries-taken]
+  (let [err-msg (extract-error-message codec resp-body)
         detail  (cond err-msg err-msg (seq resp-body) resp-body :else nil)]
     (ex-info (str "tools.agents.gemini/" fn-name ": HTTP " status (when detail (str " " detail)))
              {:type (status->type status) :status status :body resp-body
@@ -385,7 +408,8 @@
    is never retried."
   [client fn-name model method request]
   (let [url         (endpoint-url client model method)
-        body-str    (write-json request)
+        codec       (client-codec client)
+        body-str    ((:write codec) request)
         max-retries (resolve-max-retries client)]
     (loop [retries-taken 0
            auth-retried? false]
@@ -413,7 +437,7 @@
                 resp-body (:body resp)]
             (cond
               (and status (>= status 200) (< status 300))
-              (read-json resp-body)
+              ((:read codec) resp-body)
 
               (and (= status 401) (not auth-retried?) (:credential-source client)
                    (token/invalidate! (:credential-source client) used-token))
@@ -424,7 +448,7 @@
                   (recur (inc retries-taken) auth-retried?))
 
               :else
-              (throw (http-status-error fn-name status resp-body retries-taken)))))))))
+              (throw (http-status-error codec fn-name status resp-body retries-taken)))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Public API — resource methods
@@ -521,7 +545,8 @@
   [client model request]
   (let [fn-name     "generate-content-stream"
         url         (str (endpoint-url client model "streamGenerateContent") "?alt=sse")
-        body-str    (write-json request)
+        codec       (client-codec client)
+        body-str    ((:write codec) request)
         max-retries (resolve-max-retries client)
         retries     (atom 0)
         ;; Headers for the attempt about to run, set by open! before each
@@ -562,9 +587,9 @@
       :send!         (fn [req] ((or (:http client) http/request!) (assoc req :headers @headers)))
       :open!         open!
       :on-error      (fn [{:keys [status body]}]
-                       (throw (http-status-error fn-name status body @retries)))
+                       (throw (http-status-error codec fn-name status body @retries)))
       :decode        (fn [data]
-                       (let [chunk (read-json data)]
+                       (let [chunk ((:read codec) data)]
                          (if (error-chunk? chunk)
                            (throw (stream-error fn-name chunk data @retries))
                            chunk)))

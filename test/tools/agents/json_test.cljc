@@ -220,3 +220,64 @@
         e (thrown #(read "{bad"))]
     (is (= ::json/parse-error (:type (ex-data e))))
     (is (str/starts-with? (ex-message e) "only.prefix/read-json: "))))
+
+;; ---------------------------------------------------------------------------
+;; Caller-supplied codecs (#10)
+;; ---------------------------------------------------------------------------
+
+(def ^:private opts {:prefix "p" :encode-type ::enc :parse-type ::parse})
+
+(deftest codec-map?-requires-read-and-write-fns
+  (is (json/codec-map? {:read json/read-json :write json/write-json}))
+  (is (json/codec-map? {:read #'json/read-json :write #'json/write-json}))
+  (doseq [x [nil {} {:read json/read-json} {:read "x" :write "y"} [json/read-json json/write-json]]]
+    (is (not (json/codec-map? x)) (pr-str x))))
+
+(deftest wrap-codec-delegates-and-types-errors
+  (let [c (json/wrap-codec {:read (fn [s] [:read s]) :write (fn [v] (str "<" v ">"))} opts)]
+    (is (= [:read "x"] ((:read c) "x")))
+    (is (= "<1>" ((:write c) 1)))
+    (is (= "a" ((:key->str c) :a)) ":key->str stays the built-in"))
+  (let [boom (IllegalStateException. "boom")
+        c    (json/wrap-codec {:read (fn [_] (throw boom)) :write (fn [_] (throw boom))} opts)
+        r    (thrown #((:read c) "x"))
+        w    (thrown #((:write c) 1))]
+    (is (= {:type ::parse} (ex-data r)))
+    (is (= "p/read-json: boom" (ex-message r)))
+    (is (identical? boom (ex-cause r)) "cause preserved")
+    (is (= {:type ::enc} (ex-data w)))
+    (is (= "p/write-json: boom" (ex-message w)))
+    (is (identical? boom (ex-cause w))))
+  (testing "an error already of the contract's type passes through untouched"
+    (let [e (ex-info "mine" {:type ::parse :x 1})
+          c (json/wrap-codec {:read (fn [_] (throw e)) :write str} opts)]
+      (is (identical? e (thrown #((:read c) "x"))))))
+  (testing "wrapping twice is harmless"
+    (let [c (json/wrap-codec (json/wrap-codec {:read (fn [_] (throw (RuntimeException. "b"))) :write str} opts) opts)
+          e (thrown #((:read c) "x"))]
+      (is (= "p/read-json: b" (ex-message e)))
+      (is (= "b" (ex-message (ex-cause e)))))))
+
+(deftest wrap-codec-derives-read-jsonl
+  (let [calls (atom 0)
+        c     (json/wrap-codec {:read (fn [s] (swap! calls inc) (json/read-json s)) :write json/write-json} opts)
+        s     ((:read-jsonl c) "{\"a\":1}\n\n{bad\n")]
+    (is (zero? @calls) "lazy")
+    (is (= {"a" 1} (first s)))
+    (let [e (thrown #(doall s))]
+      (is (= {:type ::parse :line 3} (ex-data e)))
+      (is (str/starts-with? (ex-message e) "p/read-jsonl: line 3: p/read-json: ")))))
+
+#?(:bb
+   (deftest wrap-codec-over-cheshire
+     ;; Babashka bundles cheshire; JVM Clojure has no alternative codec on
+     ;; this repo's classpath, so this runs on bb only.
+     (require 'cheshire.core)
+     (let [parse (resolve 'cheshire.core/parse-string)
+           gen   (resolve 'cheshire.core/generate-string)
+           c     (json/wrap-codec {:read #(parse %) :write #(gen %)} opts)]
+       (is (= {"a" [1 "x"] "b" nil} ((:read c) ((:write c) {"a" [1 "x"] "b" nil}))))
+       (is (= [{"n" 1} {"n" 2}] (vec ((:read-jsonl c) "{\"n\":1}\n{\"n\":2}\n"))))
+       (let [e (thrown #((:read c) "{bad"))]
+         (is (= ::parse (:type (ex-data e))))
+         (is (some? (ex-cause e)))))))

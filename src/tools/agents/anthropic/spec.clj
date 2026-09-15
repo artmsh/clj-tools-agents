@@ -27,6 +27,8 @@
    ABOVE each s/def rather than inside it."
   (:require [clojure.spec.alpha :as s]
             [tools.agents.anthropic :as a]
+            [tools.agents.http :as http]
+            [tools.agents.json :as json]
             [tools.agents.token :as token]))
 
 ;; ---------------------------------------------------------------------------
@@ -76,6 +78,9 @@
 (s/def ::profile string?)
 (s/def ::base-url string?)
 (s/def ::max-retries (s/and int? #(>= % 0)))
+;; Injected transport and codec (README, Bring your own HTTP client / JSON codec).
+(s/def ::http http/request-fn?)
+(s/def ::json json/codec-map?)
 
 ;; The map passed to `client`. Neither :api-key nor :auth-token is required
 ;; here — `client` falls back to ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN env
@@ -83,7 +88,7 @@
 ;; concern resolve-credentials owns, not a static shape concern this spec
 ;; should duplicate.
 (s/def ::client-opts
-  (s/keys :opt-un [::api-key ::auth-token ::credential-source ::profile ::base-url ::max-retries]))
+  (s/keys :opt-un [::api-key ::auth-token ::credential-source ::profile ::base-url ::max-retries ::http ::json]))
 
 ;; The AnthropicClient record `client` RETURNS — unlike ::client-opts,
 ;; credential resolution has

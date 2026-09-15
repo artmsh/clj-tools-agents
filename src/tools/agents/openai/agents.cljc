@@ -494,8 +494,8 @@
 (defn- decode-event-data
   "An event's `data`: blank (a keep-alive with an empty data line) becomes
    ::keep-alive and is dropped by `event-xform`; anything else is JSON."
-  [data]
-  (if (str/blank? data) ::keep-alive (oai/read-json data)))
+  [codec data]
+  (if (str/blank? data) ::keep-alive ((:read codec) data)))
 
 (def ^:private event-xform
   (comp (remove #(= ::keep-alive (:data %)))
@@ -511,14 +511,15 @@
    `status->type` error typing as every other method here, applied before
    the first byte only."
   [client fn-name req]
-  (let [label (str "tools.agents.openai.agents/" fn-name)]
+  (let [label (str "tools.agents.openai.agents/" fn-name)
+        codec (oai/client-codec client)]
     (stream/open-event-stream
      {:request       (assoc req :headers {"openai-beta" beta-header "accept" "text/event-stream"})
       :send!         (fn [r] (oai/request! client label r))
       ;; request! already throws a typed error for a final non-2xx; this is
       ;; the same typing in case a response ever reaches open-event-stream.
       :on-error      (fn [{:keys [status body]}]
-                       (let [msg (oai/extract-error-message body)]
+                       (let [msg (oai/extract-error-message codec body)]
                          (throw (ex-info (str label ": HTTP " status (when (or msg (seq body)) (str " " (or msg body))))
                                          {:type (oai/status->type status) :status status :body body}))))
       :on-read-error (fn [e]
@@ -526,7 +527,7 @@
                                 {:type :tools.agents.openai/api-connection-error :status nil :body nil}
                                 e))
       :done?         #(str/starts-with? (str (:data %)) "[DONE]")
-      :decode        decode-event-data
+      :decode        (partial decode-event-data codec)
       :xform         event-xform})))
 
 (defn sessions-events-stream

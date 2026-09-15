@@ -56,10 +56,22 @@
 ;; JSON codec — tools.agents.json, bound to this namespace's error contract.
 ;; ---------------------------------------------------------------------------
 
-(def ^:private json-codec
-  (json/codec {:prefix      "tools.agents.anthropic"
-               :encode-type :tools.agents.anthropic.error/json-encode
-               :parse-type  :tools.agents.anthropic.error/json-parse}))
+(def ^:private json-opts
+  {:prefix      "tools.agents.anthropic"
+   :encode-type :tools.agents.anthropic.error/json-encode
+   :parse-type  :tools.agents.anthropic.error/json-parse})
+
+(def ^:private json-codec (json/codec json-opts))
+
+(defn client-codec
+  "The JSON codec `client` uses for its wire traffic: the built-in one, or
+   the client's injected :json bound to this namespace's error contract
+   (tools.agents.json/wrap-codec). A map {:read :write :read-jsonl
+   :key->str}; tools.agents.anthropic.batches decodes results with it."
+  [client]
+  (if-let [j (:json client)]
+    (json/wrap-codec j json-opts)
+    json-codec))
 
 (defn json-key->str
   "Coerce a map key (string/keyword/symbol) to its wire string form, verbatim
@@ -273,6 +285,15 @@
                    status, throws only on transport failure. With :as
                    :stream the body should be an InputStream (a String or
                    byte[] is accepted). Anything but a fn throws
+                   {:type :tools.agents.anthropic.error/invalid-options}.
+     :json         JSON codec {:read (fn [String]) :write (fn [value])} used
+                   for request bodies, responses, error bodies, stream
+                   events and batch results (:read-jsonl is derived). :read
+                   must yield string-keyed maps. Anything it throws becomes
+                   :json-parse / :json-encode with the original as cause.
+                   Not used by accumulate-event's tool-input parsing, the
+                   public read-json/write-json, visualize, or credential
+                   files and token exchanges. A non-codec throws
                    {:type :tools.agents.anthropic.error/invalid-options}."
   ([] (client {}))
   ([opts]
@@ -283,6 +304,10 @@
                                             "with tools.agents.http/request!'s contract, got: "
                                             (pr-str (type http-opt)))
                                        {:type :tools.agents.anthropic.error/invalid-options :option :http})))
+         _           (when (and (contains? opts :json) (not (json/codec-map? (:json opts))))
+                       (throw (ex-info (str "tools.agents.anthropic/client: :json must be a map "
+                                            "{:read (fn [s]) :write (fn [v])}, got: " (pr-str (:json opts)))
+                                       {:type :tools.agents.anthropic.error/invalid-options :option :json})))
          creds       (resolve-client-credentials opts getenv (or explicit default-base-url)
                                                  (or http-opt http/request!))
          ;; kwarg > ANTHROPIC_BASE_URL > profile base_url > default (_client.py:231-240,260-274)
@@ -298,7 +323,8 @@
                       :max-retries max-retries}
                      creds)
         (seq (:betas opts)) (assoc :betas (vec (:betas opts)))
-        http-opt            (assoc :http http-opt))))))
+        http-opt            (assoc :http http-opt)
+        (:json opts)        (assoc :json (:json opts)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Error typing
@@ -318,10 +344,10 @@
 (defn- extract-error-message
   "Best-effort extraction of Anthropic's {\"error\":{\"message\":\"...\"}}
    shape. Returns nil (never throws) on any parse failure."
-  [body]
+  [codec body]
   (when (seq body)
     (try
-      (let [parsed (read-json body)]
+      (let [parsed ((:read codec) body)]
         (when (map? parsed)
           (let [err (get parsed "error")]
             (when (map? err)
@@ -561,15 +587,15 @@
    as :response, returns resp itself untouched — anything else throws a typed
    ex-info with :status/:body/:headers in ex-data (:headers feeds
    request-with-retries!'s Retry-After handling)."
-  ([caller-name resp] (decode-or-throw! caller-name resp :json))
-  ([caller-name resp as]
+  ([codec caller-name resp] (decode-or-throw! codec caller-name resp :json))
+  ([codec caller-name resp as]
    (let [status    (:status resp)
          resp-body (:body resp)]
      (if (and status (>= status 200) (< status 300))
        (if (= as :response)
          resp
-         (with-meta (read-json resp-body) {::headers (:headers resp)}))
-       (let [err-msg (extract-error-message resp-body)
+         (with-meta ((:read codec) resp-body) {::headers (:headers resp)}))
+       (let [err-msg (extract-error-message codec resp-body)
              detail  (cond err-msg err-msg (seq resp-body) resp-body :else nil)]
          (throw (ex-info (str caller-name ": HTTP " status (when detail (str " " detail)))
                           {:type (status->type status) :status status :body resp-body :headers (:headers resp)})))))))
@@ -585,7 +611,7 @@
    on every retry would be wasted work identical across attempts."
   [client caller-name url headers-fn body-str]
   (let [headers (headers-fn)]
-    (decode-or-throw! caller-name (post-json! client caller-name url headers body-str))))
+    (decode-or-throw! (client-codec client) caller-name (post-json! client caller-name url headers body-str))))
 
 (defn- post-request!
   "Shared body of every resource method: build the URL, encode the request,
@@ -599,7 +625,7 @@
         src        (:credential-source client)
         used-token (volatile! nil)
         headers-fn #(auth-headers client (fn [tok] (vreset! used-token tok)))
-        body-str   (write-json request)]
+        body-str   ((:write (client-codec client)) request)]
     (request-with-retries! (or (:max-retries client) default-max-retries)
                            #(attempt-request! client caller-name url headers-fn body-str)
                            (when src
@@ -630,14 +656,15 @@
    anthropic-sdk-python's default_headers do."
   [client caller-name {:keys [method path query body headers as] :or {method :post as :json}}]
   (let [url        (api-url (:base-url client) path)
-        body-str   (when (some? body) (write-json body))
+        codec      (client-codec client)
+        body-str   (when (some? body) ((:write codec) body))
         src        (:credential-source client)
         used-token (volatile! nil)]
     (request-with-retries!
      (or (:max-retries client) default-max-retries)
      (fn []
        (let [auth (auth-headers client (fn [tok] (vreset! used-token tok)))]
-         (decode-or-throw! caller-name
+         (decode-or-throw! codec caller-name
                            (send-http! client caller-name {:method method :url url :query query
                                                     :headers (merge auth headers)
                                                     :body body-str})
@@ -770,7 +797,8 @@
   [client request]
   (let [caller-name "tools.agents.anthropic/messages-stream"
         url         (api-url (:base-url client) "/v1/messages")
-        body-str    (write-json (-> (if (contains? request :stream) (dissoc request :stream) request)
+        codec       (client-codec client)
+        body-str    ((:write codec) (-> (if (contains? request :stream) (dissoc request :stream) request)
                                     (assoc "stream" true)))
         src         (:credential-source client)
         used-token  (volatile! nil)
@@ -785,7 +813,7 @@
                                       (if (and (:status resp) (<= 200 (:status resp) 299))
                                         resp
                                         ;; non-2xx :body is already a String
-                                        (decode-or-throw! caller-name resp))))
+                                        (decode-or-throw! codec caller-name resp))))
                                   (when src
                                     {:on-unauthorized #(boolean (token/invalidate! src @used-token))}))]
                         (vreset! resp-hdrs (:headers resp))
@@ -798,7 +826,7 @@
       ;; SDK's Stream.__stream__ raises on the SSE event NAME `error` and
       ;; fills a missing data "type" from the event name.
       :xform         (map (fn [{:keys [event data]}]
-                            (let [ev (read-json data)
+                            (let [ev ((:read codec) data)
                                   ev (if (and (map? ev) (not (contains? ev "type")) (string? event))
                                        (assoc ev "type" event)
                                        ev)]

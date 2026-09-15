@@ -376,8 +376,13 @@
     mcp/internal-error 500
     200))
 
-(defn sse-event [message]
-  (str "event: message\ndata: " (mcp/write-json message) "\n\n"))
+(defn sse-event
+  "One SSE `message` event carrying `message`. The 2-arity encodes with the
+   server's :json codec (see `server/server`); use it for the events a host
+   writes to a held subscription stream."
+  ([message] (sse-event nil message))
+  ([srv message]
+   (str "event: message\ndata: " ((:write (mcp/codec-of srv)) message) "\n\n")))
 
 (def ^:private json-headers {"Content-Type" "application/json"})
 
@@ -390,9 +395,9 @@
    "Connection" "keep-alive"
    "X-Accel-Buffering" "no"})
 
-(defn- error-http [id code message data]
+(defn- error-http [codec id code message data]
   (let [resp (mcp/error-response id code message data)]
-    {:status (error-code->status code) :headers json-headers :body (mcp/write-json resp)}))
+    {:status (error-code->status code) :headers json-headers :body ((:write codec) resp)}))
 
 (defn handle-http
   "Map one HTTP request onto the MCP server. Pure — no sockets, no atoms, no
@@ -413,23 +418,25 @@
   ([srv req] (handle-http srv req nil))
   ([srv {:keys [request-method headers body]} {:keys [allowed-origins tools-by-name]}]
    (let [h (lower-keys headers)
-         origin (get h "origin")]
+         origin (get h "origin")
+         codec (mcp/codec-of srv)
+         write (:write codec)]
      (cond
        (and (some? origin) allowed-origins
             (not (if (fn? allowed-origins) (allowed-origins origin) (contains? (set allowed-origins) origin))))
        {:status 403 :headers json-headers
-        :body (mcp/write-json (mcp/error-response nil mcp/invalid-request
-                                                  (str "Forbidden origin: " origin)))}
+        :body (write (mcp/error-response nil mcp/invalid-request
+                                         (str "Forbidden origin: " origin)))}
 
        (not= :post (some-> request-method name str/lower-case keyword))
        {:status 405 :headers (assoc json-headers "Allow" "POST")
-        :body (mcp/write-json (mcp/error-response nil mcp/invalid-request
-                                                  "The MCP endpoint accepts POST only"))}
+        :body (write (mcp/error-response nil mcp/invalid-request
+                                         "The MCP endpoint accepts POST only"))}
 
        :else
-       (let [parsed (try [::ok (mcp/read-json body)] (catch Exception e [::bad e]))]
+       (let [parsed (try [::ok ((:read codec) body)] (catch Exception e [::bad e]))]
          (if (= ::bad (first parsed))
-           (error-http nil mcp/parse-error (str "Parse error: " (ex-message (second parsed))) nil)
+           (error-http codec nil mcp/parse-error (str "Parse error: " (ex-message (second parsed))) nil)
            (let [message (second parsed)
                  id (when (map? message) (get message "id"))]
              (if (mcp/notification? message)
@@ -443,7 +450,7 @@
                    (cond
                      subscription
                      {:status 200 :headers sse-headers
-                      :body (str/join (map sse-event notifications))
+                      :body (str/join (map #(sse-event srv %) notifications))
                       :subscription subscription}
 
                      (seq notifications)
@@ -451,19 +458,19 @@
                      ;; response on that request's own stream, and the
                      ;; response terminates it.
                      {:status 200 :headers sse-headers
-                      :body (str (str/join (map sse-event notifications)) (sse-event response))}
+                      :body (str (str/join (map #(sse-event srv %) notifications)) (sse-event srv response))}
 
                      :else
                      {:status (if (mcp/error-response? response)
                                 (error-code->status (get-in response ["error" "code"]))
                                 200)
                       :headers json-headers
-                      :body (mcp/write-json response)}))
+                      :body (write response)}))
                  (catch Exception e
                    (let [d (ex-data e)]
                      (if (= :tools.agents.mcp.error/protocol (:type d))
-                       (error-http id (:code d) (or (:message d) (ex-message e)) (:data d))
-                       (error-http id mcp/internal-error
+                       (error-http codec id (:code d) (or (:message d) (ex-message e)) (:data d))
+                       (error-http codec id mcp/internal-error
                                    (str "Internal error: " (or (ex-message e) (str e))) nil))))))))))))) 
 
 (defn- response-to?
@@ -487,7 +494,7 @@
    `on-notification`. Returns the response, or nil when the stream was
    cancelled. Throws ::error/transport when the body ends, or breaks,
    before the response arrives."
-  [msg resp {:keys [on-notification register! unregister!]}]
+  [msg resp {:keys [codec on-notification register! unregister!]}]
   (let [s (stream/open-event-stream
            {:request {:method :post}
             ;; The response is already open (its headers chose this path);
@@ -504,7 +511,7 @@
                              (let [data (:data ev)]
                                (if (str/blank? data)
                                  nil
-                                 (let [m (mcp/read-json data)]
+                                 (let [m ((:read codec) data)]
                                    (if (response-to? msg m)
                                      (reduced m)
                                      (do (on-notification m) nil))))))
@@ -558,6 +565,10 @@
    `:http` replaces tools.agents.http/request! for every POST: a request fn
    with request!'s contract, called with `:as :stream` (a String or byte[]
    body is accepted in place of an InputStream). Anything but a fn throws
+   ::error/invalid-options.
+
+   `:json` is the codec {:read (fn [s]) :write (fn [v])} for request bodies
+   and responses, JSON or SSE; default the built-in codec. A non-codec throws
    ::error/invalid-options."
   ([url] (connect! url nil))
   ([url {:keys [headers on-notification tools-by-name http]
@@ -567,7 +578,9 @@
      (throw (ex-info (str "tools.agents.mcp.http/connect!: :http must be a request fn with "
                           "tools.agents.http/request!'s contract, got: " (pr-str (type http)))
                      {:type :tools.agents.mcp.error/invalid-options :option :http})))
+   (mcp/validate-json-option! "tools.agents.mcp.http/connect!" opts)
    (let [send-http (or http http/request!)
+         codec (mcp/codec-of opts)
          in-flight (atom {})          ; stream -> request id
          close-where (fn [pred]
                        (doseq [[s id] @in-flight :when (pred id)]
@@ -584,7 +597,7 @@
         (let [tool (get tools-by-name (get-in msg ["params" "name"]))
               req-headers (merge (request-headers msg tool) headers)
               resp (-> (send-http {:method :post :url url :headers req-headers
-                                   :body (mcp/write-json msg) :as :stream})
+                                   :body ((:write codec) msg) :as :stream})
                        (update :body http/stream-body))
               status (:status resp)
               ctype (let [c (get (:headers resp) "content-type")]
@@ -595,7 +608,8 @@
 
             (and (<= 200 status 299) (str/includes? ctype "text/event-stream"))
             (read-sse-response! msg resp
-                                {:on-notification on-notification
+                                {:codec codec
+                                 :on-notification on-notification
                                  :register! #(swap! in-flight assoc % (get msg "id"))
                                  :unregister! #(swap! in-flight dissoc %)})
 
@@ -607,12 +621,12 @@
                 ;; may): kept buffered, same dispatch as the live path.
                 (let [msgs (->> (sse/parse-string body)
                                 (remove (comp str/blank? :data))
-                                (map (comp mcp/read-json :data)))]
+                                (map (comp (:read codec) :data)))]
                   (or (some (fn [m] (if (response-to? msg m) m (do (on-notification m) nil))) msgs)
                       (throw (ex-info (str "tools.agents.mcp.http: SSE body without a response, HTTP " status)
                                       {:type :tools.agents.mcp.error/transport
                                        :response (assoc resp :body body)}))))
-                (seq body) (mcp/read-json body)
+                (seq body) ((:read codec) body)
                 :else (throw (ex-info (str "tools.agents.mcp.http: empty response body, HTTP " status)
                                       {:type :tools.agents.mcp.error/transport
                                        :response (assoc resp :body body)})))))))})))
@@ -660,6 +674,8 @@
                                    :tools-by-name tools-by-name})
                      (catch Exception e
                        {:status 500 :headers {"Content-Type" "application/json"}
+                        ;; the built-in codec: this is the fallback for a
+                        ;; handler (or an injected codec) that threw
                         :body (mcp/write-json
                                (mcp/error-response nil mcp/internal-error (str e)))}))
                    out (.getBytes ^String (or body "") "UTF-8")]

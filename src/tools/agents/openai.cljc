@@ -78,10 +78,23 @@
 ;; JSON codec — tools.agents.json, bound to this namespace's error contract.
 ;; ---------------------------------------------------------------------------
 
-(def ^:private json-codec
-  (json/codec {:prefix      "tools.agents.openai"
-               :encode-type :tools.agents.openai/json-encode-error
-               :parse-type  :tools.agents.openai/json-parse-error}))
+(def ^:private json-opts
+  {:prefix      "tools.agents.openai"
+   :encode-type :tools.agents.openai/json-encode-error
+   :parse-type  :tools.agents.openai/json-parse-error})
+
+(def ^:private json-codec (json/codec json-opts))
+
+(defn client-codec
+  "The JSON codec `client` uses for its wire traffic: the built-in one, or
+   the client's injected :json bound to this namespace's error contract
+   (tools.agents.json/wrap-codec). A map {:read :write :read-jsonl
+   :key->str}, used by every resource namespace built on `request!`. nil
+   (no client) gives the built-in codec."
+  [client]
+  (if-let [j (:json client)]
+    (json/wrap-codec j json-opts)
+    json-codec))
 
 (defn write-json
   "Encode a Clojure value as a JSON string (tools.agents.json/write-json). Map
@@ -250,6 +263,16 @@
                    A credential source built separately (e.g.
                    tools.agents.openai.credentials/workload-identity-source)
                    takes its own :http. Anything but a fn throws
+                   {:type :tools.agents.openai/invalid-options}.
+     :json         JSON codec {:read (fn [String]) :write (fn [value])} for
+                   every request body, response, error body and stream event
+                   through `request!` (all resource namespaces), batch result
+                   files and `webhooks/unwrap` given :client; :read-jsonl is
+                   derived. :read must yield string-keyed maps. Anything it
+                   throws becomes :json-parse-error / :json-encode-error with
+                   the original as cause. Not used by the public
+                   read-json/write-json, `batches/batch-input-jsonl` (no
+                   client) or workload-identity exchanges. A non-codec throws
                    {:type :tools.agents.openai/invalid-options}."
   ([] (client {}))
   ([opts]
@@ -257,6 +280,10 @@
      (throw (ex-info (str "tools.agents.openai/client: :http must be a request fn with "
                           "tools.agents.http/request!'s contract, got: " (pr-str (type (:http opts))))
                      {:type :tools.agents.openai/invalid-options :option :http})))
+   (when (and (contains? opts :json) (not (json/codec-map? (:json opts))))
+     (throw (ex-info (str "tools.agents.openai/client: :json must be a map {:read (fn [s]) :write (fn [v])}, got: "
+                          (pr-str (:json opts)))
+                     {:type :tools.agents.openai/invalid-options :option :json})))
    (let [creds (resolve-client-credentials opts getenv)
          org   (or (:organization opts) (getenv "OPENAI_ORG_ID"))
          proj  (or (:project opts) (getenv "OPENAI_PROJECT_ID"))
@@ -270,7 +297,8 @@
         (seq org)  (assoc :organization org)
         (seq proj)    (assoc :project proj)
         (some? whsec) (assoc :webhook-secret whsec)
-        (:http opts)  (assoc :http (:http opts)))))))
+        (:http opts)  (assoc :http (:http opts))
+        (:json opts)  (assoc :json (:json opts)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Error typing
@@ -461,17 +489,19 @@
   "Best-effort extraction of OpenAI's {\"error\":{\"message\":\"...\"}} shape.
    Returns nil (never throws) on any parse failure. Public (not ^:private) so
    tools.agents.openai.agents reuses this verbatim rather than a second copy
-   — the Agents API's error bodies use the exact same shape."
-  [body]
-  (when (seq body)
-    (try
-      (let [parsed (read-json body)]
-        (when (map? parsed)
-          (let [err (get parsed "error")]
-            (when (map? err)
-              (let [msg (get err "message")]
-                (when (string? msg) msg))))))
-      (catch Exception _ nil))))
+   — the Agents API's error bodies use the exact same shape. The 2-arity
+   parses with `codec` (see `client-codec`)."
+  ([body] (extract-error-message json-codec body))
+  ([codec body]
+   (when (seq body)
+     (try
+       (let [parsed ((:read codec) body)]
+         (when (map? parsed)
+           (let [err (get parsed "error")]
+             (when (map? err)
+               (let [msg (get err "message")]
+                 (when (string? msg) msg))))))
+       (catch Exception _ nil)))))
 
 ;; ---------------------------------------------------------------------------
 ;; Request plumbing
@@ -592,9 +622,9 @@
     :else (assoc resp :body (with-open [^java.io.InputStream in (http/stream-body body)]
                               (String. (.readAllBytes in) "UTF-8")))))
 
-(defn- decode-success [as body]
+(defn- decode-success [codec as body]
   (case as
-    :json   (when (seq body) (read-json body))
+    :json   (when (seq body) ((:read codec) body))
     :string body
     :bytes  body))
 
@@ -656,7 +686,8 @@
                        {:type :tools.agents.openai/invalid-request})))
      (when-not (= as :stream) (reject-streaming! label body multipart))
      (let [url         (endpoint-url (:base-url client) path)
-           body-str    (when (some? body) (write-json body))
+           codec       (client-codec client)
+           body-str    (when (some? body) ((:write codec) body))
            max-retries (resolve-max-retries client)]
        (loop [retries-taken 0
               auth-retried? false]
@@ -684,7 +715,7 @@
              (let [{:keys [status] resp-hdrs :headers resp-body :body} (:resp outcome)]
                (cond
                  (and status (>= status 200) (< status 300))
-                 (if (= as :stream) (:resp outcome) (decode-success as resp-body))
+                 (if (= as :stream) (:resp outcome) (decode-success codec as resp-body))
 
                  ;; Invalidate first, on every 401; retry only once.
                  (and (= status 401) (invalidate-credentials! client credential) (not auth-retried?))
@@ -696,7 +727,7 @@
 
                  :else
                  (let [body-s  (body->string resp-body)
-                       err-msg (extract-error-message body-s)
+                       err-msg (extract-error-message codec body-s)
                        detail  (cond err-msg err-msg (seq body-s) body-s :else nil)]
                    (throw (ex-info (str label ": HTTP " status (when detail (str " " detail)))
                                    {:type (status->type status) :status status :body body-s
@@ -787,14 +818,15 @@
    the credential-source 401 retry and `status->type` typing are exactly
    `request!`'s, and all of them happen before the first byte."
   [client fn-name path request]
-  (let [label (fn-label fn-name)]
+  (let [label (fn-label fn-name)
+        codec (client-codec client)]
     (stream/open-event-stream
      {:request       {:method :post :path path
                       :body   (-> (or request {}) (dissoc :stream) (assoc "stream" true))}
       :send!         (fn [req] (request! client fn-name req))
       ;; request! already throws the typed error for a final non-2xx.
       :on-error      (fn [{:keys [status body]}]
-                       (let [msg (extract-error-message body)]
+                       (let [msg (extract-error-message codec body)]
                          (throw (ex-info (str label ": HTTP " status (when (or msg (seq body)) (str " " (or msg body))))
                                          {:type (status->type status) :status status :body body}))))
       :on-read-error (fn [e]
@@ -805,7 +837,7 @@
       :decode        (fn [data]
                        (if (str/blank? data)
                          ::keep-alive
-                         (let [event (read-json data)]
+                         (let [event ((:read codec) data)]
                            (when-let [e (stream-event-error fn-name event data)] (throw e))
                            event)))
       :xform         (comp (remove #(= ::keep-alive (:data %)))

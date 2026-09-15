@@ -125,4 +125,4 @@
                           :path    (batch-path "batches-results" message-batch-id "/results")
                           :headers {"accept" "application/binary"}
                           :as      :response})]
-    (with-meta (a/read-jsonl (:body resp)) {:tools.agents.anthropic/headers (:headers resp)})))
+    (with-meta ((:read-jsonl (a/client-codec client)) (:body resp)) {:tools.agents.anthropic/headers (:headers resp)})))

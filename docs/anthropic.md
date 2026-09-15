@@ -63,6 +63,7 @@ Programmatic Tool Calling below.
 | `anthropic.APIError` / `.APIStatusError` / `.RateLimitError` / etc. | `ex-info` with `:type` in `ex-data` | See the error-hierarchy table below — one exception constructor, discriminated by `:type`, rather than a Python-style class hierarchy (there is no `class` in Clojure to mirror it with). |
 | `client.with_options(...)` | *(not implemented)* | Per-request override without mutating the client. Out of scope for this port; `AnthropicClient` supports associative updates, so callers can use `(assoc client :base-url ...)` themselves. |
 | `max_retries` / automatic backoff | `:max-retries` client opt, default 2 | **Resolved, implemented.** See Retries below. |
+| *(no SDK equivalent)* | `:json` client opt | A `{:read :write}` codec used for request bodies, responses, error bodies, stream events and `batches-results`; its exceptions become `:json-parse`/`:json-encode` with the cause kept. `accumulate-event`'s tool-input parsing, `visualize` and credential JSON stay built-in. See README, Bring your own HTTP client / JSON codec. |
 | `Anthropic(http_client=httpx.Client(...))` | `:http` client opt | A request fn with `tools.agents.http/request!`'s contract; every exchange, streaming, batches and the token exchanges `client` resolves (profile, WIF from env) go through it. A pre-built `:credential-source` keeps its own `:http-fn`. See README, Bring your own HTTP client. |
 | `client.messages.create(..., stream=True)` / `client.messages.stream(...)` | `(messages-stream client params)` + `accumulate-event`/`accumulate-stream`/`stream-complete?` | **Resolved, implemented.** A single-use reducible of decoded events instead of a `Stream` iterator; the accumulator ports `accumulate_event`. `messages-create` still rejects `:stream true`. No `MessageStream` helper events (`text`, `input_json` snapshots) or `text_stream`. See Streaming below. |
 | `client.messages.count_tokens(...)` | `(count-tokens client request)` | **Resolved, implemented** — same request shape as `messages-create` minus `max_tokens`, same retry policy and error hierarchy, POSTs to `/v1/messages/count_tokens`. |
@@ -416,7 +417,7 @@ for those functions' own failures) and `ex-data` `{:type <keyword> :status
 | WIF or profile refresh token endpoint unreachable, non-2xx, or oversized/malformed response; assertion over 16 KiB; `user_oauth` with `client_id` but no `refresh_token`; `oidc_federation` profile without `federation_rule_id`/`organization_id`. `ex-data` `{:type :status :body <redacted> :request-id}` | `:tools.agents.anthropic.error/token-exchange` |
 | WIF identity token file missing, unreadable, a directory or empty; `ANTHROPIC_IDENTITY_TOKEN` removed after discovery. `ex-data` `{:type :path}` | `:tools.agents.anthropic.error/identity-token` |
 | `:max-retries` is not a non-negative integer (client construction) | `:tools.agents.anthropic.error/invalid-max-retries` |
-| `:http` is not a fn (client construction; `:option` in `ex-data`) | `:tools.agents.anthropic.error/invalid-options` |
+| `:http` is not a fn, or `:json` not a `{:read :write}` codec map (client construction; `:option` in `ex-data`) | `:tools.agents.anthropic.error/invalid-options` |
 | `:stream true` requested on `messages-create` (use `messages-stream`) | `:tools.agents.anthropic.error/streaming-unsupported` |
 | stream event before `message_start`, or a delta/stop for an index with no block (`accumulate-event`) | `:tools.agents.anthropic.error/invalid-response` |
 | response has no `"content"` array | `:tools.agents.anthropic.error/invalid-response` |
@@ -900,7 +901,8 @@ same data-transparency spirit as the original Zig builtin's own recursive
 **string** keys (matching the original builtin's contract). The wrappers
 throw this namespace's own `:tools.agents.anthropic.error/json-encode` /
 `json-parse` with `tools.agents.anthropic/write-json: ` /
-`tools.agents.anthropic/read-json: ` message prefixes.
+`tools.agents.anthropic/read-json: ` message prefixes. A client built with
+`:json` uses that codec instead (`client-codec` returns the one in effect).
 
 ## Testing
 

@@ -57,10 +57,11 @@ wrappers over a codec bound to that namespace's documented error `:type`
 keywords and `<ns>/read-json: ` / `<ns>/write-json: ` message prefixes. For
 example, `tools.agents.openai` throws `:tools.agents.openai/json-parse-error`,
 and `tools.agents.anthropic` throws `:tools.agents.anthropic.error/json-parse`.
+A client can swap in another codec with `:json`; see the next section.
 
 ## Bring your own HTTP client / JSON codec
 
-Every client takes `:http`, a request fn that replaces
+Every client takes `:http` and `:json`. `:http` is a request fn that replaces
 `tools.agents.http/request!` for all of its network I/O: anthropic (with
 batches and the profile / workload-identity token exchanges `client`
 resolves), openai (every resource namespace, openai.agents included), gemini,
@@ -92,7 +93,31 @@ The fn has exactly `request!`'s contract:
 (fusion/fuse [{:provider :openai :model "m" :http hato-http} ...] prompt)
 ```
 
-A non-fn `:http` throws the client's `invalid-options` error at
+`:json` replaces the built-in codec for a client's wire traffic: request
+bodies, responses, error bodies, stream events and JSONL batch results. It is
+`{:read (fn [String] value) :write (fn [value] String)}`; `:read-jsonl` is
+derived from `:read`. `:read` must return **string-keyed** maps and vectors,
+as the built-in codec does, since every accessor here looks keys up as
+strings. Anything the codec throws is rethrown as the client's own
+`json-parse` / `json-encode` error type, with the codec's exception as the
+cause. MCP takes `:json` on `server/server` (used by `handle-http`,
+`serve!`, `sse-event` and `stdio/connection`) and on both transports'
+`connect!`.
+
+```clojure
+;; pseudocode: jsonista, keys left as strings
+(def jsonista {:read  #(jsonista.core/read-value %)
+               :write #(jsonista.core/write-value-as-string %)})
+
+(openai/client {:api-key k :json jsonista :http hato-http})
+(server/server {:name "s" :tools [...] :json jsonista})
+```
+
+Some JSON stays on the built-in codec: each namespace's public
+`read-json`/`write-json`, `anthropic/accumulate-event`'s tool-input parsing,
+`anthropic.visualize`, credential files and token exchanges, and
+`openai.batches/batch-input-jsonl` (no client argument). A non-fn `:http` or
+a non-codec `:json` throws the client's `invalid-options` error at
 construction. A credential source you build yourself does not inherit the
 client's `:http`: pass it to `tools.agents.openai.credentials/workload-identity-source`
 and the metadata providers (`:http`), or to

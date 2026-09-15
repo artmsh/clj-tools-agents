@@ -266,6 +266,7 @@ header, no query string) plus Microsoft's documentation.
 | `client.with_options(...)` (general form) | `(assoc client ...)` | Per-request override without mutating the client. `OpenAIClient` supports associative updates, so callers use `(assoc client :base-url ...)` / `(assoc client :max-retries 5)` themselves. |
 | `OpenAI(max_retries=2)` / automatic backoff | `(client {:max-retries 2})`, default `default-max-retries` = 2 | Implemented — connection failures, 408, 409, 429 and 5xx are retried with the SDK's exact backoff, jitter and `Retry-After` handling. See Retries below. |
 | `client.with_options(max_retries=5)` | `(assoc client :max-retries 5)` | The client record is associative, so the per-call override needs no dedicated API. |
+| *(no SDK equivalent)* | `:json` client opt | A `{:read :write}` codec used by `request!` (every resource namespace and stream), `batches-results` and `webhooks/unwrap` given `:client`; its exceptions become `:json-parse-error`/`:json-encode-error` with the cause kept. `batch-input-jsonl` (no client) and workload-identity exchanges stay built-in. See README, Bring your own HTTP client / JSON codec. |
 | `OpenAI(http_client=httpx.Client(...))` | `:http` client opt | A request fn with `tools.agents.http/request!`'s contract; `request!` sends every attempt through it, so all resource namespaces, openai.agents and streaming use it. `workload-identity-source` and the Azure/GCP metadata providers take their own `:http`. See README, Bring your own HTTP client. |
 | `timeout` (default 10 min) / `APITimeoutError` | *(not implemented)* | Each runtime's HTTP leaf uses its own default timeout; a timeout surfaces as `:tools.agents.openai/api-connection-error` (which is also where Python's `APITimeoutError` sits in the hierarchy, as a subclass of `APIConnectionError`) and is retried like any other transport failure, exactly as the SDK does. |
 | `client.responses.create(..., stream=True)` | `(responses-stream client params)` | Single-use reducible of decoded event maps, opened (and retried) at call time through `request!`. `:stream true` on `responses-create` is still rejected. See Streaming below. |
@@ -368,7 +369,7 @@ Non-status error types:
 | workload identity token exchange: other non-2xx, malformed 2xx body, empty subject token, `expires_in` ≤ 0 (`ex-data` `{:type :status}`, never a token) | `:tools.agents.openai/token-exchange-error` |
 | built-in subject token provider failed (k8s file, Azure IMDS, GCP metadata; `SubjectTokenProviderError`) | `:tools.agents.openai/subject-token-provider-error` |
 | a callable `:api-key` returned a non-string or blank value (value never included) | `:tools.agents.openai/invalid-api-key` |
-| `:http` is not a fn (client construction; `:option` in `ex-data`) | `:tools.agents.openai/invalid-options` |
+| `:http` is not a fn, or `:json` not a `{:read :write}` codec map (client construction; `:option` in `ex-data`) | `:tools.agents.openai/invalid-options` |
 | `:stream true` requested from a non-streaming function | `:tools.agents.openai/streaming-unsupported` |
 | while reducing a stream: an `error` event, or an event with a top-level `"error"` object (`:error` in ex-data, `:body` the raw data, `:status` nil) | `:tools.agents.openai/stream-error` |
 | while reducing a stream: the connection fails mid-body | `:tools.agents.openai/api-connection-error` |

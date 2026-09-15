@@ -354,3 +354,22 @@
     (is (= 0 ((:close! transport)))
         "closing stdin is the whole shutdown; a conforming server exits 0")))
 
+
+;; ---------------------------------------------------------------------------
+;; Injected :json (#10): the server's codec frames stdio too
+;; ---------------------------------------------------------------------------
+
+(deftest server-json-codec-frames-the-connection
+  (let [reads (atom 0) writes (atom 0)
+        codec {:read  (fn [s] (swap! reads inc) (mcp/read-json s))
+               :write (fn [v] (swap! writes inc) (mcp/write-json v))}
+        written (atom [])
+        conn (stdio/connection (server/server {:name "coded" :json codec
+                                               :tools [{:name "echo" :handler (fn [_ a] (get a "m"))}]})
+                               {:write-fn #(swap! written conj %)})]
+    (stdio/handle-line! conn (line "tools/call" {"name" "echo" "arguments" {"m" "hi"}}))
+    (is (= "hi" (mcp/output-text (get (mcp/read-json (first @written)) "result"))))
+    (is (= [1 1] [@reads @writes]))
+    (testing "legacy handshake path"
+      (stdio/handle-line-legacy! conn (mcp/write-json {"jsonrpc" "2.0" "id" 2 "method" "ping"}))
+      (is (= [2 2] [@reads @writes])))))

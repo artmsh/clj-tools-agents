@@ -1,6 +1,7 @@
 (ns tools.agents.fusion-test
   (:require [clojure.test :refer [deftest is]]
-            [tools.agents.fusion :as fusion]))
+            [tools.agents.fusion :as fusion]
+            [tools.agents.json]))
 
 (defn- index-of [xs target]
   (loop [i 0 xs xs]
@@ -97,3 +98,13 @@
     (is (= :ok (:status result)))
     (is (= #{"from-o" "from-a"} (set (:texts result))))
     (is (= #{"https://openai.fake/v1/responses" "https://anthropic.fake/v1/messages"} (set @calls)))))
+
+(deftest provider-json-is-forwarded-to-the-client
+  (let [writes (atom 0)
+        codec  {:read  tools.agents.json/read-json
+                :write (fn [v] (swap! writes inc) (tools.agents.json/write-json v))}
+        http   (fn [_] {:status 200 :headers {}
+                        :body "{\"content\":[{\"type\":\"text\",\"text\":\"a\"}]}"})
+        result (fusion/provider-call {:provider :anthropic :model "m" :api-key "k" :http http :json codec} "p")]
+    (is (= "a" (:text result)))
+    (is (= 1 @writes))))
