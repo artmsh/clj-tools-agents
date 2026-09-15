@@ -609,3 +609,204 @@
       (let [final (a/add-tool-results messages [{:tool-use-id id :content "72F and sunny"}])]
         (is (= "user" (get (last final) "role")))
         (is (= "tool_result" (get-in (last final) ["content" 0 "type"])))))))
+
+;; ---------------------------------------------------------------------------
+;; Stream accumulation (accumulate-event / accumulate-stream / stream-complete?)
+;; Event shapes follow the Anthropic streaming docs' examples; the rules are
+;; anthropic-sdk-python lib/streaming/_messages.py accumulate_event.
+;; ---------------------------------------------------------------------------
+
+(defn- msg-start [& {:as extra}]
+  {"type" "message_start"
+   "message" (merge {"id" "msg_1" "type" "message" "role" "assistant" "content" [] "model" "claude-opus-5"
+                     "stop_reason" nil "stop_sequence" nil
+                     "usage" {"input_tokens" 472 "output_tokens" 2}}
+                    extra)})
+
+(defn- block-start [i block] {"type" "content_block_start" "index" i "content_block" block})
+(defn- delta [i d] {"type" "content_block_delta" "index" i "delta" d})
+(defn- block-stop [i] {"type" "content_block_stop" "index" i})
+(def ^:private msg-stop {"type" "message_stop"})
+
+(deftest accumulate-text-and-stop
+  (let [evs [(msg-start)
+             (block-start 0 {"type" "text" "text" ""})
+             {"type" "ping"}
+             (delta 0 {"type" "text_delta" "text" "Hello"})
+             (delta 0 {"type" "text_delta" "text" "!"})
+             (block-stop 0)
+             {"type" "message_delta" "delta" {"stop_reason" "end_turn" "stop_sequence" nil}
+              "usage" {"output_tokens" 15}}
+             msg-stop]
+        m   (a/accumulate-stream evs)]
+    (is (= {"id" "msg_1" "type" "message" "role" "assistant" "model" "claude-opus-5"
+            "content" [{"type" "text" "text" "Hello!"}]
+            "stop_reason" "end_turn" "stop_sequence" nil
+            "usage" {"input_tokens" 472 "output_tokens" 15}}
+           m))
+    (is (vector? (get m "content")))
+    (is (= "Hello!" (a/output-text m)))
+    (is (a/stream-complete? m))
+    (is (= m (reduce a/accumulate-event nil evs)) "plain reduce with init nil")
+    (testing "truncation: no message_stop -> same message, not complete, no throw"
+      (let [t (a/accumulate-stream (pop evs))]
+        (is (= m t))
+        (is (false? (a/stream-complete? t)))))
+    (is (false? (a/stream-complete? {"content" []})) "hand-built message")
+    (is (nil? (a/accumulate-stream [])))))
+
+(deftest accumulate-tool-use-partial-json
+  ;; docs "Streaming request with tool use": the first input_json_delta is "".
+  (let [evs [(msg-start)
+             (block-start 0 {"type" "text" "text" ""})
+             (delta 0 {"type" "text_delta" "text" "Okay, let's check the weather for San Francisco, CA:"})
+             (block-stop 0)
+             (block-start 1 {"type" "tool_use" "id" "toolu_01T1x1fJ34qAmk2tNTrN7Up6" "name" "get_weather" "input" {}})
+             (delta 1 {"type" "input_json_delta" "partial_json" ""})
+             (delta 1 {"type" "input_json_delta" "partial_json" "{\"location\":"})
+             (delta 1 {"type" "input_json_delta" "partial_json" " \"San"})
+             (delta 1 {"type" "input_json_delta" "partial_json" " Francisc"})
+             (delta 1 {"type" "input_json_delta" "partial_json" "o,"})
+             (delta 1 {"type" "input_json_delta" "partial_json" " CA\", \"unit\": \"fahrenheit\"}"})
+             (block-stop 1)
+             {"type" "message_delta" "delta" {"stop_reason" "tool_use" "stop_sequence" nil}
+              "usage" {"output_tokens" 89}}
+             msg-stop]
+        m   (a/accumulate-stream evs)]
+    (is (= {"type" "tool_use" "id" "toolu_01T1x1fJ34qAmk2tNTrN7Up6" "name" "get_weather"
+            "input" {"location" "San Francisco, CA" "unit" "fahrenheit"}}
+           (get-in m ["content" 1])))
+    (is (a/tool-use? m))
+    (is (= [{:id "toolu_01T1x1fJ34qAmk2tNTrN7Up6" :name "get_weather"
+             :input {"location" "San Francisco, CA" "unit" "fahrenheit"}}]
+           (a/tool-calls m)))
+    (is (= "Okay, let's check the weather for San Francisco, CA:" (a/output-text m)))
+    (testing "partial JSON is never parsed before content_block_stop: truncation keeps the start input"
+      (let [t (a/accumulate-stream (subvec evs 0 8))]
+        (is (= {} (get-in t ["content" 1 "input"])))
+        (is (false? (a/stream-complete? t)))))
+    (testing "an empty buffer keeps content_block_start's input"
+      (is (= {} (get-in (a/accumulate-stream [(msg-start) (block-start 0 {"type" "tool_use" "id" "t" "name" "n" "input" {}})
+                                              (delta 0 {"type" "input_json_delta" "partial_json" ""})
+                                              (block-stop 0)])
+                        ["content" 0 "input"]))))
+    (testing "server_tool_use tracks input too"
+      (is (= {"query" "weather"}
+             (get-in (a/accumulate-stream [(msg-start) (block-start 0 {"type" "server_tool_use" "id" "srvtoolu_1"
+                                                                      "name" "web_search" "input" {}})
+                                           (delta 0 {"type" "input_json_delta" "partial_json" "{\"query\": \"weat"})
+                                           (delta 0 {"type" "input_json_delta" "partial_json" "her\"}"})
+                                           (block-stop 0)])
+                     ["content" 0 "input"]))))
+    (testing "input_json_delta on a non-tool block is ignored"
+      (is (= {"type" "text" "text" ""}
+             (get-in (a/accumulate-stream [(msg-start) (block-start 0 {"type" "text" "text" ""})
+                                           (delta 0 {"type" "input_json_delta" "partial_json" "{"})
+                                           (block-stop 0)])
+                     ["content" 0]))))
+    (testing "invalid JSON at content_block_stop throws :json-parse (the SDK's ValueError)"
+      (let [e (try (a/accumulate-stream [(msg-start) (block-start 0 {"type" "tool_use" "id" "t" "name" "n" "input" {}})
+                                         (delta 0 {"type" "input_json_delta" "partial_json" "{\"a\": tru}"})
+                                         (block-stop 0)])
+                   nil (catch Exception e e))]
+        (is (= :tools.agents.anthropic.error/json-parse (:type (ex-data e))))
+        (is (= "{\"a\": tru}" (:body (ex-data e))))))))
+
+(deftest accumulate-thinking-and-signature
+  ;; docs "Streaming request with extended thinking"
+  (let [m (a/accumulate-stream
+           [(msg-start)
+            (block-start 0 {"type" "thinking" "thinking" "" "signature" ""})
+            (delta 0 {"type" "thinking_delta" "thinking" "I need to find the GCD of 1071 and 462 "})
+            (delta 0 {"type" "thinking_delta" "thinking" "using the Euclidean algorithm."})
+            (delta 0 {"type" "signature_delta" "signature" "EqQBCgIYAhIM1gbcDa9GJwZA2b3hGgxBdjrkzLoky3dl1pkiMOYds"})
+            (block-stop 0)
+            (block-start 1 {"type" "text" "text" ""})
+            (delta 1 {"type" "text_delta" "text" "The greatest common divisor is 21."})
+            (delta 1 {"type" "signature_delta" "signature" "ignored-on-text"})
+            (delta 1 {"type" "thinking_delta" "thinking" "ignored-on-text"})
+            (block-stop 1)
+            {"type" "message_delta" "delta" {"stop_reason" "end_turn" "stop_sequence" nil} "usage" {"output_tokens" 30}}
+            msg-stop])]
+    (is (= [{"type" "thinking" "thinking" "I need to find the GCD of 1071 and 462 using the Euclidean algorithm."
+             "signature" "EqQBCgIYAhIM1gbcDa9GJwZA2b3hGgxBdjrkzLoky3dl1pkiMOYds"}
+            {"type" "text" "text" "The greatest common divisor is 21."}]
+           (get m "content")))
+    (is (= "The greatest common divisor is 21." (a/output-text m)))
+    (is (a/stream-complete? m))))
+
+(deftest accumulate-citations-delta
+  (let [c1 {"type" "char_location" "cited_text" "The grass is green." "document_index" 0
+            "document_title" "Doc" "start_char_index" 0 "end_char_index" 20}
+        c2 (assoc c1 "cited_text" "The sky is blue." "start_char_index" 20 "end_char_index" 36)
+        m  (a/accumulate-stream
+            [(msg-start)
+             (block-start 0 {"type" "text" "text" ""})
+             (delta 0 {"type" "text_delta" "text" "the grass is green"})
+             (delta 0 {"type" "citations_delta" "citation" c1})
+             (delta 0 {"type" "citations_delta" "citation" c2})
+             (block-stop 0)
+             msg-stop])]
+    (is (= {"type" "text" "text" "the grass is green" "citations" [c1 c2]} (get-in m ["content" 0])))
+    (is (= "the grass is green" (a/output-text m)))
+    (testing "citations_delta onto a block that started with citations: null"
+      (is (= [c1] (get-in (a/accumulate-stream [(msg-start) (block-start 0 {"type" "text" "text" "" "citations" nil})
+                                                (delta 0 {"type" "citations_delta" "citation" c1})])
+                          ["content" 0 "citations"]))))))
+
+(deftest accumulate-message-delta-usage-merge
+  (let [start (msg-start "usage" {"input_tokens" 10 "output_tokens" 1
+                                  "cache_creation_input_tokens" 5 "cache_read_input_tokens" 7})
+        m     (a/accumulate-stream
+               [start
+                {"type" "message_delta"
+                 "delta" {"stop_reason" "max_tokens" "stop_sequence" nil "container" nil}
+                 "usage" {"output_tokens" 20 "cache_read_input_tokens" nil
+                          "server_tool_use" {"web_search_requests" 1}}}
+                {"type" "message_delta"
+                 "delta" {"stop_reason" "end_turn" "stop_sequence" nil
+                          "container" {"id" "container_1" "expires_at" "2026-09-15T00:00:00Z"}}
+                 "usage" {"output_tokens" 42 "input_tokens" 12}}
+                msg-stop])]
+    (is (= {"input_tokens" 12 "output_tokens" 42 "cache_creation_input_tokens" 5 "cache_read_input_tokens" 7
+            "server_tool_use" {"web_search_requests" 1}}
+           (get m "usage"))
+        "cumulative: overwrite, never add; nil/absent optional fields keep the earlier value")
+    (is (= "end_turn" (get m "stop_reason")))
+    (is (= {"id" "container_1" "expires_at" "2026-09-15T00:00:00Z"} (get m "container")))
+    (is (not (contains? m "stop_details")) "a key neither side has stays absent")
+    (is (= 42 (get-in (a/accumulate-stream [start {"type" "message_delta" "delta" {} "usage" {"output_tokens" 42}}])
+                      ["usage" "output_tokens"])))))
+
+(deftest accumulate-event-order-and-errors
+  (testing "a message event before message_start throws :invalid-response"
+    (let [e (try (a/accumulate-stream [(block-start 0 {"type" "text" "text" ""})]) nil (catch Exception e e))]
+      (is (= :tools.agents.anthropic.error/invalid-response (:type (ex-data e))))))
+  (testing "ping and unknown event types are ignored, before and after message_start"
+    (is (= "hi" (a/output-text (a/accumulate-stream [{"type" "ping"} {"type" "future_event"} (msg-start)
+                                                     (block-start 0 {"type" "text" "text" "hi"})
+                                                     {"type" "future_event"}
+                                                     (delta 0 {"type" "future_delta" "x" 1})
+                                                     (block-stop 0)])))))
+  (testing "a delta for an index with no block throws :invalid-response"
+    (let [e (try (a/accumulate-stream [(msg-start) (delta 3 {"type" "text_delta" "text" "x"})]) nil (catch Exception e e))]
+      (is (= :tools.agents.anthropic.error/invalid-response (:type (ex-data e))))))
+  (testing "fallback-style blocks (start + stop, no deltas) pass through"
+    (is (= [{"type" "fallback" "model" "m2"}]
+           (get (a/accumulate-stream [(msg-start) (block-start 0 {"type" "fallback" "model" "m2"}) (block-stop 0)])
+                "content"))))
+  (testing "an error event throws the typed stream error"
+    (doseq [[wire kw] [["overloaded_error" :tools.agents.anthropic.error/overloaded]
+                       ["rate_limit_error" :tools.agents.anthropic.error/rate-limit]
+                       ["api_error" :tools.agents.anthropic.error/internal-server]
+                       ["invalid_request_error" :tools.agents.anthropic.error/bad-request]
+                       ["authentication_error" :tools.agents.anthropic.error/authentication]
+                       ["permission_error" :tools.agents.anthropic.error/permission-denied]
+                       ["not_found_error" :tools.agents.anthropic.error/not-found]
+                       ["request_too_large" :tools.agents.anthropic.error/api-status]
+                       ["something_new" :tools.agents.anthropic.error/api-status]]]
+      (let [e (try (a/accumulate-stream [(msg-start) {"type" "error" "error" {"type" wire "message" "Overloaded"}}])
+                   nil (catch Exception e e))]
+        (is (= kw (:type (ex-data e))) wire)
+        (is (= wire (:error-type (ex-data e))))
+        (is (nil? (:status (ex-data e))))))))

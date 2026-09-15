@@ -125,6 +125,7 @@
     :tools.agents.anthropic.error/unprocessable-entity
     :tools.agents.anthropic.error/rate-limit
     :tools.agents.anthropic.error/internal-server
+    :tools.agents.anthropic.error/overloaded
     :tools.agents.anthropic.error/api-status
     :tools.agents.anthropic.error/api-connection
     :tools.agents.anthropic.error/json-encode

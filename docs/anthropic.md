@@ -63,7 +63,7 @@ Programmatic Tool Calling below.
 | `anthropic.APIError` / `.APIStatusError` / `.RateLimitError` / etc. | `ex-info` with `:type` in `ex-data` | See the error-hierarchy table below — one exception constructor, discriminated by `:type`, rather than a Python-style class hierarchy (there is no `class` in Clojure to mirror it with). |
 | `client.with_options(...)` | *(not implemented)* | Per-request override without mutating the client. Out of scope for this port; `AnthropicClient` supports associative updates, so callers can use `(assoc client :base-url ...)` themselves. |
 | `max_retries` / automatic backoff | `:max-retries` client opt, default 2 | **Resolved, implemented.** See Retries below. |
-| `client.messages.stream(...)` / `stream=True` | **rejected outright** | Not resolved — this is  an open TODO. |
+| `client.messages.create(..., stream=True)` / `client.messages.stream(...)` | `(messages-stream client params)` + `accumulate-event`/`accumulate-stream`/`stream-complete?` | **Resolved, implemented.** A single-use reducible of decoded events instead of a `Stream` iterator; the accumulator ports `accumulate_event`. `messages-create` still rejects `:stream true`. No `MessageStream` helper events (`text`, `input_json` snapshots) or `text_stream`. See Streaming below. |
 | `client.messages.count_tokens(...)` | `(count-tokens client request)` | **Resolved, implemented** — same request shape as `messages-create` minus `max_tokens`, same retry policy and error hierarchy, POSTs to `/v1/messages/count_tokens`. |
 | `client.messages.batches.create/retrieve/list/cancel/delete/results` | `tools.agents.anthropic.batches`: `batches-create`, `batches-retrieve`, `batches-list` (+ `next-page-params`, `batches-list-all`), `batches-cancel`, `batches-delete`, `batches-results` | **Resolved, implemented.** Same client, retries and error typing as `messages-create`. SDK deviations (no pre-flight `retrieve` in `results`, no `workspace_id`/`user_profile_id` kwargs, results buffered then decoded lazily) are listed in Message Batches below. |
 | Workload Identity Federation: `WorkloadIdentityCredentials`, `ANTHROPIC_FEDERATION_RULE_ID` + `ANTHROPIC_ORGANIZATION_ID` + `ANTHROPIC_IDENTITY_TOKEN[_FILE]` | `tools.agents.anthropic.credentials`: `workload-identity-source`, `workload-identity-from-env`, `exchange-token!`; env discovery is step 4 of `client`'s chain | **Resolved, implemented** (#35). See Workload Identity Federation below. Verified against a fake token endpoint only. |
@@ -299,6 +299,7 @@ for those functions' own failures) and `ex-data` `{:type <keyword> :status
 | 422 | `:tools.agents.anthropic.error/unprocessable-entity` |
 | 429 | `:tools.agents.anthropic.error/rate-limit` |
 | ≥500 | `:tools.agents.anthropic.error/internal-server` |
+| in-stream `error` event with `error.type` `overloaded_error` (`messages-stream` only; other `error.type`s map as in Streaming below) | `:tools.agents.anthropic.error/overloaded` |
 | other non-2xx (e.g. 413, 529) | `:tools.agents.anthropic.error/api-status` |
 | no response at all (DNS/refused/TLS/timeout) | `:tools.agents.anthropic.error/api-connection` |
 | malformed request/response JSON | `:tools.agents.anthropic.error/json-encode` / `:tools.agents.anthropic.error/json-parse` |
@@ -308,7 +309,8 @@ for those functions' own failures) and `ex-data` `{:type <keyword> :status
 | WIF token endpoint unreachable, non-2xx, or oversized/malformed response; assertion over 16 KiB. `ex-data` `{:type :status :body <redacted> :request-id}` | `:tools.agents.anthropic.error/token-exchange` |
 | WIF identity token file missing, unreadable, a directory or empty; `ANTHROPIC_IDENTITY_TOKEN` removed after discovery. `ex-data` `{:type :path}` | `:tools.agents.anthropic.error/identity-token` |
 | `:max-retries` is not a non-negative integer (client construction) | `:tools.agents.anthropic.error/invalid-max-retries` |
-| `:stream true` requested | `:tools.agents.anthropic.error/streaming-unsupported` |
+| `:stream true` requested on `messages-create` (use `messages-stream`) | `:tools.agents.anthropic.error/streaming-unsupported` |
+| stream event before `message_start`, or a delta/stop for an index with no block (`accumulate-event`) | `:tools.agents.anthropic.error/invalid-response` |
 | response has no `"content"` array | `:tools.agents.anthropic.error/invalid-response` |
 | no `"text"` blocks in `"content"` | `:tools.agents.anthropic.error/no-text-content` |
 | `"text"` content block has a non-string `"text"` value | `:tools.agents.anthropic.error/invalid-content-shape` |
@@ -672,11 +674,105 @@ of its own) and fixed:
   (`s/keys` conforms as identity, so a predicate right after it still sees
   the real map).
 
-### Streaming is not supported
+### Streaming
 
-`:stream true` throws `{:type :tools.agents.anthropic.error/streaming-unsupported}`
-immediately, before any network request, rather than being silently ignored
-or hanging. SSE streaming is simply not implemented by this client.
+```clojure
+(let [s (a/messages-stream client request)]
+  (run! #(some-> (get-in % ["delta" "text"]) print) s))   ; text as it arrives
+
+(let [m (a/accumulate-stream (a/messages-stream client request))]
+  (when-not (a/stream-complete? m) (throw (ex-info "truncated" {})))
+  (a/output-text m))                                       ; the final Message
+```
+
+**Wire.** `POST /v1/messages` with `"stream": true` added to the request (a
+caller's `:stream`/`"stream"` value is replaced), same headers as
+`messages-create` (`x-api-key`, or `Authorization: Bearer` +
+`oauth-2025-04-20`; `anthropic-version`; `:betas` in `anthropic-beta`).
+Sources: Anthropic's streaming docs
+(platform.claude.com/docs/en/build-with-claude/streaming): `message_start`,
+then per block `content_block_start` / `content_block_delta`+ /
+`content_block_stop`, then `message_delta`+ and `message_stop`, with `ping`
+anywhere; each SSE event name is repeated as `"type"` in its data; "new event
+types may be added"; usage in `message_delta` is cumulative. The accumulator
+ports anthropic-sdk-python `src/anthropic/lib/streaming/_messages.py`
+`accumulate_event` @ `eb21a4352015686c30f5759e8c2f02d70f5371e2`; error-event
+handling ports `src/anthropic/_streaming.py` `Stream.__stream__` at the same
+commit.
+
+**Events.** The reducible yields each event's decoded data map (string keys)
+verbatim, `ping` and unknown types included; a data map with no `"type"` gets
+the SSE event name, as `Stream.__stream__` does. The SDK's raw `Stream` drops
+`ping` and unknown event names; here they pass through, since the docs ask
+clients to handle them gracefully.
+
+**Lifecycle.** `messages-stream` sends the request at call time and returns
+the `tools.agents.stream` reducible. It is single-use: one reduce consumes it
+and closes the connection, including on early termination such as
+`(into [] (take 1) s)`. A stream you never reduce must be released with
+`(tools.agents.stream/close! s)`, which is also the cross-thread cancel.
+`with-open`/`.close` work on the JVM only, because Babashka's `reify` cannot
+add `java.io.Closeable`. `(tools.agents.stream/response s)` gives the 2xx
+status and headers; `accumulate-stream` over the stream attaches them, so
+`request-id` works on the accumulated message. No resumption: a lost stream
+is re-requested by the caller.
+
+**Retries and errors.** The opening exchange runs under `messages-create`'s
+retry policy (`request-with-retries!`: 408/409/429/5xx incl. 529, connection
+failures, `Retry-After`, `:max-retries`, `*sleep-fn*`), with headers rebuilt
+per attempt; a `:credential-source` client's first 401 invalidates the token
+and retries once outside `:max-retries`. The SDK also retries only the
+request, before its iterator starts. Nothing is retried once a 2xx body is
+being read.
+
+| failure | when it throws | `:type` |
+|---|---|---|
+| non-2xx after retries | from `messages-stream` | the status table above, same `:status`/`:body`/`:headers`; message `tools.agents.anthropic/messages-stream: HTTP <status> <message>` |
+| no connection after retries | from `messages-stream` | `api-connection` |
+| `event: error` (or data `"type": "error"`) | from the reduce; nothing after it is delivered | from `error.type`: `invalid_request_error` → `bad-request`, `authentication_error` → `authentication`, `permission_error` → `permission-denied`, `not_found_error` → `not-found`, `rate_limit_error` → `rate-limit`, `api_error` → `internal-server`, `overloaded_error` → `overloaded`, anything else → `api-status`. `:status nil`, `:body` the raw `data:` string, `:headers` the 2xx response's, `:error-type` the wire string |
+| connection lost mid-stream | from the reduce | `api-connection`, cause the `IOException` |
+| undecodable event | from the reduce | `json-parse` |
+
+**Divergence: error typing.** The SDK raises an in-stream error through
+`_make_status_error`, which dispatches on the HTTP status only. A stream's
+status is 200, so every in-stream error is a plain `APIStatusError` there.
+Here the type comes from `error.type`, per the error-type table in
+Anthropic's errors docs (`overloaded_error` is HTTP 529). `overloaded` is
+streaming-only: an HTTP 529 before the stream still types as
+`internal-server`.
+
+**Truncation.** A body that ends without `message_stop` reduces normally, and
+`(tools.agents.stream/outcome s)` is `:eof` for complete and truncated streams
+alike: `messages-stream` sets no `done?`, so `message_stop` reaches the
+reducer. `(stream-complete? message)` is true iff `accumulate-event` saw
+`message_stop`. The flag is metadata, so a hand-built, non-streamed or rebuilt
+(`into {}`) map reads `false`. Neither the stream nor the accumulator throws
+on truncation. A connection that drops mid-chunk is a transport error and
+throws, see above.
+
+**Accumulating.** `accumulate-event` is a pure reducing fn (`[]` → `nil`,
+`[acc]` → `acc`, `[acc event]`); `(accumulate-stream events)` is
+`(transduce identity accumulate-event events)` over the stream or any
+collection. Tool-input buffers and the completion flag live in metadata, so
+the result is `=` to the non-streamed Message and
+`output-text`/`tool-calls`/`tool-use?` work on it.
+
+| event | rule | vs. `accumulate_event` |
+|---|---|---|
+| `message_start` | the message, `content` a vector | same |
+| content/message event before `message_start` | throws `invalid-response` | same (`RuntimeError`); `ping`/unknown before it are ignored, since the SDK never passes them in |
+| `content_block_start` | block assoc'ed at `index` | the SDK appends and ignores `index` |
+| `text_delta` | appends `text` on a `text` block | same |
+| `citations_delta` | conjs `citation` onto `citations` (created when absent or null) on a `text` block | same |
+| `thinking_delta` | appends `thinking` on a `thinking` block | same |
+| `signature_delta` | sets `signature` on a `thinking` block | same |
+| `input_json_delta` | appends `partial_json` to a per-index buffer on `tool_use`/`server_tool_use` (`TRACKS_TOOL_INPUT`) | the SDK parses the buffer on every delta in jiter partial mode, so its `input` is a live snapshot |
+| `content_block_stop` | a tool block with a non-empty buffer gets `input` = the parsed buffer; an empty buffer keeps the start `input` (`{}`); invalid JSON throws `json-parse` with the buffer as `:body` | the SDK raises `ValueError` on invalid JSON at the delta; for a truncated `tool_use` it keeps the partial snapshot, here `input` stays `{}` |
+| `message_delta` | `stop_reason`/`stop_sequence`/`stop_details` overwritten; `container` when non-nil; `usage.output_tokens` overwritten; `input_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens`, `server_tool_use`, `output_tokens_details` overwritten only when non-nil | same, except a `stop_details` absent on both sides stays absent instead of becoming `null` |
+| `message_stop` | marks complete | no flag in the SDK |
+| `error` | throws, typed as above | unreachable in the SDK (its stream raises first) |
+| `ping`, unknown event or delta types | ignored | same |
+| `text` block stop with `output_format` | not implemented | the SDK sets `parsed_output` |
 
 ### Requiring `examples/` from the tests
 
@@ -750,6 +846,26 @@ and env literal re-read per exchange, a messages 401 re-exchanging once, the
 token endpoint's own 401 retried once, errors that never carry the
 assertion or access token, size limits, https enforcement, and chain
 precedence via an injected env map (the real env is never read).
+
+`test/tools/agents/anthropic/stream_test.cljc` — `messages-stream` against
+the streaming mock servers on OS-assigned ports: request line, body
+(`"stream": true`), `anthropic-version`, `x-api-key`/Bearer and combined
+`anthropic-beta`; the docs-verbatim `test/resources/sse/anthropic-text.sse`
+fixture accumulated to the exact Message, with `output-text`, `request-id`
+and `stream-complete?`; paced multi-event delivery (`ping` passed through,
+joined deltas equal `output-text`); an in-stream `overloaded_error` typed, not
+retried, nothing after it delivered, plus an `event: error` whose data has no
+`type`; a 400 before the stream; retries of the opening request (529 then 503
+then a stream, `Retry-After`, exhaustion, connection refused, 400 not
+retried); a body cut mid-chunk (`api-connection`); a stream without
+`message_stop` (`:eof`, not complete); early termination and `close!` seen by
+the server as a disconnect; a `:credential-source` 401 invalidate-and-retry
+(a second 401 and a static key's 401 not retried); `messages-create` still
+refusing `:stream true`. The pure accumulator tests are in
+`anthropic_test.cljc`: text, `tool_use` partial JSON (the docs' empty first
+chunk, truncation, invalid JSON, `server_tool_use`), thinking + signature,
+citations, cumulative usage merge, event ordering, unknown events and the
+error-type mapping.
 
 `test/tools/agents/anthropic/spec_test.clj` — asserts each spec both
 accepts a valid value and REJECTS a malformed one (including the exact

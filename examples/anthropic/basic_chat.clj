@@ -38,8 +38,9 @@
 
 ;; The Python example also shows the low-level streaming call
 ;; (`client.messages.create(..., stream=True)` -> `for event in stream: ...`).
-;; tools.agents.anthropic rejects :stream true outright rather than silently
-;; ignoring it or hanging — see the README's platform-limitations section.
+;; messages-create rejects :stream true outright rather than silently ignoring
+;; it or hanging; the streaming call is `a/messages-stream` (docs/anthropic.md,
+;; Streaming).
 (defn run-streaming-example [client]
   (let [messages (a/add-user-message [] "Write a 1 sentence description of a fake database")]
     (try
