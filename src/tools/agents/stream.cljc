@@ -74,10 +74,13 @@
   "One exchange: send with `:as :stream`. A 2xx response is returned with
    its body still an unread InputStream. Any other status has its body
    slurped to a String and closed, and is returned as
-   {:status :headers :body String}. A transport exception propagates."
+   {:status :headers :body String}. A transport exception propagates. A
+   String or byte[] body from an injected send fn is read as a stream
+   (tools.agents.http/stream-body)."
   [send! request]
   (fn []
-    (let [resp (send! (assoc request :as :stream))]
+    (let [resp (send! (assoc request :as :stream))
+          resp (update resp :body http/stream-body)]
       (if (two-xx? (:status resp))
         resp
         (assoc resp :body (slurp-and-close (:body resp)))))))

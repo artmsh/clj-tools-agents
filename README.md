@@ -58,6 +58,47 @@ keywords and `<ns>/read-json: ` / `<ns>/write-json: ` message prefixes. For
 example, `tools.agents.openai` throws `:tools.agents.openai/json-parse-error`,
 and `tools.agents.anthropic` throws `:tools.agents.anthropic.error/json-parse`.
 
+## Bring your own HTTP client / JSON codec
+
+Every client takes `:http`, a request fn that replaces
+`tools.agents.http/request!` for all of its network I/O: anthropic (with
+batches and the profile / workload-identity token exchanges `client`
+resolves), openai (every resource namespace, openai.agents included), gemini,
+fusion provider specs, and `tools.agents.mcp.http/connect!`. Streaming goes
+through it too.
+
+The fn has exactly `request!`'s contract:
+
+- it takes `{:method :url :headers :body :multipart :query :as :timeout-ms}`;
+  `:as` is `:string`, `:bytes` or `:stream`;
+- it returns `{:status :headers :body}` for **any** status, with lower-cased
+  header names, and throws only when no response arrives (the client types
+  that as its connection error and retries it);
+- for `:as :stream` the body is a `java.io.InputStream`; a String or byte[]
+  body is accepted and wrapped.
+
+```clojure
+;; pseudocode: adapt a hato-style client
+(defn hato-http [{:keys [method url headers body query as timeout-ms]}]
+  (let [resp (hato/request {:method method :url url :headers headers :body body
+                            :query-params query :timeout timeout-ms
+                            :as (case as :stream :stream :bytes :byte-array :string)
+                            :throw-exceptions? false})]
+    {:status  (:status resp)
+     :headers (update-keys (:headers resp) clojure.string/lower-case)
+     :body    (:body resp)}))
+
+(anthropic/client {:api-key k :http hato-http})
+(fusion/fuse [{:provider :openai :model "m" :http hato-http} ...] prompt)
+```
+
+A non-fn `:http` throws the client's `invalid-options` error at
+construction. A credential source you build yourself does not inherit the
+client's `:http`: pass it to `tools.agents.openai.credentials/workload-identity-source`
+and the metadata providers (`:http`), or to
+`tools.agents.anthropic.credentials` constructors (`:http-fn`). See
+[docs/divergences.md](docs/divergences.md).
+
 ## Refreshable credentials: `tools.agents.token`
 
 Static keys (`:api-key`, `:auth-token`) are resolved once by `client`. A

@@ -9,7 +9,7 @@
 
    PORTABILITY: all network I/O goes through `tools.agents.http/request!`,
    the shared HTTP request function, which needs no reader
-   conditional. Everything else — URL/header building, the hand-rolled JSON codec,
+   conditional, or through the fn a caller injects as the client's `:http`. Everything else — URL/header building, the hand-rolled JSON codec,
    error typing, credential resolution, output-text extraction — is plain,
    portable clojure.core exercised identically by both test runners.
 
@@ -263,11 +263,28 @@
                    false; spec.clj's own ::max-retries spec already
                    documented non-negative as the contract, this just
                    enforces it on the real, non-instrumented call path).
-                   See messages-create's retry note."
+                   See messages-create's retry note.
+     :http         request fn replacing tools.agents.http/request! for every
+                   exchange this client makes: API calls, streaming, batches
+                   and the profile / workload-identity token exchanges
+                   resolved here. Same contract as request!: takes its
+                   request map ({:method :url :headers :body :query :as
+                   :timeout-ms}), returns {:status :headers :body} for any
+                   status, throws only on transport failure. With :as
+                   :stream the body should be an InputStream (a String or
+                   byte[] is accepted). Anything but a fn throws
+                   {:type :tools.agents.anthropic.error/invalid-options}."
   ([] (client {}))
   ([opts]
    (let [explicit    (or (:base-url opts) (getenv "ANTHROPIC_BASE_URL"))
-         creds       (resolve-client-credentials opts getenv (or explicit default-base-url) http/request!)
+         http-opt    (:http opts)
+         _           (when (and (contains? opts :http) (not (http/request-fn? http-opt)))
+                       (throw (ex-info (str "tools.agents.anthropic/client: :http must be a request fn "
+                                            "with tools.agents.http/request!'s contract, got: "
+                                            (pr-str (type http-opt)))
+                                       {:type :tools.agents.anthropic.error/invalid-options :option :http})))
+         creds       (resolve-client-credentials opts getenv (or explicit default-base-url)
+                                                 (or http-opt http/request!))
          ;; kwarg > ANTHROPIC_BASE_URL > profile base_url > default (_client.py:231-240,260-274)
          base-url    (or explicit (:profile-base-url creds) default-base-url)
          creds       (dissoc creds :profile-base-url)
@@ -280,7 +297,8 @@
       (cond-> (merge {:base-url base-url
                       :max-retries max-retries}
                      creds)
-        (seq (:betas opts)) (assoc :betas (vec (:betas opts))))))))
+        (seq (:betas opts)) (assoc :betas (vec (:betas opts)))
+        http-opt            (assoc :http http-opt))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Error typing
@@ -515,15 +533,16 @@
                       {:type :tools.agents.anthropic.error/missing-credentials}))))))
 
 (defn- send-http!
-  "One tools.agents.http/request! exchange for req, classifying a genuine
+  "One exchange for req through the client's :http fn (default
+   tools.agents.http/request!), classifying a genuine
    transport failure (DNS/refused/TLS/timeout — no response at all) as
    :tools.agents.anthropic.error/api-connection. caller-name (e.g.
    \"tools.agents.anthropic/messages-create\") prefixes that error's message.
    An already-typed tools.agents.anthropic.error/* ex-info surfaces verbatim
    instead — those are permanent, not connection failures."
-  [caller-name req]
+  [client caller-name req]
   (try
-    (http/request! req)
+    ((or (:http client) http/request!) req)
     (catch Exception e
       (let [data (ex-data e)]
         (if (and data (keyword? (:type data)) (= "tools.agents.anthropic.error" (namespace (:type data))))
@@ -533,8 +552,8 @@
 
 (defn- post-json!
   "POST body-str to url with headers — send-http! with :method :post."
-  [caller-name url headers body-str]
-  (send-http! caller-name {:method :post :url url :headers headers :body body-str}))
+  [client caller-name url headers body-str]
+  (send-http! client caller-name {:method :post :url url :headers headers :body body-str}))
 
 (defn- decode-or-throw!
   "Shared response handling for every request: 2xx decodes the body and
@@ -564,9 +583,9 @@
    body-str are computed ONCE by the caller before entering
    request-with-retries! — re-serializing the whole request via write-json
    on every retry would be wasted work identical across attempts."
-  [caller-name url headers-fn body-str]
+  [client caller-name url headers-fn body-str]
   (let [headers (headers-fn)]
-    (decode-or-throw! caller-name (post-json! caller-name url headers body-str))))
+    (decode-or-throw! caller-name (post-json! client caller-name url headers body-str))))
 
 (defn- post-request!
   "Shared body of every resource method: build the URL, encode the request,
@@ -582,7 +601,7 @@
         headers-fn #(auth-headers client (fn [tok] (vreset! used-token tok)))
         body-str   (write-json request)]
     (request-with-retries! (or (:max-retries client) default-max-retries)
-                           #(attempt-request! caller-name url headers-fn body-str)
+                           #(attempt-request! client caller-name url headers-fn body-str)
                            (when src
                              {:on-unauthorized #(boolean (token/invalidate! src @used-token))}))))
 
@@ -619,7 +638,7 @@
      (fn []
        (let [auth (auth-headers client (fn [tok] (vreset! used-token tok)))]
          (decode-or-throw! caller-name
-                           (send-http! caller-name {:method method :url url :query query
+                           (send-http! client caller-name {:method method :url url :query query
                                                     :headers (merge auth headers)
                                                     :body body-str})
                            as)))
@@ -773,7 +792,7 @@
                         resp))]
     (stream/open-event-stream
      {:request       {:method :post :url url :body body-str}
-      :send!         (fn [req] (send-http! caller-name (assoc req :headers @headers)))
+      :send!         (fn [req] (send-http! client caller-name (assoc req :headers @headers)))
       :open!         open!
       ;; Decoded here rather than via :decode, which sees only the data: the
       ;; SDK's Stream.__stream__ raises on the SSE event NAME `error` and

@@ -121,9 +121,9 @@
 (defn- metadata-get!
   "One GET to a cloud metadata endpoint -> the response body String.
    `label` prefixes errors."
-  [label url query headers timeout-ms]
+  [http-fn label url query headers timeout-ms]
   (let [resp (try
-               (http/request! {:method :get :url url :query query :headers headers
+               ((or http-fn http/request!) {:method :get :url url :query query :headers headers
                                :timeout-ms timeout-ms :as :string})
                (catch Exception e
                  (provider-error! (str label ": request failed: " (.getName (class e))) nil e)))
@@ -142,11 +142,13 @@
      :api-version  default \"2018-02-01\"
      :timeout-ms   default 10000
      :url          IMDS endpoint override (tests; the SDK injects `http_client`)
+     :http         request fn with tools.agents.http/request!'s contract,
+                   default request!
 
    A non-2xx, unparseable body or missing `access_token` throws
    :tools.agents.openai/subject-token-provider-error."
   ([] (azure-managed-identity-token-provider nil))
-  ([{:keys [resource object-id client-id msi-res-id api-version timeout-ms url]
+  ([{:keys [resource object-id client-id msi-res-id api-version timeout-ms url http]
      :or   {resource    "https://management.azure.com/"
             api-version "2018-02-01"
             timeout-ms  10000
@@ -154,7 +156,7 @@
    (let [label "azure-managed-identity-token-provider"]
      {:token-type :jwt
       :get-token  (fn []
-                    (let [body  (metadata-get! label url
+                    (let [body  (metadata-get! http label url
                                                (cond-> {"api-version" api-version "resource" resource}
                                                  object-id  (assoc "object_id" object-id)
                                                  client-id  (assoc "client_id" client-id)
@@ -174,17 +176,19 @@
      :audience    default \"https://api.openai.com/v1\"
      :timeout-ms  default 10000
      :url         metadata endpoint override (tests)
+     :http        request fn with tools.agents.http/request!'s contract,
+                  default request!
 
    A non-2xx or empty body throws :tools.agents.openai/subject-token-provider-error."
   ([] (gcp-id-token-provider nil))
-  ([{:keys [audience timeout-ms url]
+  ([{:keys [audience timeout-ms url http]
      :or   {audience   "https://api.openai.com/v1"
             timeout-ms 10000
             url        "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity"}}]
    (let [label "gcp-id-token-provider"]
      {:token-type :id
       :get-token  (fn []
-                    (let [token (str/trim (metadata-get! label url {"audience" audience}
+                    (let [token (str/trim (metadata-get! http label url {"audience" audience}
                                                          {"Metadata-Flavor" "Google"} timeout-ms))]
                       (if (seq token)
                         token
@@ -250,9 +254,9 @@
     t))
 
 (defn- exchange-once!
-  [{:keys [token-exchange-url identity-provider-id service-account-id subject-token-type get-token]}]
+  [{:keys [token-exchange-url identity-provider-id service-account-id subject-token-type get-token http]}]
   (let [subject (subject-token! get-token)
-        resp    (http/request! {:method     :post
+        resp    (http {:method     :post
                                 :url        token-exchange-url
                                 :headers    {"content-type" "application/json"
                                              "accept"       "application/json"}
@@ -333,6 +337,12 @@
      :max-retries             retries of an exchange that got no response
                               (transport failure/timeout), default 2
      :now-ms                  clock (fn [] epoch-ms), for tests
+     :http                    request fn for the exchange POST, with
+                              tools.agents.http/request!'s contract; default
+                              request!. Not inherited from a client's :http:
+                              the source is built before the client. Pass
+                              the same fn to both, and to a metadata
+                              provider, to route every exchange through it.
 
    token! throws (no token in any message or ex-data):
      :tools.agents.openai/oauth-error                 exchange HTTP 400/401/403;
@@ -346,7 +356,7 @@
                                                       :max-retries
    A throwing :get-token fn is retried like a transport failure (as in the SDK)."
   [{:keys [identity-provider-id service-account-id provider refresh-buffer-seconds
-           token-exchange-url max-retries now-ms]
+           token-exchange-url max-retries now-ms http]
     :or   {refresh-buffer-seconds default-refresh-buffer-seconds
            token-exchange-url     default-token-exchange-url
            max-retries            default-max-retries
@@ -371,11 +381,15 @@
       (invalid-options! ":max-retries must be a non-negative integer"))
     (when (contains? opts :now-ms)
       (when-not (ifn? now-ms) (invalid-options! ":now-ms must be a function")))
+    (when (contains? opts :http)
+      (when-not (http/request-fn? http)
+        (invalid-options! ":http must be a request fn with tools.agents.http/request!'s contract")))
     (let [cfg    {:token-exchange-url   token-exchange-url
                   :identity-provider-id identity-provider-id
                   :service-account-id   service-account-id
                   :subject-token-type   urn
-                  :get-token            (:get-token provider)}
+                  :get-token            (:get-token provider)
+                  :http                 (or http http/request!)}
           sleep! (fn [ms] (when (pos? ms) (Thread/sleep (long ms))))]
       (token/token-cache
        {:refresh-skew-ms (long (* 1000 refresh-buffer-seconds))

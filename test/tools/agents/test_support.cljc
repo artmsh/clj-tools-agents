@@ -143,6 +143,21 @@
           (catch java.io.IOException _ nil))))
     {:port port :stop! (fn [] (reset! running false) (.close ss))}))
 
+(defn recording-http
+  "A fake `:http` request fn (tools.agents.http/request!'s contract) with no
+   network: `respond` maps each request map to a {:status :headers :body}
+   response, or throws to simulate a transport failure. Returns
+   {:http f :calls atom}; :calls holds every request map in order."
+  [respond]
+  (let [calls (atom [])]
+    {:calls calls
+     :http  (fn [req] (swap! calls conj req) (respond req))}))
+
+(defn input-stream
+  "A UTF-8 ByteArrayInputStream over s: a streamed response body."
+  ^java.io.InputStream [^String s]
+  (java.io.ByteArrayInputStream. (.getBytes s "UTF-8")))
+
 (defn rotating-token-cache
   "A tools.agents.token/token-cache whose fetch! returns \"tok-1\",
    \"tok-2\", ... that never expire, so only invalidate! causes a refetch.

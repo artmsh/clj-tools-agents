@@ -80,3 +80,20 @@
   (let [src (Object.)]
     (is (identical? src (:credential-source (#'fusion/provider-options {:provider :openai :credential-source src}))))
     (is (not (contains? (#'fusion/provider-options {:provider :openai :api-key "k"}) :credential-source)))))
+
+(deftest provider-http-is-forwarded-to-the-client
+  (let [calls (atom [])
+        http  (fn [req]
+                (swap! calls conj (:url req))
+                {:status 200 :headers {}
+                 :body (if (clojure.string/includes? (:url req) "anthropic")
+                         "{\"content\":[{\"type\":\"text\",\"text\":\"from-a\"}]}"
+                         "{\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"from-o\"}]}]}")})
+        result (fusion/fuse [{:provider :openai :id :o :model "m" :api-key "k"
+                              :base-url "https://openai.fake/v1" :http http}
+                             {:provider :anthropic :id :a :model "m" :api-key "k"
+                              :base-url "https://anthropic.fake" :http http}]
+                            "prompt")]
+    (is (= :ok (:status result)))
+    (is (= #{"from-o" "from-a"} (set (:texts result))))
+    (is (= #{"https://openai.fake/v1/responses" "https://anthropic.fake/v1/messages"} (set @calls)))))

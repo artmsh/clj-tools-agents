@@ -224,3 +224,41 @@
           (is (nil? (deref fut 5000 :timeout)))
           (is (true? (deref gone 5000 :timeout)) "the server observed the disconnect"))
         (finally (stop!))))))
+
+;; ---------------------------------------------------------------------------
+;; Injected :http (#10): no socket, the fake hosts handle-http in-process
+;; ---------------------------------------------------------------------------
+
+(defn- lower-keys [m] (into {} (map (fn [[k v]] [(clojure.string/lower-case (str k)) v])) m))
+
+(deftest injected-http-carries-every-post
+  (let [calls (atom [])
+        fake  (fn [req]
+                (swap! calls conj req)
+                (let [r (http/handle-http srv {:request-method :post :headers (lower-keys (:headers req))
+                                               :body (:body req)})]
+                  ;; a String body: connect! reads it as the stream
+                  (update r :headers lower-keys)))
+        t (http/connect! "https://mcp.fake/mcp" {:http fake})
+        c (a-client t)]
+    (is (= "hi" (mcp/output-text (client/call-tool! c "echo" {"m" "hi"}))))
+    (is (every? #(= "https://mcp.fake/mcp" (:url %)) @calls))
+    (is (every? #(= :stream (:as %)) @calls))
+    (is (= "tools/call" (get-in (last @calls) [:headers "Mcp-Method"])))))
+
+(deftest injected-http-sse-answer-is-read
+  (let [notes (atom [])
+        fake  (fn [req]
+                (let [id (get (mcp/read-json (:body req)) "id")]
+                  {:status 200 :headers sse-headers
+                   :body (java.io.ByteArrayInputStream.
+                          (.getBytes (str (http/sse-event (mcp/notification "notifications/progress" {"progress" 1}))
+                                          (http/sse-event (mcp/result-response id (mcp/tool-result [(mcp/text "done")]))))
+                                     "UTF-8"))}))
+        t (http/connect! "https://mcp.fake/mcp" {:http fake :on-notification #(swap! notes conj (get % "method"))})]
+    (is (= "done" (mcp/output-text (client/call-tool! (a-client t) "noisy"))))
+    (is (= ["notifications/progress"] @notes))))
+
+(deftest invalid-http-option-is-rejected
+  (let [e (try (http/connect! "https://mcp.fake/mcp" {:http "nope"}) nil (catch Exception e e))]
+    (is (= :tools.agents.mcp.error/invalid-options (:type (ex-data e))))))

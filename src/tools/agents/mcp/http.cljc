@@ -22,7 +22,8 @@
    the whole integration.
 
    THE CLIENT SIDE runs on both runtimes through `tools.agents.http/request!`,
-   the shared request function the provider clients use, and reads an SSE
+   the shared request function the provider clients use (or a caller's
+   injected `:http` fn), and reads an SSE
    answer incrementally through `tools.agents.stream`, so notifications on a
    request's stream (and on a `subscriptions/listen` stream) arrive live.
 
@@ -552,11 +553,22 @@
    A JSON answer is returned whatever its status: a 4xx/5xx carrying a
    JSON-RPC error is that error response, for `client/result-of` to type.
    Notifications POST with no expectation of a body: 202 Accepted returns
-   nil. A transport failure before any response propagates unwrapped."
+   nil. A transport failure before any response propagates unwrapped.
+
+   `:http` replaces tools.agents.http/request! for every POST: a request fn
+   with request!'s contract, called with `:as :stream` (a String or byte[]
+   body is accepted in place of an InputStream). Anything but a fn throws
+   ::error/invalid-options."
   ([url] (connect! url nil))
-  ([url {:keys [headers on-notification tools-by-name]
-         :or {on-notification (fn [_])}}]
-   (let [in-flight (atom {})          ; stream -> request id
+  ([url {:keys [headers on-notification tools-by-name http]
+         :or {on-notification (fn [_])}
+         :as opts}]
+   (when (and (contains? opts :http) (not (http/request-fn? http)))
+     (throw (ex-info (str "tools.agents.mcp.http/connect!: :http must be a request fn with "
+                          "tools.agents.http/request!'s contract, got: " (pr-str (type http)))
+                     {:type :tools.agents.mcp.error/invalid-options :option :http})))
+   (let [send-http (or http http/request!)
+         in-flight (atom {})          ; stream -> request id
          close-where (fn [pred]
                        (doseq [[s id] @in-flight :when (pred id)]
                          (stream/close! s)))]
@@ -571,8 +583,9 @@
             (close-where #(= target %))))
         (let [tool (get tools-by-name (get-in msg ["params" "name"]))
               req-headers (merge (request-headers msg tool) headers)
-              resp (http/request! {:method :post :url url :headers req-headers
+              resp (-> (send-http {:method :post :url url :headers req-headers
                                    :body (mcp/write-json msg) :as :stream})
+                       (update :body http/stream-body))
               status (:status resp)
               ctype (let [c (get (:headers resp) "content-type")]
                       (str/lower-case (str (if (sequential? c) (first c) c))))]

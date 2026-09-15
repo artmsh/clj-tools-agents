@@ -302,3 +302,28 @@
       {:status  (.statusCode resp)
        :headers (normalize-headers (.map (.headers resp)))
        :body    (.body resp)})))
+
+(defn stream-body
+  "The body of an `:as :stream` response as a java.io.InputStream. An
+   injected request fn (a client's `:http` option) may return a String
+   (UTF-8) or byte[] body instead of a stream; it is wrapped in a
+   ByteArrayInputStream. nil becomes an empty stream."
+  ^java.io.InputStream [body]
+  (cond
+    (instance? java.io.InputStream body) body
+    (nil? body)    (java.io.ByteArrayInputStream. (byte-array 0))
+    (string? body) (java.io.ByteArrayInputStream. (.getBytes ^String body "UTF-8"))
+    (bytes? body)  (java.io.ByteArrayInputStream. ^bytes body)
+    :else (throw (ex-info (str "tools.agents.http/stream-body: unsupported :as :stream body "
+                               (.getName (class body)))
+                          {:type :tools.agents.http/invalid-response}))))
+
+(defn request-fn?
+  "True when x can serve as a client's `:http` option: a function or var
+   (anything invocable that is not a collection, keyword or symbol). The fn
+   must honor `request!`'s contract: the same request map, the same
+   {:status :headers :body} response for every status, throwing only when no
+   response arrives."
+  [x]
+  (boolean (or (fn? x) (var? x)
+               (and (ifn? x) (not (coll? x)) (not (keyword? x)) (not (symbol? x))))))
