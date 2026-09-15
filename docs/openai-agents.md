@@ -324,7 +324,8 @@ injected so none of it costs real wall-clock.
 One test in that file hits the real API:
 `agents-crud-round-trip-against-the-real-api` runs create → retrieve →
 update → list contains → delete → retrieve 404. It runs no inference (no
-model tokens) and passes as skipped unless `OPENAI_API_KEY` is set. It
+model tokens) and passes as skipped unless both `OPENAI_AGENTS_LIVE=1` and
+`OPENAI_API_KEY` are set. It
 targets `https://api.openai.com/v1` (override: `OPENAI_AGENTS_BASE_URL`;
 model: `OPENAI_AGENTS_MODEL`, default `gpt-5.5`).
 
