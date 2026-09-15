@@ -34,6 +34,7 @@
   (:require [clojure.string :as str]
             [tools.agents.http :as http]
             [tools.agents.json :as json]
+            [tools.agents.retry :as retry]
             [tools.agents.stream :as stream]
             [tools.agents.token :as token]
             [tools.agents.anthropic.credentials :as credentials]))
@@ -492,34 +493,19 @@
                        throws. Absent (the 2-arity), a 401 is never retried."
   ([max-retries attempt-fn] (request-with-retries! max-retries attempt-fn nil))
   ([max-retries attempt-fn {:keys [on-unauthorized]}]
-   (loop [attempt 0
-          auth-retried? false]
-     (let [outcome (try {:ok (attempt-fn)}
-                         (catch Exception e
-                           (let [data      (ex-data e)
-                                 status    (:status data)
-                                 type      (:type data)
-                                 retryable (or (= type :tools.agents.anthropic.error/api-connection)
-                                               (retryable-status? status))]
-                             (cond
-                               (and (= status 401) on-unauthorized (not auth-retried?) (on-unauthorized))
-                               {:auth-retry e}
-
-                               (and retryable (< attempt max-retries))
-                               {:retry e}
-
-                               :else
-                               (throw e)))))]
-       (cond
-         (contains? outcome :auth-retry)
-         (recur attempt true)
-
-         (contains? outcome :retry)
-         (do (*sleep-fn* (backoff-seconds attempt (parse-retry-after (:headers (ex-data (:retry outcome))))))
-             (recur (inc attempt) auth-retried?))
-
-         :else
-         (:ok outcome))))))
+   (retry/with-retries
+    {:max-retries     max-retries
+     :attempt         (fn [_] (attempt-fn))
+     :unauthorized?   (fn [{:keys [error]}] (= 401 (:status (ex-data error))))
+     :on-unauthorized (when on-unauthorized (fn [_] (on-unauthorized)))
+     :retryable?      (fn [{:keys [error]}]
+                        (let [data (ex-data error)]
+                          (and error
+                               (or (= (:type data) :tools.agents.anthropic.error/api-connection)
+                                   (retryable-status? (:status data))))))
+     :delay           (fn [{:keys [retries-taken error]}]
+                        (backoff-seconds retries-taken (parse-retry-after (:headers (ex-data error)))))
+     :sleep!          #(*sleep-fn* %)})))
 
 ;; ---------------------------------------------------------------------------
 ;; Public API

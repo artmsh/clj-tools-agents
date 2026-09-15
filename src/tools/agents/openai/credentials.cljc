@@ -35,6 +35,7 @@
   (:require [clojure.string :as str]
             [tools.agents.http :as http]
             [tools.agents.json :as json]
+            [tools.agents.retry :as retry]
             [tools.agents.token :as token]))
 
 ;; ---------------------------------------------------------------------------
@@ -287,22 +288,20 @@
    owns that budget (:max-retries), since the client asks for its token
    before its own retry loop."
   [cfg max-retries sleep!]
-  (loop [retries-taken 0]
-    (let [outcome (try
-                    {:ok (exchange-once! cfg)}
-                    (catch InterruptedException e (throw e))
-                    (catch Exception e
-                      (if (own-error? e) (throw e) {:error e})))]
-      (if (contains? outcome :ok)
-        (:ok outcome)
-        (if (< retries-taken max-retries)
-          (do (sleep! (backoff-ms retries-taken))
-              (recur (inc retries-taken)))
-          (let [e (:error outcome)]
-            (fail! :tools.agents.openai/api-connection-error
-                   (str "workload-identity-source: token exchange connection failed: " (.getName (class e)))
-                   {:status nil :body nil :retries-taken retries-taken}
-                   e)))))))
+  (retry/with-retries
+   {:max-retries max-retries
+    :attempt     (fn [_] (exchange-once! cfg))
+    :rethrow?    (fn [e] (or (instance? InterruptedException e) (own-error? e)))
+    :retryable?  (fn [{:keys [error]}] (some? error))
+    :delay       (fn [{:keys [retries-taken]}] (backoff-ms retries-taken))
+    :sleep!      sleep!
+    :finish      (fn [{:keys [retries-taken error response]}]
+                   (if error
+                     (fail! :tools.agents.openai/api-connection-error
+                            (str "workload-identity-source: token exchange connection failed: " (.getName (class error)))
+                            {:status nil :body nil :retries-taken retries-taken}
+                            error)
+                     response))}))
 
 ;; ---------------------------------------------------------------------------
 ;; Public constructor

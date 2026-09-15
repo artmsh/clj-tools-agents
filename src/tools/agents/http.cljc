@@ -3,7 +3,8 @@
 
    `request!` performs exactly one HTTP exchange. It does not retry, classify
    statuses or parse bodies: each client (anthropic, openai, openai.agents,
-   gemini, mcp.http) keeps its own retry loop and error typing on top of it.
+   gemini, mcp.http) keeps its own error typing on top of it, and the
+   retrying clients run their attempts through tools.agents.retry.
 
    ONE CODE PATH, BOTH RUNTIMES: this is plain java.net.http interop, with no
    reader conditional. Babashka exposes the same HttpClient, HttpRequest,
