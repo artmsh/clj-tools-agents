@@ -96,6 +96,28 @@ Batches (`tools.agents.openai.batches`, openai-python's `client.batches.*`):
 (get-in res ["q1" "response" "body"])                            ;; lines are unordered — look up by custom_id
 ```
 
+Fine-tuning (`tools.agents.openai.fine-tuning`, openai-python's `client.fine_tuning.*`):
+
+```clojure
+(require '[tools.agents.openai.fine-tuning :as ft])
+
+(def job (ft/jobs-create client {"model" "gpt-4o-mini-2024-07-18" "training_file" "file-abc"
+                                 "method" {"type" "supervised"
+                                           "supervised" {"hyperparameters" {"n_epochs" 3}}}
+                                 "metadata" {"team" "ml"}}))
+(ft/jobs-list client {"limit" 10 "metadata" {"team" "ml"}})        ;; metadata[team]=ml
+(ft/jobs-list-events client (get job "id") {"limit" 50})
+(ft/jobs-pause client (get job "id"))
+(ft/jobs-resume client (get job "id"))
+(ft/jobs-checkpoints-list client (get job "id"))
+;; checkpoint permissions need an organization admin key as :api-key
+(let [admin (oai/client {:api-key (System/getenv "OPENAI_ADMIN_KEY")})
+      ckpt  "ft:gpt-4o-mini-2024-07-18:org:custom:ckpt-step-100"]
+  (ft/checkpoints-permissions-create admin ckpt {"project_ids" ["proj_abc"]})
+  (ft/checkpoints-permissions-list admin ckpt {"project_id" "proj_abc"})
+  (ft/checkpoints-permissions-delete admin ckpt "cp_123"))
+```
+
 `client` resolves credentials eagerly — explicit `:api-key` first, then
 `OPENAI_API_KEY`, else it throws a catchable `ex-info` **before any network
 request is attempted** (fail fast). Failed requests are retried per
@@ -199,8 +221,13 @@ header, no query string) plus Microsoft's documentation.
 | `client.batches.create(completion_window=, endpoint=, input_file_id=, metadata=, output_expires_after=)` | `(tools.agents.openai.batches/batches-create client {"input_file_id" id "endpoint" e "completion_window" "24h" ...})` | `POST /batches` JSON body, verbatim (`resources/batches.py`, `types/batch_create_params.py`); `output_expires_after` is a nested JSON object. `endpoint` is one of 8 values (`batches/endpoints`: `/v1/responses`, `/v1/chat/completions`, `/v1/embeddings`, `/v1/completions`, `/v1/moderations`, `/v1/images/generations`, `/v1/images/edits`, `/v1/videos`), sent verbatim, not validated. |
 | `client.batches.retrieve(batch_id)` / `.list(after=, limit=)` / `.cancel(batch_id)` | `(batches-retrieve client id)` / `(batches-list client params)` / `(batches-cancel client id)` | `GET /batches/{id}`, `GET /batches` (cursor page; no `order`), `POST /batches/{id}/cancel`. Ids are encoded as the SDK's `path_template` (`tools.agents.http/encode-path-segment`); an empty id throws `:tools.agents.openai/invalid-request` before I/O. The SDK has no batch wait helper, so none is ported. |
 | *(no SDK equivalent)* | `(batch-input-jsonl url requests)` / `(batches-results client batch {:errors? b})` | Helpers. `batch-input-jsonl` builds the input JSONL (unique non-empty `custom_id` enforced). `batches-results` takes a `Batch` map or id, downloads `output_file_id` (plus `error_file_id` with `:errors?`) via `files-content`, decodes with `tools.agents.openai/read-jsonl` and returns `{custom_id line}` — the output file is **not** in input order. No file id to read → `:invalid-request`; a malformed line → `:json-parse-error` (`:line`); a line without `custom_id` or a repeated one → `:invalid-response`. |
-| `client.fine_tuning.*` / Assistants / Realtime `connect` + `calls.*` | *(not implemented)* | Not yet ported. `request!` is the shared transport (any method, `:query`, JSON or multipart body, `:as :json`/`:string`/`:bytes`), so a new resource method is a single call. See Shared transport below. |
-| `admin_api_key` / `OPENAI_ADMIN_KEY`, Workload Identity Federation | *(not implemented)* | The credential chain here is explicit `:credential-source` → explicit `:api-key` → `OPENAI_API_KEY` → throw. Admin keys and the token exchange are not ported; the cache, per-attempt token and 401 retry they need are (`:credential-source`, see README, Refreshable credentials). |
+| `client.fine_tuning.jobs.create(model=, training_file=, method=, ...)` | `(tools.agents.openai.fine-tuning/jobs-create client {"model" m "training_file" id ...})` | `POST /fine_tuning/jobs` JSON body, verbatim (`resources/fine_tuning/jobs/jobs.py`); `method`, `hyperparameters` (deprecated), `integrations`, `metadata` are nested JSON, not bracket-flattened. |
+| `client.fine_tuning.jobs.retrieve(id)` / `.list(after=, limit=, metadata=)` / `.cancel(id)` / `.pause(id)` / `.resume(id)` / `.list_events(id, after=, limit=)` | `(jobs-retrieve client id)` / `(jobs-list client params)` / `(jobs-cancel client id)` / `(jobs-pause client id)` / `(jobs-resume client id)` / `(jobs-list-events client id params)` | `GET /fine_tuning/jobs/{id}`, `GET /fine_tuning/jobs` (`metadata` filter bracket-encoded as `metadata[k]=v`; the SDK's `metadata=None` → pass `{"metadata" "null"}`, since nil params are dropped), `POST .../cancel`, `.../pause`, `.../resume`, `GET .../events`. Empty id → `:invalid-request` before I/O. |
+| `client.fine_tuning.jobs.checkpoints.list(id, after=, limit=)` | `(jobs-checkpoints-list client id params)` | `GET /fine_tuning/jobs/{id}/checkpoints` (`jobs/checkpoints.py`). |
+| `client.fine_tuning.checkpoints.permissions.create(ckpt, project_ids=)` / `.list(ckpt, after=, limit=, order=, project_id=)` / `.delete(permission_id, fine_tuned_model_checkpoint=)` | `(checkpoints-permissions-create client ckpt {"project_ids" [...]})` / `(checkpoints-permissions-list client ckpt params)` / `(checkpoints-permissions-delete client ckpt permission-id)` | `POST`/`GET /fine_tuning/checkpoints/{ckpt}/permissions`, `DELETE .../permissions/{id}` (`checkpoints/permissions.py`). Require an **admin API key**: build the client with it as `:api-key`. The checkpoint keeps its `:`s in the path, as the SDK's `path_template`. `delete` takes arguments in URL order (checkpoint first). The deprecated `permissions.retrieve` sends the same GET as `list` and is not ported separately. |
+| `client.fine_tuning.alpha.graders.run` / `.validate` | *(not implemented)* | Alpha (`POST /fine_tuning/alpha/graders/run\|validate`, `resources/fine_tuning/alpha/graders.py`); out of scope. |
+| Assistants / Realtime `connect` + `calls.*` | *(not implemented)* | Not yet ported. `request!` is the shared transport (any method, `:query`, JSON or multipart body, `:as :json`/`:string`/`:bytes`), so a new resource method is a single call. See Shared transport below. |
+| `admin_api_key` / `OPENAI_ADMIN_KEY`, Workload Identity Federation | *(not implemented)* | The credential chain here is explicit `:credential-source` → explicit `:api-key` → `OPENAI_API_KEY` → throw. Admin keys and the token exchange are not ported; the cache, per-attempt token and 401 retry they need are (`:credential-source`, see README, Refreshable credentials). The checkpoint-permission endpoints accept an admin key passed as `:api-key`. |
 | Azure OpenAI v1: `OpenAI(base_url="https://<resource>.openai.azure.com/openai/v1/", api_key=...)` | `(client {:base-url "https://<resource>.openai.azure.com/openai/v1" :api-key ...})` | Works through `:base-url`; no Azure-specific code. API key or a static Entra ID token, both as `Authorization: Bearer`. A refreshing Entra token provider needs callable `:api-key` (#37). Not verified against a live Azure resource. See Azure OpenAI (v1 API) above. |
 | `AzureOpenAI(azure_endpoint=, azure_deployment=, api_version=)` (legacy) | *(not supported)* | Deployment path rewriting, the required `api-version` query and `AZURE_OPENAI_*` / `OPENAI_API_VERSION` env vars are not ported. Use the v1 API. |
 
@@ -253,7 +280,7 @@ Non-status error types:
 | missing credentials (client construction or a hand-built client map) | `:tools.agents.openai/missing-credentials` |
 | `:credential-source` not a `TokenSource`, or combined with `:api-key` | `:tools.agents.openai/invalid-credentials` |
 | `:stream true` requested | `:tools.agents.openai/streaming-unsupported` |
-| request rejected before any I/O (bad `:as`; files/images: missing/unsupported file or required field; an empty file or batch id — the SDK's `ValueError`; batches: bad `custom_id` in `batch-input-jsonl`, no result file id in `batches-results`) | `:tools.agents.openai/invalid-request` |
+| request rejected before any I/O (bad `:as`; files/images: missing/unsupported file or required field; an empty file, batch, fine-tuning job, checkpoint or permission id — the SDK's `ValueError`; batches: bad `custom_id` in `batch-input-jsonl`, no result file id in `batches-results`) | `:tools.agents.openai/invalid-request` |
 | `files-wait-for-processing` gave up after `:max-wait-ms` (the SDK's `RuntimeError`; not an HTTP timeout; never retried) | `:tools.agents.openai/wait-timeout` |
 | response has no `"output"` / `"choices"` array, or an empty `"choices"`; a batch result line without a string `custom_id`, or a repeated one | `:tools.agents.openai/invalid-response` |
 | structurally wrong content (non-array `"content"`, non-string `"text"`, non-string non-null `"content"`) | `:tools.agents.openai/invalid-content-shape` |
@@ -536,7 +563,10 @@ wait-for-processing), and `19300`–`19303` for the
 wire format, 4xx typing), and `19320`–`19325` for the
 `tools.agents.openai.batches` tests (create body, retrieve/cancel, 404
 typing, list paging, results shuffled and matched by `custom_id`, error file,
-malformed and duplicate lines). Port `18999` is additionally used by the three tests that deliberately
+malformed and duplicate lines), and `19340`–`19344` for the
+`tools.agents.openai.fine-tuning` tests (method/path/query/body of every
+endpoint, checkpoint colons in paths, admin key as `:api-key`, 404 typing,
+events paging). Port `18999` is additionally used by the three tests that deliberately
 start *no* server (missing credentials and the two connection-failure tests,
 which actually dial it and so assume nothing else on the host has `18999`
 bound).
