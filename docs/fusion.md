@@ -63,6 +63,7 @@ Useful keys:
 | `:system` | Provider-specific system prompt |
 | `:api-key` | Explicit API key override |
 | `:auth-token` | Explicit bearer/OAuth token override (`:anthropic` only, forwarded to `tools.agents.anthropic/client`) |
+| `:credential-source` | A refreshable `tools.agents.token` source, forwarded to the provider's `client` (see README, Refreshable credentials) |
 | `:base-url` | Explicit endpoint override, useful for local tests |
 | `:max-tokens` | Anthropic `max_tokens`, defaults to `1024` |
 | `:call` | Test/demo hook: `(fn [spec prompt] {:text ... :response ...})` |

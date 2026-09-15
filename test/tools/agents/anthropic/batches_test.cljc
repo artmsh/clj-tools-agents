@@ -7,7 +7,7 @@
             [clojure.string :as str]
             [tools.agents.anthropic :as a]
             [tools.agents.anthropic.batches :as b]
-            [tools.agents.test-support :refer [start-server!]]))
+            [tools.agents.test-support :refer [start-server! rotating-token-cache]]))
 
 (def ^:private route "/v1/messages/batches")
 
@@ -115,6 +115,18 @@
       (let [h (:headers (first @captured))]
         (is (= "Bearer tok" (get h "authorization")))
         (is (= "oauth-2025-04-20,x-beta" (get h "anthropic-beta")))))))
+
+(deftest credential-source-401-invalidates-and-retries-once-through-request!
+  (let [{:keys [source fetches]} (rotating-token-cache)
+        hits (atom 0)]
+    (with-mock 19419 {:api-key nil :credential-source source :max-retries 0}
+      (fn [_] (if (= 1 (swap! hits inc))
+                {:status 401 :body "{\"error\":{\"message\":\"expired\"}}"}
+                {:status 200 :body (batch-json "b" "ended")}))
+      (fn [client captured]
+        (is (= "b" (get (b/batches-retrieve client "b") "id")))
+        (is (= ["Bearer tok-1" "Bearer tok-2"] (mapv #(get (:headers %) "authorization") @captured)))
+        (is (= 2 @fetches))))))
 
 ;; ---------------------------------------------------------------------------
 ;; List + paging

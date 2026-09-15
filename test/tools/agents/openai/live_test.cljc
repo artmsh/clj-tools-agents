@@ -15,7 +15,8 @@
             [examples.openai.chat-completions :as ex-chat]
             [examples.openai.custom-gateway :as ex-gateway]
             [examples.openai.azure :as ex-azure]
-            [tools.agents.test-support :refer [start-server!]]))
+            [tools.agents.token :as token]
+            [tools.agents.test-support :refer [start-server! rotating-token-cache per-call-token-source]]))
 
 (defn- base-url [port] (str "http://127.0.0.1:" port "/v1"))
 
@@ -364,6 +365,80 @@
     (is (some? e))
     (is (= :tools.agents.openai/missing-credentials (:type (ex-data e))))))
 
+;; ---------------------------------------------------------------------------
+;; :credential-source (tools.agents.token): per-attempt tokens, 401 retry once
+;; ---------------------------------------------------------------------------
+
+(deftest credential-source-401-invalidates-and-retries-once-outside-budget
+  (let [seen (atom [])
+        {:keys [source fetches]} (rotating-token-cache)
+        {:keys [port stop!]} (start-server! 19350 "/v1/responses"
+                                (fn [req]
+                                  (let [auth (get (:headers req) "authorization")]
+                                    (swap! seen conj auth)
+                                    (if (= auth "Bearer tok-1")
+                                      {:status 401 :body "{\"error\":{\"message\":\"token expired\"}}"}
+                                      {:status 200 :body (canned-response)}))))]
+    (try
+      ;; :max-retries 0: the 401 retry must not come out of the retry budget.
+      (let [client (oai/client {:credential-source source :base-url (base-url port) :max-retries 0})]
+        (is (= "hello back" (oai/output-text (oai/responses-create client {"model" "m" "input" "hi"}))))
+        (is (= ["Bearer tok-1" "Bearer tok-2"] @seen))
+        (is (= 2 @fetches)))
+      (finally (stop!)))))
+
+(deftest credential-source-second-401-surfaces-without-leaking-tokens
+  (let [hits (atom 0)
+        {:keys [source fetches]} (rotating-token-cache)
+        {:keys [port stop!]} (start-server! 19351 "/v1/responses"
+                                (fn [_] (swap! hits inc)
+                                  {:status 401 :body "{\"error\":{\"message\":\"invalid token\"}}"}))]
+    (try
+      (let [client (oai/client {:credential-source source :base-url (base-url port)})
+            e      (try (oai/responses-create client {"model" "m" "input" "hi"}) nil (catch Exception e e))]
+        (is (= :tools.agents.openai/authentication-error (:type (ex-data e))))
+        (is (= 0 (:retries-taken (ex-data e))))
+        (is (= 2 @hits) "one original attempt + exactly one auth retry")
+        (is (= 2 @fetches))
+        (is (not (re-find #"tok-" (str (ex-message e) (pr-str (ex-data e)))))))
+      (finally (stop!)))))
+
+(deftest credential-source-token-requested-per-attempt
+  (let [seen (atom [])
+        {:keys [port stop!]} (start-server! 19353 "/v1/responses"
+                                (fn [req]
+                                  (swap! seen conj (get (:headers req) "authorization"))
+                                  (if (= 1 (count @seen))
+                                    {:status 429 :headers {"retry-after-ms" "1"} :body "{}"}
+                                    {:status 200 :body (canned-response)})))]
+    (try
+      (let [client (oai/client {:credential-source (per-call-token-source) :base-url (base-url port)})]
+        (is (= "hello back" (oai/output-text (oai/responses-create client {"model" "m" "input" "hi"}))))
+        (is (= ["Bearer call-1" "Bearer call-2"] @seen)))
+      (finally (stop!)))))
+
+(deftest credential-source-declining-invalidate-is-not-retried
+  (let [hits (atom 0)
+        {:keys [port stop!]} (start-server! 19354 "/v1/responses"
+                                (fn [_] (swap! hits inc) {:status 401 :body "{}"}))]
+    (try
+      (let [client (oai/client {:credential-source (per-call-token-source) :base-url (base-url port)})
+            e      (try (oai/responses-create client {"model" "m" "input" "hi"}) nil (catch Exception e e))]
+        (is (= :tools.agents.openai/authentication-error (:type (ex-data e))))
+        (is (= 1 @hits)))
+      (finally (stop!)))))
+
+(deftest credential-source-fetch-failure-propagates-before-any-request
+  ;; Nothing listens on this port: a fetch failure must surface as itself,
+  ;; not be retried and rewrapped as api-connection-error.
+  (let [calls  (atom 0)
+        source (token/token-cache {:fetch! (fn [] (swap! calls inc)
+                                             (throw (ex-info "exchange failed" {:type ::exchange-failed})))})
+        client (oai/client {:credential-source source :base-url "http://127.0.0.1:18999/v1"})
+        e      (try (oai/responses-create client {"model" "m" "input" "hi"}) nil (catch Exception e e))]
+    (is (= ::exchange-failed (:type (ex-data e))))
+    (is (= 1 @calls))))
+
 
 ;; ---------------------------------------------------------------------------
 ;; examples/*.clj wired end-to-end against the mock server
@@ -513,7 +588,7 @@
         (is (= :tools.agents.openai/streaming-unsupported (:type (ex-data e))))
         (is (str/starts-with? (ex-message e) "tools.agents.openai/request!: "))))))
 
-(deftest request-401-is-not-retried-while-the-credentials-seam-is-inactive
+(deftest request-static-api-key-401-is-not-retried
   (let [hits (atom 0)
         {:keys [port stop!]} (start-server! 19405 "/v1/responses"
                                 (fn [_] (swap! hits inc)
@@ -524,24 +599,4 @@
         (is (= :tools.agents.openai/authentication-error (:type (ex-data e))))
         (is (= 0 (:retries-taken (ex-data e))))
         (is (= 1 @hits)))
-      (finally (stop!)))))
-
-(deftest request-rebuilds-headers-before-every-attempt
-  ;; Pins the #34 seam: headers are built once per ATTEMPT, not once per
-  ;; call, so a credential refreshed between attempts reaches the retry.
-  (let [calls (atom 0)
-        orig  @#'oai/request-headers
-        {:keys [port stop!]} (start-server! 19406 "/v1/responses"
-                                (fn [req]
-                                  (if (= "Bearer k1" (get (:headers req) "authorization"))
-                                    {:status 503 :headers {"retry-after-ms" "1"} :body ""}
-                                    {:status 200 :body (canned-response)})))]
-    (try
-      (with-redefs [oai/request-headers (fn [label client multipart? extra]
-                                          (orig label (assoc client :api-key (str "k" (swap! calls inc)))
-                                                multipart? extra))]
-        (is (= "hello back" (oai/output-text (oai/responses-create
-                                               (oai/client {:api-key "k" :base-url (base-url port)})
-                                               {"model" "m"}))))
-        (is (= 2 @calls)))
       (finally (stop!)))))

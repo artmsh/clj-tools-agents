@@ -16,6 +16,7 @@
   (let [opts {}
         opts (if (contains? spec :api-key) (assoc opts :api-key (:api-key spec)) opts)
         opts (if (contains? spec :auth-token) (assoc opts :auth-token (:auth-token spec)) opts)
+        opts (if (contains? spec :credential-source) (assoc opts :credential-source (:credential-source spec)) opts)
         opts (if (contains? spec :base-url) (assoc opts :base-url (:base-url spec)) opts)]
     opts))
 

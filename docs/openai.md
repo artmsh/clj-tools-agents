@@ -178,14 +178,17 @@ header, no query string) plus Microsoft's documentation.
 | `ImagesResponse.data[i].b64_json` (base64 decode by caller) | `(image-bytes item)` → `byte[]` | Not an SDK method. Standard Base64 decode of one `data` item; `nil` for a `url` item (dall-e `response_format` `url`, the dall-e default), which the caller fetches. All images: `(keep image-bytes (get resp "data"))`. |
 | `client.uploads.*` (`/uploads`, multi-part, up to 8 GB) | *(not implemented)* | Out of scope: `/files` takes up to 512 MB in one request. The SDK's `upload_file_chunked` uses 64 MB parts (`resources/uploads/uploads.py`). |
 | `client.batches.*` / `.fine_tuning.*` / Assistants / Realtime `connect` + `calls.*` | *(not implemented)* | Not yet ported. `request!` is the shared transport (any method, `:query`, JSON or multipart body, `:as :json`/`:string`/`:bytes`), so a new resource method is a single call. See Shared transport below. |
-| `admin_api_key` / `OPENAI_ADMIN_KEY`, Workload Identity Federation | *(not implemented)* | The credential chain here is explicit `:api-key` → `OPENAI_API_KEY` → throw. The SDK's fuller chain (admin keys, token-exchange workload identity) is out of scope. |
+| `admin_api_key` / `OPENAI_ADMIN_KEY`, Workload Identity Federation | *(not implemented)* | The credential chain here is explicit `:credential-source` → explicit `:api-key` → `OPENAI_API_KEY` → throw. Admin keys and the token exchange are not ported; the cache, per-attempt token and 401 retry they need are (`:credential-source`, see README, Refreshable credentials). |
 | Azure OpenAI v1: `OpenAI(base_url="https://<resource>.openai.azure.com/openai/v1/", api_key=...)` | `(client {:base-url "https://<resource>.openai.azure.com/openai/v1" :api-key ...})` | Works through `:base-url`; no Azure-specific code. API key or a static Entra ID token, both as `Authorization: Bearer`. A refreshing Entra token provider needs callable `:api-key` (#37). Not verified against a live Azure resource. See Azure OpenAI (v1 API) above. |
 | `AzureOpenAI(azure_endpoint=, azure_deployment=, api_version=)` (legacy) | *(not supported)* | Deployment path rewriting, the required `api-version` query and `AZURE_OPENAI_*` / `OPENAI_API_VERSION` env vars are not ported. Use the v1 API. |
 
 ### Credential resolution & headers (confirmed from openai-python source)
 
 Precedence, first match wins: explicit `:api-key` → `OPENAI_API_KEY` env var
-→ throw.
+→ throw. An explicit `:credential-source` (a `tools.agents.token/TokenSource`)
+replaces this chain: its token is fetched before every attempt and sent as
+`Authorization: Bearer`; combining it with `:api-key` throws
+`invalid-credentials`. See README, Refreshable credentials.
 
 - Auth is always `Authorization: Bearer <api-key>` — there is no `x-api-key`
   path here, and no beta header (both of which the Anthropic sibling needs).
@@ -226,6 +229,7 @@ Non-status error types:
 |---|---|
 | malformed request/response JSON | `:tools.agents.openai/json-encode-error` / `:tools.agents.openai/json-parse-error` |
 | missing credentials (client construction or a hand-built client map) | `:tools.agents.openai/missing-credentials` |
+| `:credential-source` not a `TokenSource`, or combined with `:api-key` | `:tools.agents.openai/invalid-credentials` |
 | `:stream true` requested | `:tools.agents.openai/streaming-unsupported` |
 | request rejected before any I/O (bad `:as`; files/images: missing/unsupported file or required field, empty file id — the SDK's `ValueError`) | `:tools.agents.openai/invalid-request` |
 | `files-wait-for-processing` gave up after `:max-wait-ms` (the SDK's `RuntimeError`; not an HTTP timeout; never retried) | `:tools.agents.openai/wait-timeout` |
@@ -264,6 +268,9 @@ tuning, on by default with `:max-retries` 2.
   header wins outright (exact, case-sensitive match, as in the SDK), otherwise
   408 / 409 / 429 / 5xx retry and everything else does not. A `Retry-After`
   longer than two minutes vetoes the retry entirely.
+- **401.** Retried once, immediately and outside `:max-retries`, only for a
+  `:credential-source` client after invalidating the token it sent. A static
+  `:api-key` 401 is never retried.
 - **What is not retried.** 4xx other than 408/409/429; a malformed, non-empty
   JSON body on an otherwise-successful 2xx (an empty one decodes to `nil`) (the SDK decodes after its retry loop has
   already broken out); and this library's own typed refusal, the `:stream true`
@@ -401,10 +408,9 @@ public function, so there is exactly one copy of the retry loop:
 - A `stream` true body field or multipart part throws `streaming-unsupported`
   before any I/O.
 - `post-json!` stays public as `(request! client fn-name {:path path :body request})`.
-- **401 seam (#34, inactive):** on a 401 the loop consults a private
-  `invalidate-credentials!` once; when a refreshable credential source exists
-  it will invalidate the cached token and retry once outside `:max-retries`.
-  Today it always declines, so a 401 is never retried.
+- **401:** for a `:credential-source` client the loop invalidates the token
+  the failed attempt sent and retries once outside `:max-retries`; a second
+  401 throws. A static `:api-key` 401 is never retried.
 
 Everything else — URL/header building, the JSON codec, credential resolution,
 error typing, the whole retry policy, `output-text`/`completion-text`
@@ -496,10 +502,11 @@ image). JVM Clojure uses `com.sun.net.httpserver.HttpServer` (built into the
 JDK, zero deps). Mock
 ports are `18950`–`18964`, chosen not to collide with
 tools.agents.anthropic's `18930`–`18946`, `18965`–`18971` for the retry
-tests, `19391` for the Azure v1 example, and `19400`–`19406` for the
+tests, `19391` for the Azure v1 example, and `19400`–`19405` for the
 `request!` transport tests (GET + `:query` + extra headers, `:as :bytes` /
-`:string`, empty 2xx body, multipart, streaming rejection, 401 not retried,
-headers rebuilt per attempt), and `19280`–`19285` for the
+`:string`, empty 2xx body, multipart, streaming rejection, static-key 401 not
+retried), `19350`–`19354` for `:credential-source` (401
+invalidate-and-retry, token per attempt), `19280`–`19285` for the
 `tools.agents.openai.files` tests (multipart wire format, File streamed from
 disk, list query, retrieve/delete, 404 typing, binary content round-trip,
 wait-for-processing), and `19300`–`19303` for the

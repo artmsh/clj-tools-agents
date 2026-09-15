@@ -13,7 +13,8 @@
             [examples.anthropic.custom-gateway :as ex-gateway]
             [examples.anthropic.tool-use :as ex-tool]
             [examples.anthropic.ptc-demo :as ex-ptc]
-            [tools.agents.test-support :refer [start-server!]]))
+            [tools.agents.token :as token]
+            [tools.agents.test-support :refer [start-server! rotating-token-cache per-call-token-source]]))
 
 (defn- canned-response []
   "{\"id\":\"msg_1\",\"content\":[{\"type\":\"text\",\"text\":\"hello back\"}],\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}")
@@ -293,6 +294,87 @@
           (is (str/includes? (str (:body (ex-data e))) "still slow"))
           (is (str/includes? (str (ex-message e)) "HTTP 429 still slow"))))
       (finally (stop!)))))
+
+;; ---------------------------------------------------------------------------
+;; :credential-source (tools.agents.token): per-attempt tokens, 401 retry once
+;; ---------------------------------------------------------------------------
+
+(defn- local [port] (str "http://127.0.0.1:" port))
+
+(deftest credential-source-401-invalidates-and-retries-once-outside-budget
+  (let [seen (atom [])
+        {:keys [source fetches]} (rotating-token-cache)
+        {:keys [port stop!]} (start-server! 19355 "/v1/messages"
+                                (fn [req]
+                                  (let [auth (get (:headers req) "authorization")]
+                                    (swap! seen conj [auth (get (:headers req) "anthropic-beta")
+                                                      (get (:headers req) "x-api-key")])
+                                    (if (= auth "Bearer tok-1")
+                                      {:status 401 :body "{\"error\":{\"message\":\"token expired\"}}"}
+                                      {:status 200 :body (canned-response)}))))]
+    (try
+      (binding [a/*sleep-fn* (fn [_] (throw (ex-info "auth retry must not sleep" {})))]
+        (let [client (a/client {:credential-source source :base-url (local port) :max-retries 0
+                                :betas ["advanced-tool-use-2025-11-20"]})]
+          (is (= "hello back" (a/output-text (a/messages-create client {"model" "m" "max_tokens" 1 "messages" []}))))
+          (is (= [["Bearer tok-1" "oauth-2025-04-20,advanced-tool-use-2025-11-20" nil]
+                  ["Bearer tok-2" "oauth-2025-04-20,advanced-tool-use-2025-11-20" nil]]
+                 @seen))
+          (is (= 2 @fetches))))
+      (finally (stop!)))))
+
+(deftest credential-source-second-401-surfaces-without-leaking-tokens
+  (let [hits (atom 0)
+        {:keys [source fetches]} (rotating-token-cache)
+        {:keys [port stop!]} (start-server! 19356 "/v1/messages"
+                                (fn [_] (swap! hits inc)
+                                  {:status 401 :body "{\"error\":{\"message\":\"invalid token\"}}"}))]
+    (try
+      (let [client (a/client {:credential-source source :base-url (local port)})
+            e      (try (a/count-tokens client {"model" "m" "messages" []}) nil (catch Exception e e))]
+        (is (= :tools.agents.anthropic.error/authentication (:type (ex-data e))))
+        (is (= 2 @hits) "one original attempt + exactly one auth retry")
+        (is (= 2 @fetches))
+        (is (not (re-find #"tok-" (str (ex-message e) (pr-str (ex-data e)))))))
+      (finally (stop!)))))
+
+(deftest static-credentials-401-is-not-retried
+  (doseq [[opts port] [[{:api-key "k"} 19357] [{:auth-token "t"} 19358]]]
+    (let [hits (atom 0)
+          {:keys [stop!]} (start-server! port "/v1/messages"
+                            (fn [_] (swap! hits inc)
+                              {:status 401 :body "{\"error\":{\"message\":\"bad key\"}}"}))]
+      (try
+        (let [client (a/client (assoc opts :base-url (local port)))
+              e      (try (a/messages-create client {"model" "m" "max_tokens" 1 "messages" []})
+                          nil (catch Exception e e))]
+          (is (= :tools.agents.anthropic.error/authentication (:type (ex-data e))))
+          (is (= 1 @hits) (pr-str (keys opts))))
+        (finally (stop!))))))
+
+(deftest credential-source-token-requested-per-attempt
+  (let [seen (atom [])
+        {:keys [port stop!]} (start-server! 19359 "/v1/messages"
+                                (fn [req]
+                                  (swap! seen conj (get (:headers req) "authorization"))
+                                  (if (= 1 (count @seen))
+                                    {:status 429 :body "{}"}
+                                    {:status 200 :body (canned-response)})))]
+    (try
+      (binding [a/*sleep-fn* (fn [_] nil)]
+        (let [client (a/client {:credential-source (per-call-token-source) :base-url (local port)})]
+          (is (= "hello back" (a/output-text (a/messages-create client {"model" "m" "max_tokens" 1 "messages" []}))))
+          (is (= ["Bearer call-1" "Bearer call-2"] @seen))))
+      (finally (stop!)))))
+
+(deftest credential-source-fetch-failure-propagates-before-any-request
+  (let [calls  (atom 0)
+        source (token/token-cache {:fetch! (fn [] (swap! calls inc)
+                                             (throw (ex-info "exchange failed" {:type ::exchange-failed})))})
+        client (a/client {:credential-source source :base-url "http://127.0.0.1:18999"})
+        e      (try (a/messages-create client {"model" "m" "max_tokens" 1 "messages" []}) nil (catch Exception e e))]
+    (is (= ::exchange-failed (:type (ex-data e))))
+    (is (= 1 @calls))))
 
 ;; ---------------------------------------------------------------------------
 ;; examples/*.clj wired end-to-end against the mock server

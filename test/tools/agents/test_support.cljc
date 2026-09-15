@@ -9,6 +9,7 @@
    Everything the suites assert above this leaf is identical handler logic
    and identical assertions on both runtimes."
   (:require [clojure.string :as str]
+            [tools.agents.token :as token]
             #?@(:bb [[org.httpkit.server :as hk]] :clj [])))
 
 (defn- chunk-bytes ^bytes [chunk]
@@ -140,3 +141,22 @@
                       (when (pos? delay-ms) (Thread/sleep (long delay-ms)))))))))
           (catch java.io.IOException _ nil))))
     {:port port :stop! (fn [] (reset! running false) (.close ss))}))
+
+(defn rotating-token-cache
+  "A tools.agents.token/token-cache whose fetch! returns \"tok-1\",
+   \"tok-2\", ... that never expire, so only invalidate! causes a refetch.
+   Returns {:source :fetches}; :fetches is an atom counting fetch! calls."
+  []
+  (let [fetches (atom 0)]
+    {:fetches fetches
+     :source  (token/token-cache {:fetch! (fn [] {:token (str "tok-" (swap! fetches inc)) :expires-at nil})})}))
+
+(defn per-call-token-source
+  "A TokenSource returning a new token (\"call-1\", \"call-2\", ...) on every
+   token! call and declining invalidate!: shows that a client asks for
+   credentials per attempt, and that a declined invalidate! means no 401 retry."
+  []
+  (let [n (atom 0)]
+    (reify token/TokenSource
+      (-token [_] (str "call-" (swap! n inc)))
+      (-invalidate [_ _] false))))

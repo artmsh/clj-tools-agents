@@ -91,7 +91,12 @@ model id) is used verbatim.
 ### Credential resolution & headers (confirmed from python-genai source)
 
 Precedence, first match wins: explicit `:api-key` → `GOOGLE_API_KEY` env var
-→ `GEMINI_API_KEY` env var → throw.
+→ `GEMINI_API_KEY` env var → throw. An explicit `:credential-source` (a
+`tools.agents.token/TokenSource`, e.g. an OAuth access-token cache) replaces
+this chain: its token is fetched before every attempt and sent as
+`Authorization: Bearer <token>` **instead of** `x-goog-api-key`; combining it
+with `:api-key` throws `invalid-credentials`. A 401 invalidates it and retries
+once outside `:max-retries`. See README, Refreshable credentials.
 
 - Auth is always `x-goog-api-key: <api-key>` — a bare key, no scheme prefix.
   There is no `Authorization` header at all for Gemini Developer API auth.
@@ -134,6 +139,7 @@ Non-status error types:
 |---|---|
 | malformed request/response JSON | `:tools.agents.gemini/json-encode-error` / `:tools.agents.gemini/json-parse-error` |
 | missing credentials (client construction or a hand-built client map) | `:tools.agents.gemini/missing-credentials` |
+| `:credential-source` not a `TokenSource`, or combined with `:api-key` | `:tools.agents.gemini/invalid-credentials` |
 
 Unlike the two siblings, `output-text` never throws — see the next section.
 
@@ -179,6 +185,8 @@ initial call, so 4 *retries*).
   which has a confirmed source basis in openai-python; no equivalent is
   implemented here because none was found in python-genai). `409` is
   deliberately excluded, unlike `tools.agents.openai`'s retryable set.
+- **401.** Retried once, immediately and outside `:max-retries`, only for a
+  `:credential-source` client; a static key's 401 is never retried.
 - **What is not retried.** Any other 4xx; a malformed JSON body on an
   otherwise-successful 2xx; this library's own typed errors.
 - **How long it waits.** `tenacity.wait_exponential_jitter(initial=1.0,
@@ -364,7 +372,7 @@ connection. Its ports come from the OS (bind port 0), not a fixed band.
 
 The mock server is `tools.agents.test-support/start-server!`, shared by all three provider suites: two leaves, Babashka
 `org.httpkit.server` and JVM Clojure `com.sun.net.httpserver.HttpServer`.
-Mock ports are `18980`–`18997`, kept disjoint from
+Mock ports are `18980`–`18997` (plus `19360`–`19362` for `:credential-source`), kept disjoint from
 `tools.agents.anthropic`'s `18930`–`18946` and `tools.agents.openai`'s
 `18950`–`18971` as a matter of hygiene. Port `18999` is additionally used by
 the tests that deliberately start *no* server (missing credentials and the

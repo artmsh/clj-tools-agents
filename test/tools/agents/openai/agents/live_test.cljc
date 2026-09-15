@@ -12,7 +12,7 @@
             [tools.agents.openai.agents :as agents]
             [examples.openai.agents-sandbox-task :as ex-task]
             [examples.openai.agents-self-hosted :as ex-self-hosted]
-            [tools.agents.test-support :refer [start-server!]]))
+            [tools.agents.test-support :refer [start-server! rotating-token-cache]]))
 
 (defn- base-url [port] (str "http://127.0.0.1:" port "/v1"))
 
@@ -989,3 +989,25 @@
         (finally
           (when session-id (live-cleanup-session! client session-id)))))
     (is true "skipped: set OPENAI_AGENTS_LIVE=1 and OPENAI_API_KEY")))
+
+;; ---------------------------------------------------------------------------
+;; :credential-source (#34) — inherited from the openai client
+;; ---------------------------------------------------------------------------
+
+(deftest sessions-create-with-credential-source-refreshes-on-401
+  (let [auths (atom [])
+        {:keys [source fetches]} (rotating-token-cache)
+        {:keys [port stop!]} (start-server! 19079 "/v1/agents/sessions"
+                                (fn [req]
+                                  (swap! auths conj [(get (:headers req) "authorization")
+                                                     (get (:headers req) "openai-beta")])
+                                  (if (= 1 (count @auths))
+                                    {:status 401 :body "{\"error\":{\"message\":\"expired\"}}"}
+                                    {:status 200 :body (canned-session "sess_1" "in_progress")})))]
+    (try
+      (let [client  (oai/client {:credential-source source :base-url (base-url port) :max-retries 0})
+            session (agents/sessions-create client {"agent" {"model" "m"} "input" "hi"})]
+        (is (= "sess_1" (get session "id")))
+        (is (= [["Bearer tok-1" "agents=v1"] ["Bearer tok-2" "agents=v1"]] @auths))
+        (is (= 2 @fetches)))
+      (finally (stop!)))))

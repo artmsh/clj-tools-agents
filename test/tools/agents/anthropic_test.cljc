@@ -3,7 +3,8 @@
    Babashka. Mock-server / transport-level coverage lives in
    tools.agents.anthropic.live-test."
   (:require [clojure.test :refer [deftest is testing]]
-            [tools.agents.anthropic :as a]))
+            [tools.agents.anthropic :as a]
+            [tools.agents.token :as token]))
 
 ;; ---------------------------------------------------------------------------
 ;; JSON codec
@@ -254,6 +255,19 @@
     (is (= "k" (:api-key client)))
     (is (record? (assoc client :base-url "http://example.test")))))
 
+(deftest client-accepts-credential-source
+  (let [src (token/token-cache {:fetch! (fn [] (throw (ex-info "must not fetch at construction" {})))})
+        c   (a/client {:credential-source src :base-url "http://x"})]
+    (is (identical? src (:credential-source c)))
+    (is (not (contains? c :api-key)))
+    (is (not (contains? c :auth-token))))
+  (testing "conflicts and non-sources are rejected"
+    (doseq [opts [{:credential-source (token/token-cache {:fetch! (fn [])}) :api-key "k"}
+                  {:credential-source (token/token-cache {:fetch! (fn [])}) :auth-token "t"}
+                  {:credential-source "not-a-source"}]]
+      (is (= :tools.agents.anthropic.error/invalid-credentials
+             (:type (ex-data (try (a/client opts) nil (catch Exception e e)))))))))
+
 (deftest client-uses-explicit-api-key
   (is (= "explicit" (:api-key (a/client {:api-key "explicit" :base-url "http://x"})))))
 
@@ -336,6 +350,48 @@
             (is (= type (:type (ex-data e))))
             ;; permanent error -> exactly one attempt, no retry consumed
             (is (= 1 @calls))))))))
+
+(deftest unauthorized-without-on-unauthorized-is-not-retried
+  (let [calls (atom 0)
+        attempt-fn (fn [] (swap! calls inc) ((throwing :tools.agents.anthropic.error/authentication 401 nil)))]
+    (binding [a/*sleep-fn* (fn [_] (throw (ex-info "must not sleep" {})))]
+      (let [e (try (a/request-with-retries! 5 attempt-fn) nil (catch Exception e e))]
+        (is (= :tools.agents.anthropic.error/authentication (:type (ex-data e))))
+        (is (= 1 @calls))))))
+
+(deftest unauthorized-retries-once-outside-budget-when-invalidated
+  (testing "first 401 -> invalidate -> one retry that succeeds, even with max-retries 0"
+    (let [calls (atom 0) invalidations (atom 0)
+          attempt-fn (fn [] (if (= 1 (swap! calls inc))
+                              ((throwing :tools.agents.anthropic.error/authentication 401 nil))
+                              :ok))]
+      (binding [a/*sleep-fn* (fn [_] (throw (ex-info "must not sleep" {})))]
+        (is (= :ok (a/request-with-retries! 0 attempt-fn {:on-unauthorized #(do (swap! invalidations inc) true)})))
+        (is (= 2 @calls))
+        (is (= 1 @invalidations)))))
+  (testing "second 401 throws; the auth retry does not consume the retry budget"
+    (let [calls (atom 0) invalidations (atom 0)
+          attempt-fn (fn [] (swap! calls inc) ((throwing :tools.agents.anthropic.error/authentication 401 nil)))]
+      (let [e (try (a/request-with-retries! 3 attempt-fn {:on-unauthorized #(do (swap! invalidations inc) true)})
+                   nil (catch Exception e e))]
+        (is (= 401 (:status (ex-data e))))
+        (is (= 2 @calls))
+        (is (= 1 @invalidations)))))
+  (testing "a 429 after the auth retry still gets the full retry budget"
+    (let [calls (atom 0)
+          attempt-fn (fn [] (case (swap! calls inc)
+                              1 ((throwing :tools.agents.anthropic.error/authentication 401 nil))
+                              (2 3) ((throwing :tools.agents.anthropic.error/rate-limit 429 nil))
+                              :ok))]
+      (binding [a/*sleep-fn* (fn [_] nil)]
+        (is (= :ok (a/request-with-retries! 2 attempt-fn {:on-unauthorized (constantly true)})))
+        (is (= 4 @calls)))))
+  (testing "on-unauthorized declining means no retry"
+    (let [calls (atom 0)
+          attempt-fn (fn [] (swap! calls inc) ((throwing :tools.agents.anthropic.error/authentication 401 nil)))]
+      (is (some? (try (a/request-with-retries! 3 attempt-fn {:on-unauthorized (constantly false)}) nil
+                      (catch Exception e e))))
+      (is (= 1 @calls)))))
 
 (deftest max-retries-zero-means-exactly-one-attempt
   (let [calls (atom 0)

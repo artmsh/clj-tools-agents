@@ -10,7 +10,7 @@
             [tools.agents.gemini :as g]
             [tools.agents.sse :as sse]
             [tools.agents.stream :as stream]
-            [tools.agents.test-support :refer [start-server! start-abort-server!]]))
+            [tools.agents.test-support :refer [start-server! start-abort-server! rotating-token-cache]]))
 
 (defn- free-port []
   (with-open [ss (java.net.ServerSocket. 0 50 (java.net.InetAddress/getByName "127.0.0.1"))]
@@ -236,3 +236,43 @@
             (is (true? (deref gone 5000 :timeout)))
             (is (nil? (g/accumulate-stream s)) "a reduce after close! returns init")
             (is (= :cancelled (stream/outcome s)))))))))
+
+(deftest credential-source-401-invalidates-and-retries-the-opening-request-once
+  (testing "401 -> invalidate -> retry with the refreshed Bearer token, outside :max-retries"
+    (let [auths (atom [])
+          {:keys [source fetches]} (rotating-token-cache)
+          {:keys [port stop!]} (start-server! (free-port) model-path
+                                 (fn [req]
+                                   (swap! auths conj [(get (:headers req) "authorization")
+                                                      (get (:headers req) "x-goog-api-key")])
+                                   (if (= 1 (count @auths))
+                                     {:status 401 :body "{\"error\":{\"message\":\"expired\"}}"}
+                                     {:status 200 :headers sse-headers
+                                      :body (fn [send!] (send! (sse (chunk-json "ok" :finish "STOP"))))})))]
+      (try
+        (let [client (g/client {:credential-source source :base-url (base-url port) :max-retries 0})]
+          (is (= "ok" (g/output-text (g/accumulate-stream
+                                       (g/generate-content-stream client "gemini-2.5-flash" {"contents" []})))))
+          (is (= [["Bearer tok-1" nil] ["Bearer tok-2" nil]] @auths))
+          (is (= 2 @fetches)))
+        (finally (stop!)))))
+  (testing "a second 401 surfaces as the typed status error"
+    (let [hits (atom 0)
+          {:keys [source]} (rotating-token-cache)
+          {:keys [port stop!]} (start-server! (free-port) model-path
+                                 (fn [_] (swap! hits inc) {:status 401 :body "{\"error\":{\"message\":\"nope\"}}"}))]
+      (try
+        (let [client (g/client {:credential-source source :base-url (base-url port) :max-retries 0})
+              e      (try (g/generate-content-stream client "m" {}) nil (catch Exception e e))]
+          (is (= 401 (:status (ex-data e))))
+          (is (= 2 @hits))
+          (is (not (str/includes? (pr-str (ex-data e)) "tok-"))))
+        (finally (stop!)))))
+  (testing "a static key's 401 is not retried"
+    (let [hits (atom 0)]
+      (with-server
+        (fn [_] (swap! hits inc) {:status 401 :body "{\"error\":{\"message\":\"bad key\"}}"})
+        (fn [client]
+          (let [e (try (g/generate-content-stream client "gemini-2.5-flash" {}) nil (catch Exception e e))]
+            (is (= 401 (:status (ex-data e))))
+            (is (= 1 @hits))))))))
