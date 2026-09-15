@@ -226,6 +226,14 @@ test suite runs it instantly against a mock server) and
 
 ### Parity with openai-python's `client.beta.agents.*`
 
+Coverage is complete as of openai-python `d421d7ab8c0a` and the API
+reference fetched 2026-09-15: all 42 method/path pairs the reference's
+`beta/agents` index lists (the same set as the SDK's
+`resources/beta/agents/**`) have a function below. No endpoint is out of
+scope. Not ported: the SDK's `with_raw_response`/`with_streaming_response`
+wrappers and auto-paginating iterators; list methods return one page, paged
+by the caller as each row says.
+
 | openai-python | tools.agents.openai.agents | Notes |
 |---|---|---|
 | `client.beta.agents.create(**params)` — `POST /v1/agents` (API reference) | `(agents-create client request)` | `"model"` required; `name`, `instructions`, `metadata`, `multi_agent`, `reasoning`, `service_tier`, `text`, `tools` passed through. Returns the `Agent` with defaults resolved. |

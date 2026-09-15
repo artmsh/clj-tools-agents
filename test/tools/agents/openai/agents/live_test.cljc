@@ -5,7 +5,8 @@
    and identical assertions on both runtimes.
 
    Port range 19000-19079 — chosen not to collide with the sibling suites'
-   ranges (anthropic 18930-18975, gemini 18980-18997, openai 18950-18971)."
+   ranges (anthropic 18930-18975, gemini 18980-18997, openai 18950-18971).
+   Newer tests (#49 onward) bind port 0 instead."
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.string :as str]
             [tools.agents.openai :as oai]
