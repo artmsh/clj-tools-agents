@@ -22,12 +22,19 @@
    — the same idiom the Python SDK uses with literal dict keys like
    \"max_tokens\").
 
-   STREAMING: not implemented. :stream true is rejected with a clear error
-   rather than silently ignored. See docs/anthropic.md, section \"Streaming is
-   not supported\"."
+   STREAMING: `messages-stream` is anthropic-sdk-python's
+   `client.messages.create(..., stream=True)`: it POSTs /v1/messages with
+   \"stream\": true and returns a single-use reducible (tools.agents.stream)
+   of decoded stream events; retries cover only the opening request.
+   `accumulate-event`/`accumulate-stream` rebuild the final Message exactly
+   as the SDK's `accumulate_event`, and `stream-complete?` tells a finished
+   stream (message_stop seen) from a truncated one; nothing throws on
+   truncation. `messages-create` still rejects :stream true, pointing at
+   `messages-stream`. See docs/anthropic.md, section \"Streaming\"."
   (:require [clojure.string :as str]
             [tools.agents.http :as http]
             [tools.agents.json :as json]
+            [tools.agents.stream :as stream]
             [tools.agents.token :as token]
             [tools.agents.anthropic.credentials :as credentials]))
 
@@ -590,7 +597,8 @@
    response headers attached as metadata — see `request-id` below for the
    Python SDK's `message._request_id` equivalent.
 
-   :stream true throws immediately — see the ns docstring's STREAMING note.
+   :stream true throws :streaming-unsupported immediately — use
+   `messages-stream` instead (see the ns docstring's STREAMING note).
 
    Retries client's :max-retries times (default 2, see `client`) on
    408/409/429/5xx and connection failures, with exponential backoff honoring
@@ -607,7 +615,7 @@
   [client request]
   (when (or (true? (get request :stream)) (true? (get request "stream")))
     (throw (ex-info (str "tools.agents.anthropic/messages-create: :stream true is not supported — "
-                          "SSE streaming is not implemented by this client. See docs/anthropic.md.")
+                          "use tools.agents.anthropic/messages-stream. See docs/anthropic.md.")
                      {:type :tools.agents.anthropic.error/streaming-unsupported})))
   (post-request! client "tools.agents.anthropic/messages-create" "/v1/messages" request))
 
@@ -621,6 +629,323 @@
    Same retry policy, error hierarchy and ex-data shape as messages-create."
   [client request]
   (post-request! client "tools.agents.anthropic/count-tokens" "/v1/messages/count_tokens" request))
+
+;; ---------------------------------------------------------------------------
+;; Public API — streaming
+;; ---------------------------------------------------------------------------
+
+(defn- stream-error-type
+  "Keyword for an in-stream `error` event's error.type, following the
+   error-type table of Anthropic's errors docs (overloaded_error is HTTP 529).
+   A DIVERGENCE from anthropic-sdk-python, whose `_make_status_error`
+   dispatches on the HTTP status only, which is 200 for a stream, so every
+   in-stream error is a plain APIStatusError there."
+  [error-type]
+  (case error-type
+    "invalid_request_error" :tools.agents.anthropic.error/bad-request
+    "authentication_error"  :tools.agents.anthropic.error/authentication
+    "permission_error"      :tools.agents.anthropic.error/permission-denied
+    "not_found_error"       :tools.agents.anthropic.error/not-found
+    "rate_limit_error"      :tools.agents.anthropic.error/rate-limit
+    "api_error"             :tools.agents.anthropic.error/internal-server
+    "overloaded_error"      :tools.agents.anthropic.error/overloaded
+    :tools.agents.anthropic.error/api-status))
+
+(defn- error-event? [ev]
+  (and (map? ev) (= "error" (get ev "type"))))
+
+(defn- stream-error
+  "Typed ex-info for a decoded `error` event
+   {\"type\" \"error\" \"error\" {\"type\" t \"message\" m}}."
+  [caller-name ev body headers]
+  (let [err  (get ev "error")
+        et   (when (map? err) (get err "type"))
+        msg  (when (map? err) (get err "message"))]
+    (ex-info (str caller-name ": stream error"
+                  (when (string? et) (str " " et))
+                  (when (string? msg) (str " " msg)))
+             {:type (stream-error-type et) :status nil :body body :headers headers
+              :error-type et})))
+
+(defn messages-stream
+  "POST request (same map as messages-create) with \"stream\" true to
+   POST /v1/messages — anthropic-sdk-python's
+   client.messages.create(..., stream=True).
+
+   The request is sent NOW, under messages-create's retry policy
+   (request-with-retries!: 408/409/429/5xx and connection failures,
+   :max-retries, Retry-After, *sleep-fn*; a :credential-source client's first
+   401 invalidates the token and retries once outside :max-retries), with
+   auth and `anthropic-beta` headers rebuilt per attempt. Retries cover the
+   opening exchange only; once a 2xx arrives nothing is retried. A final
+   non-2xx or connection failure throws from this call with messages-create's
+   :type/:status/:body/:headers ex-data.
+
+   Returns a SINGLE-USE reducible (tools.agents.stream/open-event-stream) of
+   decoded event maps (string keys): message_start, content_block_start,
+   content_block_delta, content_block_stop, message_delta, message_stop,
+   ping, and any event type added later, all passed through verbatim:
+
+     (let [s (messages-stream client req)]
+       (run! #(some-> (get-in % [\"delta\" \"text\"]) print) s))
+     (let [m (accumulate-stream (messages-stream client req))]
+       (when (stream-complete? m) (output-text m)))
+
+   Reducing closes the connection (EOF, early termination, exception). A
+   stream that is never reduced must be released with
+   (tools.agents.stream/close! s), which is also the cross-thread cancel;
+   `.close`/with-open work on the JVM only. (tools.agents.stream/response s)
+   gives the 2xx {:status :headers}.
+
+   While reducing, throws:
+     - an `error` event (SSE event name `error`, as the SDK's Stream checks,
+       or data \"type\" \"error\") — ex-info typed from error.type (overloaded_error ->
+       :overloaded, rate_limit_error -> :rate-limit, api_error ->
+       :internal-server, invalid_request_error -> :bad-request, ...; see
+       docs/anthropic.md), :status nil, :body the raw data string, :error-type
+       the wire error.type; nothing further is delivered;
+     - a mid-stream transport failure — :api-connection, cause the IOException;
+     - an undecodable event — :json-parse.
+
+   Truncation never throws: a body that ends without message_stop reduces
+   normally and (tools.agents.stream/outcome s) is :eof either way. Check
+   `stream-complete?` on the accumulated message."
+  [client request]
+  (let [caller-name "tools.agents.anthropic/messages-stream"
+        url         (api-url (:base-url client) "/v1/messages")
+        body-str    (write-json (-> (if (contains? request :stream) (dissoc request :stream) request)
+                                    (assoc "stream" true)))
+        src         (:credential-source client)
+        used-token  (volatile! nil)
+        headers     (volatile! nil)
+        resp-hdrs   (volatile! nil)
+        open!       (fn [attempt]
+                      (let [resp (request-with-retries!
+                                  (or (:max-retries client) default-max-retries)
+                                  (fn []
+                                    (vreset! headers (auth-headers client (fn [tok] (vreset! used-token tok))))
+                                    (let [resp (attempt)]
+                                      (if (and (:status resp) (<= 200 (:status resp) 299))
+                                        resp
+                                        ;; non-2xx :body is already a String
+                                        (decode-or-throw! caller-name resp))))
+                                  (when src
+                                    {:on-unauthorized #(boolean (token/invalidate! src @used-token))}))]
+                        (vreset! resp-hdrs (:headers resp))
+                        resp))]
+    (stream/open-event-stream
+     {:request       {:method :post :url url :body body-str}
+      :send!         (fn [req] (send-http! caller-name (assoc req :headers @headers)))
+      :open!         open!
+      ;; Decoded here rather than via :decode, which sees only the data: the
+      ;; SDK's Stream.__stream__ raises on the SSE event NAME `error` and
+      ;; fills a missing data "type" from the event name.
+      :xform         (map (fn [{:keys [event data]}]
+                            (let [ev (read-json data)
+                                  ev (if (and (map? ev) (not (contains? ev "type")) (string? event))
+                                       (assoc ev "type" event)
+                                       ev)]
+                              (if (or (= "error" event) (error-event? ev))
+                                (throw (stream-error caller-name ev data @resp-hdrs))
+                                ev))))
+      :on-read-error (fn [e]
+                       (ex-info (str caller-name ": connection failed mid-stream: " e)
+                                {:type :tools.agents.anthropic.error/api-connection :status nil :body nil}
+                                e))})))
+
+;; ---------------------------------------------------------------------------
+;; Stream accumulation — pure
+;; ---------------------------------------------------------------------------
+;; A port of anthropic-sdk-python src/anthropic/lib/streaming/_messages.py
+;; `accumulate_event` (@ eb21a4352015686c30f5759e8c2f02d70f5371e2). Side
+;; state (per-index input_json buffers, message_stop seen) lives in metadata
+;; on the message map, so the result stays equal to the non-streamed Message.
+
+(def ^:private tracks-tool-input
+  "SDK TRACKS_TOOL_INPUT = (ToolUseBlock, ServerToolUseBlock)."
+  #{"tool_use" "server_tool_use"})
+
+(def ^:private message-event-types
+  #{"message_start" "content_block_start" "content_block_delta" "content_block_stop"
+    "message_delta" "message_stop"})
+
+(defn- invalid-stream [msg]
+  (ex-info (str "tools.agents.anthropic/accumulate-event: " msg)
+           {:type :tools.agents.anthropic.error/invalid-response :status nil :body nil}))
+
+(defn- assoc-grow
+  "assoc x at index i of vector v, nil-padding when i is past the end."
+  [v i x]
+  (let [v (vec v)]
+    (if (< i (count v))
+      (assoc v i x)
+      (conj (into v (repeat (- i (count v)) nil)) x))))
+
+(defn- event-index [ev]
+  (let [i (get ev "index")]
+    (when-not (and (integer? i) (>= i 0))
+      (throw (invalid-stream (str (get ev "type") " has no valid \"index\": " (pr-str i)))))
+    i))
+
+(defn- block-at [acc ev]
+  (let [i     (event-index ev)
+        block (get-in acc ["content" i])]
+    (when-not (map? block)
+      (throw (invalid-stream (str (get ev "type") " for content index " i " with no content_block_start"))))
+    [i block]))
+
+(defn- apply-delta [acc ev]
+  (let [[i block] (block-at acc ev)
+        delta     (get ev "delta")
+        btype     (get block "type")]
+    (case (get delta "type")
+      "text_delta"
+      (if (= "text" btype)
+        (update-in acc ["content" i "text"] str (get delta "text"))
+        acc)
+
+      "input_json_delta"
+      (if (contains? tracks-tool-input btype)
+        (vary-meta acc update-in [::json-bufs i] str (get delta "partial_json"))
+        acc)
+
+      "citations_delta"
+      (if (= "text" btype)
+        (update-in acc ["content" i "citations"] (fnil conj []) (get delta "citation"))
+        acc)
+
+      "thinking_delta"
+      (if (= "thinking" btype)
+        (update-in acc ["content" i "thinking"] str (get delta "thinking"))
+        acc)
+
+      "signature_delta"
+      (if (= "thinking" btype)
+        (assoc-in acc ["content" i "signature"] (get delta "signature"))
+        acc)
+
+      acc)))
+
+(defn- stop-block [acc ev]
+  (let [[i block] (block-at acc ev)
+        buf       (get-in (meta acc) [::json-bufs i])]
+    (if (and (contains? tracks-tool-input (get block "type")) (seq buf))
+      (let [input (try (read-json buf)
+                       (catch Exception e
+                         (throw (ex-info (str "tools.agents.anthropic/accumulate-event: unable to parse tool "
+                                              "input JSON at content index " i ": " (ex-message e))
+                                         {:type :tools.agents.anthropic.error/json-parse :status nil :body buf}
+                                         e))))]
+        (-> (assoc-in acc ["content" i "input"] input)
+            (vary-meta update ::json-bufs dissoc i)))
+      acc)))
+
+(def ^:private optional-usage-keys
+  ["input_tokens" "cache_creation_input_tokens" "cache_read_input_tokens"
+   "server_tool_use" "output_tokens_details"])
+
+(defn- apply-message-delta [acc ev]
+  (let [delta (get ev "delta")
+        usage (get ev "usage")
+        acc   (reduce (fn [a k]
+                        ;; SDK assigns these unconditionally (None when absent);
+                        ;; a key neither side has stays absent.
+                        (if (or (contains? delta k) (contains? a k)) (assoc a k (get delta k)) a))
+                      acc ["stop_reason" "stop_sequence" "stop_details"])
+        acc   (if (some? (get delta "container")) (assoc acc "container" (get delta "container")) acc)
+        acc   (assoc-in acc ["usage" "output_tokens"] (get usage "output_tokens"))]
+    (reduce (fn [a k] (if (some? (get usage k)) (assoc-in a ["usage" k] (get usage k)) a))
+            acc optional-usage-keys)))
+
+(defn accumulate-event
+  "Reducing fn rebuilding the final Message map from messages-stream events,
+   ported from anthropic-sdk-python `accumulate_event` (lib/streaming/
+   _messages.py):
+
+     - message_start        the message, \"content\" forced to a vector.
+                            A content_block_*/message_* event before it throws
+                            :invalid-response (the SDK's RuntimeError); ping
+                            and unknown types before it are ignored.
+     - content_block_start  the block assoc'ed at \"index\" (the SDK appends).
+     - content_block_delta  text_delta appends \"text\"; citations_delta conjs
+                            \"citation\" onto \"citations\" (text blocks);
+                            thinking_delta appends \"thinking\";
+                            signature_delta sets \"signature\" (thinking
+                            blocks); input_json_delta buffers \"partial_json\"
+                            (tool_use/server_tool_use); a delta whose type does
+                            not match its block, or an unknown delta type, is
+                            ignored.
+     - content_block_stop   a tool_use/server_tool_use block with a non-empty
+                            buffer gets \"input\" = the parsed buffer; an empty
+                            buffer keeps content_block_start's input ({}). A
+                            buffer that does not parse throws :json-parse (the
+                            SDK's ValueError). Until content_block_stop the
+                            partial JSON is never parsed, so a truncated
+                            tool_use never throws and keeps its start input
+                            (the SDK instead keeps a jiter partial-mode snapshot).
+     - message_delta        stop_reason/stop_sequence/stop_details overwritten,
+                            container when non-nil; usage is cumulative, so
+                            output_tokens is overwritten and input_tokens,
+                            cache_creation_input_tokens, cache_read_input_tokens,
+                            server_tool_use, output_tokens_details only when
+                            non-nil.
+     - message_stop         marks the message complete (`stream-complete?`).
+     - error                throws the same typed ex-info as messages-stream.
+     - ping, unknown types  ignored.
+
+   Arities: [] -> nil, [acc] -> acc, [acc event] -> acc (reduce with init nil,
+   or transduce). Pure; side state is metadata, so the result is `=` to the
+   non-streamed Message and `output-text`/`tool-calls` work on it."
+  ([] nil)
+  ([acc] acc)
+  ([acc ev]
+   (let [etype (get ev "type")]
+     (cond
+       (error-event? ev)
+       (throw (stream-error "tools.agents.anthropic/accumulate-event" ev nil nil))
+
+       (nil? acc)
+       (cond
+         (= "message_start" etype)
+         (let [m (get ev "message")]
+           (when-not (map? m) (throw (invalid-stream "message_start has no \"message\" map")))
+           (assoc m "content" (vec (get m "content"))))
+
+         (contains? message-event-types etype)
+         (throw (invalid-stream (str "unexpected event order, got " (pr-str etype) " before \"message_start\"")))
+
+         ;; ping/unknown never reach the SDK's accumulate_event (Stream.__stream__
+         ;; skips them), so they cannot violate its ordering check either.
+         :else nil)
+
+       :else
+       (case etype
+         "content_block_start" (assoc acc "content"
+                                      (assoc-grow (get acc "content") (event-index ev) (get ev "content_block")))
+         "content_block_delta" (apply-delta acc ev)
+         "content_block_stop"  (stop-block acc ev)
+         "message_delta"       (apply-message-delta acc ev)
+         "message_stop"        (vary-meta acc assoc ::complete true)
+         acc)))))
+
+(defn accumulate-stream
+  "Reduce `events` — a messages-stream reducible (consumed and closed) or any
+   collection of event maps — with accumulate-event. Returns the Message map,
+   or nil for no events. Given a messages-stream, the response headers are
+   attached so `request-id` works on the result. Never throws on truncation;
+   check `stream-complete?`."
+  [events]
+  (let [m (transduce identity accumulate-event events)]
+    (if (and m (satisfies? stream/EventStream events))
+      (vary-meta m assoc ::headers (:headers (stream/response events)))
+      m)))
+
+(defn stream-complete?
+  "True iff the accumulated message saw message_stop. A stream cut off before
+   it (connection closed cleanly at an event boundary) accumulates normally
+   and reads false here; so does a hand-built or non-streamed message."
+  [message]
+  (true? (::complete (meta message))))
 
 (defn request-id
   "The `request-id` response header for a successful messages-create/

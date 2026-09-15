@@ -6,6 +6,7 @@
             tools.agents.anthropic.credentials-test
             tools.agents.anthropic.live-test
             tools.agents.anthropic.spec-test
+            tools.agents.anthropic.stream-test
             tools.agents.anthropic.visualize-test))
 
 (def suites
@@ -14,6 +15,7 @@
    'tools.agents.anthropic.credentials-test
    'tools.agents.anthropic.live-test
    'tools.agents.anthropic.spec-test
+   'tools.agents.anthropic.stream-test
    'tools.agents.anthropic.visualize-test])
 
 (defn -main [& _]
