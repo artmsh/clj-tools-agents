@@ -608,7 +608,7 @@ after the turn it lists, retrieves, downloads (byte-exact), and deletes the
 artifact, then expects a 404. Cleanup cancels and deletes the session,
 retrying a 409. It costs a short turn; it passed live on 2026-09-15.
 
-Event streaming (ports `19041`–`19048`): `sessions-events-stream` sends GET,
+Event streaming: `sessions-events-stream` sends GET,
 `Accept: text/event-stream`, the beta header and `stream=true` alongside
 caller params; events reach the reducer while the server is still blocked
 (incremental delivery); the synthetic `test/resources/sse/agents-turn.sse`
@@ -655,11 +655,9 @@ typed `not-found-error`. `environments-templates-crud-round-trip-against-the-rea
 (same gate; a template only, no session) runs create → retrieve → update →
 list (polled) → delete. It **has not been run yet**.
 
-Tests added in #49 bind port `0` (OS-assigned) through `with-recording-server`.
-
-Port range `19000`–`19079` — chosen not to collide with the sibling suites'
-ranges (anthropic `18930`–`18975`, gemini `18980`–`18997`, openai
-`18950`–`18971`).
+Every mock server binds port `0` (OS-assigned) and the tests read the bound
+port back; the before-any-network tests dial
+`tools.agents.test-support/closed-port`.
 
 ### Running the tests
 

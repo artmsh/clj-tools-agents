@@ -376,12 +376,10 @@ connection. Its ports come from the OS (bind port 0), not a fixed band.
 
 The mock server is `tools.agents.test-support/start-server!`, shared by all three provider suites: two leaves, Babashka
 `org.httpkit.server` and JVM Clojure `com.sun.net.httpserver.HttpServer`.
-Mock ports are `18980`–`18997` (plus `19360`–`19362` for `:credential-source`), kept disjoint from
-`tools.agents.anthropic`'s `18930`–`18946` and `tools.agents.openai`'s
-`18950`–`18971` as a matter of hygiene. Port `18999` is additionally used by
-the tests that deliberately start *no* server (missing credentials and the
-connection-failure tests, which actually dial it and so assume nothing else
-on the host has `18999` bound).
+Every mock server binds port `0` and the tests read the OS-assigned port back.
+The tests that deliberately start *no* server (missing credentials and the
+connection-failure tests) dial `tools.agents.test-support/closed-port`: a port
+bound to `0`, read, and closed.
 
 A couple of client-construction tests read the real environment (they assert
 the behavior that applies when `GOOGLE_API_KEY`/`GEMINI_API_KEY` are unset),

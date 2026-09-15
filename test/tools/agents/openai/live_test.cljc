@@ -16,7 +16,7 @@
             [examples.openai.custom-gateway :as ex-gateway]
             [examples.openai.azure :as ex-azure]
             [tools.agents.token :as token]
-            [tools.agents.test-support :refer [start-server! rotating-token-cache per-call-token-source]]))
+            [tools.agents.test-support :refer [closed-port start-server! rotating-token-cache per-call-token-source]]))
 
 (defn- base-url [port] (str "http://127.0.0.1:" port "/v1"))
 
@@ -38,7 +38,7 @@
 
 (deftest posts-to-v1-responses-with-required-headers
   (let [captured (atom nil)
-        {:keys [port stop!]} (start-server! 18950 "/v1/responses"
+        {:keys [port stop!]} (start-server! 0 "/v1/responses"
                                 (fn [req] (reset! captured req) {:status 200 :body (canned-response)}))]
     (try
       (let [client (oai/client {:api-key "test-key" :base-url (base-url port)})
@@ -63,7 +63,7 @@
   ;; openai-python emits Omit() for these — the headers must be ABSENT, not
   ;; present-and-empty (which is what an assoc-of-nil would produce).
   (let [captured (atom nil)
-        {:keys [port stop!]} (start-server! 18951 "/v1/responses"
+        {:keys [port stop!]} (start-server! 0 "/v1/responses"
                                 (fn [req] (reset! captured req) {:status 200 :body (canned-response)}))]
     (try
       (let [client (with-redefs [oai/getenv (constantly nil)] ; unset means unset in the shell too
@@ -75,7 +75,7 @@
 
 (deftest org-and-project-headers-sent-when-set
   (let [captured (atom nil)
-        {:keys [port stop!]} (start-server! 18952 "/v1/responses"
+        {:keys [port stop!]} (start-server! 0 "/v1/responses"
                                 (fn [req] (reset! captured req) {:status 200 :body (canned-response)}))]
     (try
       (let [client (oai/client {:api-key "k" :base-url (base-url port)
@@ -87,7 +87,7 @@
 
 (deftest base-url-with-trailing-slash-still-builds-correct-path
   (let [captured (atom nil)
-        {:keys [port stop!]} (start-server! 18953 "/v1/responses"
+        {:keys [port stop!]} (start-server! 0 "/v1/responses"
                                 (fn [req] (reset! captured req) {:status 200 :body (canned-response)}))]
     (try
       (let [client (oai/client {:api-key "k" :base-url (str (base-url port) "/")})]
@@ -97,7 +97,7 @@
 
 (deftest chat-completions-posts-to-v1-chat-completions
   (let [captured (atom nil)
-        {:keys [port stop!]} (start-server! 18954 "/v1/chat/completions"
+        {:keys [port stop!]} (start-server! 0 "/v1/chat/completions"
                                 (fn [req] (reset! captured req) {:status 200 :body (canned-completion)}))]
     (try
       (let [client (oai/client {:api-key "k" :base-url (base-url port)})
@@ -115,7 +115,7 @@
 ;; ---------------------------------------------------------------------------
 
 (deftest decodes-nested-response-into-maps-and-vectors
-  (let [{:keys [port stop!]} (start-server! 18955 "/v1/responses"
+  (let [{:keys [port stop!]} (start-server! 0 "/v1/responses"
                                 (fn [_] {:status 200
                                          :body (str "{\"id\":\"resp_2\",\"model\":\"gpt-5.5\","
                                                     "\"output\":[{\"type\":\"message\",\"content\":"
@@ -135,7 +135,7 @@
 (deftest reasoning-only-response-yields-empty-output-text
   ;; End-to-end confirmation of the SDK's documented "" contract — not just
   ;; the pure-unit version in tools.agents.openai-test.
-  (let [{:keys [port stop!]} (start-server! 18956 "/v1/responses"
+  (let [{:keys [port stop!]} (start-server! 0 "/v1/responses"
                                 (fn [_] {:status 200
                                          :body (str "{\"id\":\"resp_3\",\"status\":\"incomplete\","
                                                     "\"output\":[{\"type\":\"reasoning\",\"summary\":[]}],"
@@ -152,7 +152,7 @@
 ;; ---------------------------------------------------------------------------
 
 (deftest non-2xx-throws-with-status-and-extracted-message
-  (let [{:keys [port stop!]} (start-server! 18957 "/v1/responses"
+  (let [{:keys [port stop!]} (start-server! 0 "/v1/responses"
                                 (fn [_] {:status 429
                                          :body (str "{\"error\":{\"message\":\"Rate limit reached\","
                                                     "\"type\":\"rate_limit_error\",\"param\":null,"
@@ -175,7 +175,7 @@
 (deftest conflict-409-maps-to-its-own-error-type
   ;; openai-python has a ConflictError class for 409 that anthropic-sdk-python
   ;; has no analogue for — easy to lose in a port of the sibling's status map.
-  (let [{:keys [port stop!]} (start-server! 18958 "/v1/responses"
+  (let [{:keys [port stop!]} (start-server! 0 "/v1/responses"
                                 (fn [_] {:status 409 :body "{\"error\":{\"message\":\"conflict\"}}"}))]
     (try
       (let [client (oai/client {:api-key "k" :base-url (base-url port) :max-retries 0})
@@ -187,7 +187,7 @@
       (finally (stop!)))))
 
 (deftest non-2xx-without-json-error-shape-falls-back-to-raw-body
-  (let [{:keys [port stop!]} (start-server! 18959 "/v1/responses"
+  (let [{:keys [port stop!]} (start-server! 0 "/v1/responses"
                                 (fn [_] {:status 500 :body "internal explosion, not json"}))]
     (try
       (let [client (oai/client {:api-key "k" :base-url (base-url port) :max-retries 0})
@@ -200,7 +200,7 @@
       (finally (stop!)))))
 
 (deftest chat-completions-errors-are-labelled-with-their-own-fn-name
-  (let [{:keys [port stop!]} (start-server! 18960 "/v1/chat/completions"
+  (let [{:keys [port stop!]} (start-server! 0 "/v1/chat/completions"
                                 (fn [_] {:status 400 :body "{\"error\":{\"message\":\"bad model\"}}"}))]
     (try
       (let [client (oai/client {:api-key "k" :base-url (base-url port)})
@@ -212,7 +212,7 @@
       (finally (stop!)))))
 
 (deftest malformed-json-response-throws-catchable-parse-error
-  (let [{:keys [port stop!]} (start-server! 18961 "/v1/responses"
+  (let [{:keys [port stop!]} (start-server! 0 "/v1/responses"
                                 (fn [_] {:status 200 :body "{not valid json"}))]
     (try
       (let [client (oai/client {:api-key "k" :base-url (base-url port)})
@@ -224,7 +224,7 @@
 
 (deftest connection-failure-is-typed-not-leaked
   ;; Nothing is listening on this port at all. :max-retries 0 keeps it instant.
-  (let [client (oai/client {:api-key "k" :base-url "http://127.0.0.1:18999/v1" :max-retries 0})
+  (let [client (oai/client {:api-key "k" :base-url (str "http://127.0.0.1:" (closed-port) "/v1") :max-retries 0})
         e (try (oai/responses-create client {"model" "m" "input" "hi"})
                nil (catch Exception e e))]
     (is (some? e))
@@ -240,7 +240,7 @@
 
 (deftest retries-a-429-then-succeeds
   (let [hits (atom 0)
-        {:keys [port stop!]} (start-server! 18965 "/v1/responses"
+        {:keys [port stop!]} (start-server! 0 "/v1/responses"
                                 (fn [_]
                                   (if (< (swap! hits inc) 3)
                                     {:status 429 :headers {"retry-after-ms" "1"}
@@ -264,7 +264,7 @@
 
 (deftest retries-are-exhausted-then-the-status-error-surfaces
   (let [hits (atom 0)
-        {:keys [port stop!]} (start-server! 18966 "/v1/responses"
+        {:keys [port stop!]} (start-server! 0 "/v1/responses"
                                 (fn [_] (swap! hits inc)
                                   {:status 503 :headers {"retry-after-ms" "1"}
                                    :body "{\"error\":{\"message\":\"overloaded\"}}"}))]
@@ -281,7 +281,7 @@
 
 (deftest non-retryable-status-is-not-retried
   (let [hits (atom 0)
-        {:keys [port stop!]} (start-server! 18967 "/v1/responses"
+        {:keys [port stop!]} (start-server! 0 "/v1/responses"
                                 (fn [_] (swap! hits inc)
                                   {:status 400 :body "{\"error\":{\"message\":\"bad request\"}}"}))]
     (try
@@ -296,7 +296,7 @@
 (deftest x-should-retry-header-overrides-the-status
   ;; A 400 the server explicitly asks us to retry — and a 500 it asks us not to.
   (let [hits (atom 0)
-        {:keys [port stop!]} (start-server! 18968 "/v1/responses"
+        {:keys [port stop!]} (start-server! 0 "/v1/responses"
                                 (fn [_]
                                   (if (< (swap! hits inc) 2)
                                     {:status 400 :headers {"x-should-retry" "true" "retry-after-ms" "1"}
@@ -308,7 +308,7 @@
         (is (= 2 @hits)))
       (finally (stop!))))
   (let [hits (atom 0)
-        {:keys [port stop!]} (start-server! 18969 "/v1/responses"
+        {:keys [port stop!]} (start-server! 0 "/v1/responses"
                                 (fn [_] (swap! hits inc)
                                   {:status 500 :headers {"x-should-retry" "false"}
                                    :body "{\"error\":{\"message\":\"do not retry\"}}"}))]
@@ -322,7 +322,7 @@
 
 (deftest max-retries-zero-disables-retrying
   (let [hits (atom 0)
-        {:keys [port stop!]} (start-server! 18970 "/v1/responses"
+        {:keys [port stop!]} (start-server! 0 "/v1/responses"
                                 (fn [_] (swap! hits inc)
                                   {:status 429 :headers {"retry-after-ms" "1"} :body "{}"}))]
     (try
@@ -335,7 +335,7 @@
 
 (deftest chat-completions-retries-too
   (let [hits (atom 0)
-        {:keys [port stop!]} (start-server! 18971 "/v1/chat/completions"
+        {:keys [port stop!]} (start-server! 0 "/v1/chat/completions"
                                 (fn [_]
                                   (if (< (swap! hits inc) 2)
                                     {:status 429 :headers {"retry-after-ms" "1"} :body "{}"}
@@ -350,7 +350,7 @@
 (deftest connection-errors-are-retried-then-typed
   ;; Nothing listening at all — the SDK retries transport failures without
   ;; consulting should-retry?. One retry keeps the backoff sleep at ~0.5s.
-  (let [client (oai/client {:api-key "k" :base-url "http://127.0.0.1:18999/v1" :max-retries 1})
+  (let [client (oai/client {:api-key "k" :base-url (str "http://127.0.0.1:" (closed-port) "/v1") :max-retries 1})
         e (try (oai/responses-create client {"model" "m" "input" "hi"})
                nil (catch Exception e e))]
     (is (some? e))
@@ -363,7 +363,7 @@
   ;; the expected missing-credentials error. The env is injected empty, so an
   ;; exported OPENAI_API_KEY cannot change the outcome.
   (let [e (try (with-redefs [oai/getenv (constantly nil)]
-                 (oai/client {:base-url "http://127.0.0.1:18999/v1"}))
+                 (oai/client {:base-url (str "http://127.0.0.1:" (closed-port) "/v1")}))
                nil (catch Exception e e))]
     (is (some? e))
     (is (= :tools.agents.openai/missing-credentials (:type (ex-data e))))))
@@ -375,7 +375,7 @@
 (deftest credential-source-401-invalidates-and-retries-once-outside-budget
   (let [seen (atom [])
         {:keys [source fetches]} (rotating-token-cache)
-        {:keys [port stop!]} (start-server! 19350 "/v1/responses"
+        {:keys [port stop!]} (start-server! 0 "/v1/responses"
                                 (fn [req]
                                   (let [auth (get (:headers req) "authorization")]
                                     (swap! seen conj auth)
@@ -393,7 +393,7 @@
 (deftest credential-source-second-401-surfaces-without-leaking-tokens
   (let [hits (atom 0)
         {:keys [source fetches]} (rotating-token-cache)
-        {:keys [port stop!]} (start-server! 19351 "/v1/responses"
+        {:keys [port stop!]} (start-server! 0 "/v1/responses"
                                 (fn [_] (swap! hits inc)
                                   {:status 401 :body "{\"error\":{\"message\":\"invalid token\"}}"}))]
     (try
@@ -408,7 +408,7 @@
 
 (deftest credential-source-token-requested-per-attempt
   (let [seen (atom [])
-        {:keys [port stop!]} (start-server! 19353 "/v1/responses"
+        {:keys [port stop!]} (start-server! 0 "/v1/responses"
                                 (fn [req]
                                   (swap! seen conj (get (:headers req) "authorization"))
                                   (if (= 1 (count @seen))
@@ -422,7 +422,7 @@
 
 (deftest credential-source-declining-invalidate-is-not-retried
   (let [hits (atom 0)
-        {:keys [port stop!]} (start-server! 19354 "/v1/responses"
+        {:keys [port stop!]} (start-server! 0 "/v1/responses"
                                 (fn [_] (swap! hits inc) {:status 401 :body "{}"}))]
     (try
       (let [client (oai/client {:credential-source (per-call-token-source) :base-url (base-url port)})
@@ -437,7 +437,7 @@
   (let [calls  (atom 0)
         source (token/token-cache {:fetch! (fn [] (swap! calls inc)
                                              (throw (ex-info "exchange failed" {:type ::exchange-failed})))})
-        client (oai/client {:credential-source source :base-url "http://127.0.0.1:18999/v1"})
+        client (oai/client {:credential-source source :base-url (str "http://127.0.0.1:" (closed-port) "/v1")})
         e      (try (oai/responses-create client {"model" "m" "input" "hi"}) nil (catch Exception e e))]
     (is (= ::exchange-failed (:type (ex-data e))))
     (is (= 1 @calls))))
@@ -446,10 +446,6 @@
 ;; callable :api-key (#37): openai-python's `api_key=<callable>` — called before
 ;; every attempt, no cache, 401 not retried, bad return typed. OS-assigned ports.
 ;; ---------------------------------------------------------------------------
-
-(defn- free-port []
-  (with-open [s (java.net.ServerSocket. 0 50 (java.net.InetAddress/getByName "127.0.0.1"))]
-    (.getLocalPort s)))
 
 (defn- counting-key-fn
   "A zero-arg :api-key fn returning \"key-1\", \"key-2\", ... Returns {:f :calls}."
@@ -523,7 +519,7 @@
 (deftest api-key-fn-exception-propagates-unretried
   (let [calls  (atom 0)
         client (oai/client {:api-key (fn [] (swap! calls inc) (throw (ex-info "provider down" {:type ::provider-down})))
-                            :base-url (str "http://127.0.0.1:" (free-port) "/v1")})
+                            :base-url (str "http://127.0.0.1:" (closed-port) "/v1")})
         e      (try (oai/responses-create client {"model" "m" "input" "hi"}) nil (catch Exception e e))]
     (is (= ::provider-down (:type (ex-data e))))
     (is (= 1 @calls))))
@@ -560,7 +556,7 @@
 
 (deftest example-a-basic-chat-runs-against-mock-server
   (let [captured (atom nil)
-        {:keys [port stop!]} (start-server! 18962 "/v1/responses"
+        {:keys [port stop!]} (start-server! 0 "/v1/responses"
                                 (fn [req] (reset! captured req) {:status 200 :body (canned-response)}))]
     (try
       (let [client (oai/client {:api-key "test-key" :base-url (base-url port)})]
@@ -575,7 +571,7 @@
 
 (deftest example-b-chat-completions-runs-against-mock-server
   (let [captured (atom nil)
-        {:keys [port stop!]} (start-server! 18963 "/v1/chat/completions"
+        {:keys [port stop!]} (start-server! 0 "/v1/chat/completions"
                                 (fn [req] (reset! captured req) {:status 200 :body (canned-completion)}))]
     (try
       (let [client (oai/client {:api-key "test-key" :base-url (base-url port)})]
@@ -586,7 +582,7 @@
 
 (deftest example-c-custom-gateway-runs-against-mock-server
   (let [captured (atom nil)
-        {:keys [port stop!]} (start-server! 18964 "/v1/responses"
+        {:keys [port stop!]} (start-server! 0 "/v1/responses"
                                 (fn [req] (reset! captured req)
                                   {:status 200
                                    :body (str "{\"output\":[{\"type\":\"message\",\"content\":"
@@ -606,7 +602,7 @@
   ;; Azure v1 shape: {endpoint}/openai/v1/responses, credential as Bearer, no
   ;; api-version query. Mock only; never run against a live Azure resource.
   (let [captured (atom nil)
-        {:keys [port stop!]} (start-server! 19391 "/openai/v1/responses"
+        {:keys [port stop!]} (start-server! 0 "/openai/v1/responses"
                                 (fn [req] (reset! captured req) {:status 200 :body (canned-response)}))]
     (try
       (let [endpoint (str "http://127.0.0.1:" port "/")
@@ -621,12 +617,12 @@
       (finally (stop!)))))
 
 ;; ---------------------------------------------------------------------------
-;; request! — the single public transport (#41). Ports 19400-19409.
+;; request! — the single public transport (#41).
 ;; ---------------------------------------------------------------------------
 
 (deftest request-get-with-query-extra-headers-and-no-body
   (let [captured (atom nil)
-        {:keys [port stop!]} (start-server! 19400 "/v1/files"
+        {:keys [port stop!]} (start-server! 0 "/v1/files"
                                 (fn [req] (reset! captured req)
                                   {:status 200 :body "{\"object\":\"list\",\"data\":[]}"}))]
     (try
@@ -647,7 +643,7 @@
 
 (deftest request-as-bytes-returns-raw-bytes-and-as-string-skips-decoding
   (let [payload (byte-array [0 1 2 -1 123])
-        {:keys [port stop!]} (start-server! 19401 "/v1/files"
+        {:keys [port stop!]} (start-server! 0 "/v1/files"
                                 (fn [req]
                                   {:status 200
                                    :body (if (str/ends-with? (:path req) "/bin") payload "{not json")}))]
@@ -661,7 +657,7 @@
       (finally (stop!)))))
 
 (deftest request-as-bytes-error-body-is-a-string-and-typed
-  (let [{:keys [port stop!]} (start-server! 19402 "/v1/files"
+  (let [{:keys [port stop!]} (start-server! 0 "/v1/files"
                                 (fn [_] {:status 404 :body "{\"error\":{\"message\":\"no such file\"}}"}))]
     (try
       (let [client (oai/client {:api-key "k" :base-url (base-url port) :max-retries 0})
@@ -673,7 +669,7 @@
       (finally (stop!)))))
 
 (deftest request-empty-2xx-json-body-decodes-to-nil
-  (let [{:keys [port stop!]} (start-server! 19403 "/v1/things" (fn [_] {:status 200 :body ""}))]
+  (let [{:keys [port stop!]} (start-server! 0 "/v1/things" (fn [_] {:status 200 :body ""}))]
     (try
       (is (nil? (oai/request! (oai/client {:api-key "k" :base-url (base-url port)})
                               {:method :delete :path "/things/t1"})))
@@ -681,7 +677,7 @@
 
 (deftest request-multipart-sends-form-data-not-json
   (let [captured (atom nil)
-        {:keys [port stop!]} (start-server! 19404 "/v1/uploads"
+        {:keys [port stop!]} (start-server! 0 "/v1/uploads"
                                 (fn [req] (reset! captured req) {:status 200 :body "{\"id\":\"file_1\"}"}))]
     (try
       (let [client (oai/client {:api-key "k" :base-url (base-url port)})
@@ -704,7 +700,7 @@
 
 (deftest request-static-api-key-401-is-not-retried
   (let [hits (atom 0)
-        {:keys [port stop!]} (start-server! 19405 "/v1/responses"
+        {:keys [port stop!]} (start-server! 0 "/v1/responses"
                                 (fn [_] (swap! hits inc)
                                   {:status 401 :body "{\"error\":{\"message\":\"bad key\"}}"}))]
     (try

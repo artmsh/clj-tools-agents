@@ -16,7 +16,7 @@
             [examples.gemini.count-tokens :as ex-count]
             [examples.gemini.custom-gateway :as ex-gateway]
             [tools.agents.token :as token]
-            [tools.agents.test-support :refer [start-server! rotating-token-cache per-call-token-source]]))
+            [tools.agents.test-support :refer [closed-port start-server! rotating-token-cache per-call-token-source]]))
 
 (defn- base-url [port] (str "http://127.0.0.1:" port))
 
@@ -32,7 +32,7 @@
 
 (deftest posts-to-models-generate-content-with-required-headers
   (let [captured (atom nil)
-        {:keys [port stop!]} (start-server! 18980 "/v1beta/models/gemini-2.5-flash:generateContent"
+        {:keys [port stop!]} (start-server! 0 "/v1beta/models/gemini-2.5-flash:generateContent"
                                 (fn [req] (reset! captured req) {:status 200 :body (canned-response)}))]
     (try
       (let [client (g/client {:api-key "test-key" :base-url (base-url port)})
@@ -54,7 +54,7 @@
 
 (deftest bare-model-id-gets-models-prefix-tuned-model-id-does-not
   (let [captured (atom nil)
-        {:keys [port stop!]} (start-server! 18981 "/v1beta/tunedModels/my-tuned-model:generateContent"
+        {:keys [port stop!]} (start-server! 0 "/v1beta/tunedModels/my-tuned-model:generateContent"
                                 (fn [req] (reset! captured req) {:status 200 :body (canned-response)}))]
     (try
       (let [client (g/client {:api-key "k" :base-url (base-url port)})]
@@ -64,7 +64,7 @@
 
 (deftest base-url-with-trailing-slash-still-builds-correct-path
   (let [captured (atom nil)
-        {:keys [port stop!]} (start-server! 18982 "/v1beta/models/gemini-2.5-flash:generateContent"
+        {:keys [port stop!]} (start-server! 0 "/v1beta/models/gemini-2.5-flash:generateContent"
                                 (fn [req] (reset! captured req) {:status 200 :body (canned-response)}))]
     (try
       (let [client (g/client {:api-key "k" :base-url (str (base-url port) "/")})]
@@ -74,7 +74,7 @@
 
 (deftest count-tokens-posts-to-count-tokens-path-and-decodes
   (let [captured (atom nil)
-        {:keys [port stop!]} (start-server! 18983 "/v1beta/models/gemini-2.5-flash:countTokens"
+        {:keys [port stop!]} (start-server! 0 "/v1beta/models/gemini-2.5-flash:countTokens"
                                 (fn [req] (reset! captured req) {:status 200 :body "{\"totalTokens\":7}"}))]
     (try
       (let [client (g/client {:api-key "k" :base-url (base-url port)})
@@ -88,7 +88,7 @@
 ;; ---------------------------------------------------------------------------
 
 (deftest decodes-nested-response-into-maps-and-vectors
-  (let [{:keys [port stop!]} (start-server! 18984 "/v1beta/models/m:generateContent"
+  (let [{:keys [port stop!]} (start-server! 0 "/v1beta/models/m:generateContent"
                                 (fn [_] {:status 200
                                          :body (str "{\"candidates\":[{\"content\":{\"parts\":"
                                                     "[{\"text\":\"hi\"}]}}],"
@@ -104,7 +104,7 @@
       (finally (stop!)))))
 
 (deftest safety-blocked-response-yields-nil-output-text
-  (let [{:keys [port stop!]} (start-server! 18985 "/v1beta/models/m:generateContent"
+  (let [{:keys [port stop!]} (start-server! 0 "/v1beta/models/m:generateContent"
                                 (fn [_] {:status 200
                                          :body (str "{\"candidates\":[{\"finishReason\":\"SAFETY\","
                                                     "\"safetyRatings\":[]}]}")}))]
@@ -120,7 +120,7 @@
 ;; ---------------------------------------------------------------------------
 
 (deftest non-2xx-throws-with-status-and-extracted-message-nested-error-shape
-  (let [{:keys [port stop!]} (start-server! 18986 "/v1beta/models/m:generateContent"
+  (let [{:keys [port stop!]} (start-server! 0 "/v1beta/models/m:generateContent"
                                 (fn [_] {:status 429
                                          :body (str "{\"error\":{\"code\":429,"
                                                     "\"message\":\"Resource exhausted\",\"status\":\"RESOURCE_EXHAUSTED\"}}")}))]
@@ -138,7 +138,7 @@
 (deftest non-2xx-flat-error-shape-also-extracts-message
   ;; python-genai's APIError accepts a top-level {"message":...} too, not
   ;; just the nested {"error":{"message":...}} shape.
-  (let [{:keys [port stop!]} (start-server! 18987 "/v1beta/models/m:generateContent"
+  (let [{:keys [port stop!]} (start-server! 0 "/v1beta/models/m:generateContent"
                                 (fn [_] {:status 400 :body "{\"code\":400,\"message\":\"bad request\"}"}))]
     (try
       (let [client (g/client {:api-key "k" :base-url (base-url port) :max-retries 0})
@@ -148,7 +148,7 @@
       (finally (stop!)))))
 
 (deftest non-2xx-without-json-error-shape-falls-back-to-raw-body
-  (let [{:keys [port stop!]} (start-server! 18988 "/v1beta/models/m:generateContent"
+  (let [{:keys [port stop!]} (start-server! 0 "/v1beta/models/m:generateContent"
                                 (fn [_] {:status 500 :body "internal explosion, not json"}))]
     (try
       (let [client (g/client {:api-key "k" :base-url (base-url port) :max-retries 0})
@@ -159,7 +159,7 @@
       (finally (stop!)))))
 
 (deftest malformed-json-response-throws-catchable-parse-error
-  (let [{:keys [port stop!]} (start-server! 18989 "/v1beta/models/m:generateContent"
+  (let [{:keys [port stop!]} (start-server! 0 "/v1beta/models/m:generateContent"
                                 (fn [_] {:status 200 :body "{not valid json"}))]
     (try
       (let [client (g/client {:api-key "k" :base-url (base-url port)})
@@ -168,7 +168,7 @@
       (finally (stop!)))))
 
 (deftest connection-failure-is-typed-not-leaked
-  (let [client (g/client {:api-key "k" :base-url "http://127.0.0.1:18999" :max-retries 0})
+  (let [client (g/client {:api-key "k" :base-url (str "http://127.0.0.1:" (closed-port)) :max-retries 0})
         e (try (g/generate-content client "m" {"contents" []}) nil (catch Exception e e))]
     (is (some? e))
     (is (= :tools.agents.gemini/api-connection-error (:type (ex-data e))))
@@ -179,7 +179,7 @@
   ;; An empty injected env: the outcome must not depend on GOOGLE_API_KEY /
   ;; GEMINI_API_KEY being exported in the shell running the suite.
   (let [e (try (with-redefs [g/getenv (constantly nil)]
-                 (g/client {:base-url "http://127.0.0.1:18999"}))
+                 (g/client {:base-url (str "http://127.0.0.1:" (closed-port))}))
                nil (catch Exception e e))]
     (is (some? e))
     (is (= :tools.agents.gemini/missing-credentials (:type (ex-data e))))))
@@ -193,7 +193,7 @@
 (deftest credential-source-401-invalidates-and-retries-once-outside-budget
   (let [seen (atom [])
         {:keys [source fetches]} (rotating-token-cache)
-        {:keys [port stop!]} (start-server! 19360 generate-path
+        {:keys [port stop!]} (start-server! 0 generate-path
                                 (fn [req]
                                   (let [auth (get (:headers req) "authorization")]
                                     (swap! seen conj [auth (get (:headers req) "x-goog-api-key")])
@@ -210,7 +210,7 @@
 
 (deftest credential-source-second-401-surfaces-and-static-key-401-is-not-retried
   (let [hits (atom 0)
-        {:keys [port stop!]} (start-server! 19361 generate-path
+        {:keys [port stop!]} (start-server! 0 generate-path
                                 (fn [_] (swap! hits inc) {:status 401 :body "{\"error\":{\"message\":\"no\"}}"}))]
     (try
       (let [call (fn [opts]
@@ -226,7 +226,7 @@
 
 (deftest credential-source-token-requested-per-attempt
   (let [seen (atom [])
-        {:keys [port stop!]} (start-server! 19362 generate-path
+        {:keys [port stop!]} (start-server! 0 generate-path
                                 (fn [req]
                                   (swap! seen conj (get (:headers req) "authorization"))
                                   (if (= 1 (count @seen))
@@ -244,7 +244,7 @@
          (:type (ex-data (try (g/client {:api-key "k" :credential-source (:source (rotating-token-cache))})
                               nil (catch Exception e e))))))
   (let [source (token/token-cache {:fetch! (fn [] (throw (ex-info "exchange failed" {:type ::exchange-failed})))})
-        client (g/client {:credential-source source :base-url "http://127.0.0.1:18999"})
+        client (g/client {:credential-source source :base-url (str "http://127.0.0.1:" (closed-port))})
         e      (try (g/generate-content client "gemini-2.5-flash" {"contents" []}) nil (catch Exception e e))]
     (is (= ::exchange-failed (:type (ex-data e))))))
 
@@ -254,7 +254,7 @@
 
 (deftest retries-a-503-then-succeeds
   (let [hits (atom 0)
-        {:keys [port stop!]} (start-server! 18990 "/v1beta/models/gemini-2.5-flash:generateContent"
+        {:keys [port stop!]} (start-server! 0 "/v1beta/models/gemini-2.5-flash:generateContent"
                                 (fn [_]
                                   (if (< (swap! hits inc) 3)
                                     {:status 503 :body "{\"error\":{\"message\":\"overloaded\"}}"}
@@ -268,7 +268,7 @@
 
 (deftest retries-are-exhausted-then-the-status-error-surfaces
   (let [hits (atom 0)
-        {:keys [port stop!]} (start-server! 18991 "/v1beta/models/m:generateContent"
+        {:keys [port stop!]} (start-server! 0 "/v1beta/models/m:generateContent"
                                 (fn [_] (swap! hits inc)
                                   {:status 500 :body "{\"error\":{\"message\":\"overloaded\"}}"}))]
     (try
@@ -284,7 +284,7 @@
 
 (deftest non-retryable-status-is-not-retried
   (let [hits (atom 0)
-        {:keys [port stop!]} (start-server! 18992 "/v1beta/models/m:generateContent"
+        {:keys [port stop!]} (start-server! 0 "/v1beta/models/m:generateContent"
                                 (fn [_] (swap! hits inc)
                                   {:status 400 :body "{\"error\":{\"message\":\"bad request\"}}"}))]
     (try
@@ -297,7 +297,7 @@
 
 (deftest max-retries-zero-disables-retrying
   (let [hits (atom 0)
-        {:keys [port stop!]} (start-server! 18993 "/v1beta/models/m:generateContent"
+        {:keys [port stop!]} (start-server! 0 "/v1beta/models/m:generateContent"
                                 (fn [_] (swap! hits inc) {:status 429 :body "{}"}))]
     (try
       (let [client (g/client {:api-key "k" :base-url (base-url port) :max-retries 0})
@@ -308,7 +308,7 @@
 
 (deftest count-tokens-retries-too
   (let [hits (atom 0)
-        {:keys [port stop!]} (start-server! 18994 "/v1beta/models/gemini-2.5-flash:countTokens"
+        {:keys [port stop!]} (start-server! 0 "/v1beta/models/gemini-2.5-flash:countTokens"
                                 (fn [_]
                                   (if (< (swap! hits inc) 2)
                                     {:status 429 :body "{}"}
@@ -321,7 +321,7 @@
       (finally (stop!)))))
 
 (deftest connection-errors-are-retried-then-typed
-  (let [client (g/client {:api-key "k" :base-url "http://127.0.0.1:18999" :max-retries 1})]
+  (let [client (g/client {:api-key "k" :base-url (str "http://127.0.0.1:" (closed-port)) :max-retries 1})]
     (binding [g/*sleep-fn* (fn [_] nil)]
       (let [e (try (g/generate-content client "m" {"contents" []}) nil (catch Exception e e))]
         (is (some? e))
@@ -335,7 +335,7 @@
 
 (deftest example-a-basic-chat-runs-against-mock-server
   (let [captured (atom nil)
-        {:keys [port stop!]} (start-server! 18995 "/v1beta/models/gemini-2.5-flash:generateContent"
+        {:keys [port stop!]} (start-server! 0 "/v1beta/models/gemini-2.5-flash:generateContent"
                                 (fn [req] (reset! captured req) {:status 200 :body (canned-response)}))]
     (try
       (let [client (g/client {:api-key "test-key" :base-url (base-url port)})]
@@ -347,7 +347,7 @@
 
 (deftest example-b-count-tokens-runs-against-mock-server
   (let [captured (atom nil)
-        {:keys [port stop!]} (start-server! 18996 "/v1beta/models/gemini-2.5-flash:countTokens"
+        {:keys [port stop!]} (start-server! 0 "/v1beta/models/gemini-2.5-flash:countTokens"
                                 (fn [req] (reset! captured req) {:status 200 :body "{\"totalTokens\":6}"}))]
     (try
       (let [client (g/client {:api-key "test-key" :base-url (base-url port)})]
@@ -357,7 +357,7 @@
 
 (deftest example-c-custom-gateway-runs-against-mock-server
   (let [captured (atom nil)
-        {:keys [port stop!]} (start-server! 18997 "/v1beta/models/gemini-2.5-flash:generateContent"
+        {:keys [port stop!]} (start-server! 0 "/v1beta/models/gemini-2.5-flash:generateContent"
                                 (fn [req] (reset! captured req)
                                   {:status 200
                                    :body "{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"{}\"}]}}]}"}))]

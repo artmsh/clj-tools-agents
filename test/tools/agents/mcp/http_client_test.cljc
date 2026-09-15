@@ -13,9 +13,6 @@
             [tools.agents.mcp.server :as server]
             [tools.agents.test-support :refer [start-server! start-abort-server! start-stall-server! recording-codec throwing-codec]]))
 
-(defn- free-port []
-  (with-open [s (java.net.ServerSocket. 0)] (.getLocalPort s)))
-
 (defn- url [port] (str "http://127.0.0.1:" port "/mcp"))
 
 (def ^:private sse-headers {"content-type" "text/event-stream"})

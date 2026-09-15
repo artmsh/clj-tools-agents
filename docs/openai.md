@@ -762,32 +762,28 @@ The mock server is `tools.agents.test-support/start-server!`, shared by the prov
 also serve byte[] and streaming (chunked) response bodies. Babashka uses `org.httpkit.server`
 (`com.sun.net.httpserver.HttpServer` is not resolvable under bb's native
 image). JVM Clojure uses `com.sun.net.httpserver.HttpServer` (built into the
-JDK, zero deps). Mock
-ports are `18950`–`18964`, chosen not to collide with
-tools.agents.anthropic's `18930`–`18946`, `18965`–`18971` for the retry
-tests, `19391` for the Azure v1 example, and `19400`–`19405` for the
-`request!` transport tests (GET + `:query` + extra headers, `:as :bytes` /
-`:string`, empty 2xx body, multipart, streaming rejection, static-key 401 not
-retried), `19350`–`19354` for `:credential-source` (401
-invalidate-and-retry, token per attempt), OS-assigned ports for callable
-`:api-key` (per-attempt calls, 401, bad return, streaming open) and for
-`tools.agents.openai.credentials` (exchange shape, refresh buffer,
-single-flight, 401 re-exchange, typed non-leaking failures, providers,
-agents, responses/chat/agents streaming opens), `19280`–`19285` for the
+JDK, zero deps). Every mock server binds port `0` and the tests read the
+OS-assigned port back, so concurrent runs cannot collide. Beyond the
+Responses/Chat tests above, the mock covers the retry tests, the Azure v1
+example, the `request!` transport tests (GET + `:query` + extra headers,
+`:as :bytes` / `:string`, empty 2xx body, multipart, streaming rejection,
+static-key 401 not retried), `:credential-source` (401 invalidate-and-retry,
+token per attempt), callable `:api-key` (per-attempt calls, 401, bad return,
+streaming open), `tools.agents.openai.credentials` (exchange shape, refresh
+buffer, single-flight, 401 re-exchange, typed non-leaking failures, providers,
+agents, responses/chat/agents streaming opens), the
 `tools.agents.openai.files` tests (multipart wire format, File streamed from
 disk, list query, retrieve/delete, 404 typing, binary content round-trip,
-wait-for-processing), and `19300`–`19303` for the
-`tools.agents.openai.images` tests (generate JSON body, edit/variation multipart
-wire format, 4xx typing), and `19320`–`19325` for the
+wait-for-processing), the `tools.agents.openai.images` tests (generate JSON
+body, edit/variation multipart wire format, 4xx typing), the
 `tools.agents.openai.batches` tests (create body, retrieve/cancel, 404
 typing, list paging, results shuffled and matched by `custom_id`, error file,
-malformed and duplicate lines), and `19340`–`19344` for the
-`tools.agents.openai.fine-tuning` tests (method/path/query/body of every
-endpoint, checkpoint colons in paths, admin key as `:api-key`, 404 typing,
-events paging). Port `18999` is additionally used by the three tests that deliberately
-start *no* server (missing credentials and the two connection-failure tests,
-which actually dial it and so assume nothing else on the host has `18999`
-bound).
+malformed and duplicate lines), and the `tools.agents.openai.fine-tuning`
+tests (method/path/query/body of every endpoint, checkpoint colons in paths,
+admin key as `:api-key`, 404 typing, events paging). The tests that
+deliberately start *no* server (missing credentials and the connection-failure
+tests, which actually dial) use `tools.agents.test-support/closed-port`: a
+port bound to `0`, read, and closed.
 
 A few client-construction tests read the real environment (they assert the
 defaults that apply when `OPENAI_API_KEY` / `OPENAI_ORG_ID` /

@@ -1,8 +1,6 @@
 (ns tools.agents.stream-test
   "tools.agents.stream/open-event-stream end to end against the shared mock
-   servers, identical on both runtimes.
-
-   Port range 19140-19159 — next to tools.agents.http-test (19100-19139)."
+   servers, identical on both runtimes."
   (:require [clojure.test :refer [deftest is testing]]
             [tools.agents.json :as json]
             [tools.agents.stream :as stream]
@@ -29,7 +27,7 @@
   (let [seen-first (promise)
         server-saw (promise)
         {:keys [port stop!]}
-        (start-server! 19140 "/s"
+        (start-server! 0 "/s"
           (fn [_] {:status 200 :headers sse-headers
                    :body (fn [send!]
                            (send! "event: a\ndata: 1\nid: x\n\n")
@@ -54,7 +52,7 @@
 (deftest early-termination-closes-the-connection
   (let [gone (promise)
         {:keys [port stop!]}
-        (start-server! 19141 "/s"
+        (start-server! 0 "/s"
           (fn [_] {:status 200 :headers sse-headers
                    :body (fn [send!]
                            (send! "data: 1\n\ndata: 2\n\n")
@@ -69,7 +67,7 @@
 (deftest exception-in-reducer-closes-the-connection
   (let [gone (promise)
         {:keys [port stop!]}
-        (start-server! 19142 "/s"
+        (start-server! 0 "/s"
           (fn [_] {:status 200 :headers sse-headers
                    :body (fn [send!]
                            (send! "data: boom\n\n")
@@ -87,7 +85,7 @@
   (let [gone      (promise)
         closed    (promise)
         {:keys [port stop!]}
-        (start-server! 19143 "/s"
+        (start-server! 0 "/s"
           (fn [_] {:status 200 :headers sse-headers
                    :body (fn [send!]
                            (send! "data: 1\n\n")
@@ -112,7 +110,7 @@
 
 (deftest a-stream-is-single-use
   (let [{:keys [port stop!]}
-        (start-server! 19144 "/s"
+        (start-server! 0 "/s"
           (fn [_] {:status 200 :headers sse-headers :body (fn [send!] (send! "data: 1\n\n"))}))]
     (try
       (let [s (open port "/s")]
@@ -136,7 +134,7 @@
 (deftest non-2xx-reads-the-body-as-a-string-before-any-stream
   (let [hits (atom 0)
         {:keys [port stop!]}
-        (start-server! 19145 "/s"
+        (start-server! 0 "/s"
           (fn [_] (swap! hits inc)
             {:status 429 :headers {"retry-after" "7" "content-type" "application/json"}
              :body "{\"error\":{\"message\":\"slow down\"}}"}))]
@@ -162,7 +160,7 @@
 (deftest open!-retries-before-the-first-byte-only
   (let [hits (atom 0)
         {:keys [port stop!]}
-        (start-server! 19146 "/s"
+        (start-server! 0 "/s"
           (fn [_]
             (if (= 1 (swap! hits inc))
               {:status 503 :body "overloaded"}
@@ -195,7 +193,7 @@
 
 (deftest decode-and-done?
   (let [{:keys [port stop!]}
-        (start-server! 19147 "/s"
+        (start-server! 0 "/s"
           (fn [_] {:status 200 :headers sse-headers
                    :body (fn [send!]
                            (send! "data: {\"n\":1}\n\n")
@@ -224,7 +222,7 @@
 
 (deftest eof-without-a-terminal-event-is-reported-not-thrown
   (let [{:keys [port stop!]}
-        (start-server! 19148 "/s"
+        (start-server! 0 "/s"
           (fn [_] {:status 200 :headers sse-headers
                    :body (fn [send!] (send! "data: 1\n\ndata: incomplete"))}))]
     (try
@@ -235,7 +233,7 @@
 
 (deftest mid-stream-disconnect-throws-from-reduce
   (let [{:keys [port stop!]}
-        (start-abort-server! 19149 {:headers sse-headers
+        (start-abort-server! 0 {:headers sse-headers
                                     :chunks  ["data: 1\n\n" "data: 2\n\n"]
                                     :delay-ms 50})]
     (try

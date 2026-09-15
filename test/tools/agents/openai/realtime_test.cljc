@@ -11,7 +11,7 @@
 
 (deftest client-secrets-create-posts-json-passthrough
   (let [captured (atom nil)
-        {:keys [port stop!]} (start-server! 19270 "/v1/realtime/client_secrets"
+        {:keys [port stop!]} (start-server! 0 "/v1/realtime/client_secrets"
                                 (fn [req]
                                   (reset! captured req)
                                   {:status 200
@@ -35,7 +35,7 @@
       (finally (stop!)))))
 
 (deftest client-secrets-create-typed-http-error
-  (let [{:keys [port stop!]} (start-server! 19271 "/v1/realtime/client_secrets"
+  (let [{:keys [port stop!]} (start-server! 0 "/v1/realtime/client_secrets"
                                 (fn [_] {:status 401 :body "{\"error\":{\"message\":\"bad key\"}}"}))]
     (try
       (let [client (oai/client {:api-key "k" :base-url (base-url port) :max-retries 0})

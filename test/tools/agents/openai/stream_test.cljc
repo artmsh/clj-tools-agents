@@ -11,11 +11,7 @@
             [tools.agents.openai :as oai]
             [tools.agents.sse :as sse]
             [tools.agents.stream :as stream]
-            [tools.agents.test-support :refer [start-server! start-abort-server! start-stall-server! sse-chunks rotating-token-cache]]))
-
-(defn- free-port []
-  (with-open [ss (java.net.ServerSocket. 0 50 (java.net.InetAddress/getByName "127.0.0.1"))]
-    (.getLocalPort ss)))
+            [tools.agents.test-support :refer [closed-port start-server! start-abort-server! start-stall-server! sse-chunks rotating-token-cache]]))
 
 (defn- base-url [port] (str "http://127.0.0.1:" port "/v1"))
 
@@ -227,7 +223,7 @@
             (is (= 2 (:retries-taken (ex-data e))))
             (is (= 3 @hits)))))))
   (testing "connection refused: retried, then typed"
-    (let [client (oai/client {:api-key "k" :base-url (base-url (free-port)) :max-retries 1})
+    (let [client (oai/client {:api-key "k" :base-url (base-url (closed-port)) :max-retries 1})
           e      (thrown #(oai/responses-stream client {"model" "m"}))]
       (is (= :tools.agents.openai/api-connection-error (:type (ex-data e))))
       (is (= 1 (:retries-taken (ex-data e)))))))

@@ -1,7 +1,7 @@
 (ns tools.agents.openai.fine-tuning-test
   "tools.agents.openai.fine-tuning: id validation plus mock-server round trips
    for every endpoint (shared tools.agents.test-support server; base-url
-   carries /v1). Ports 19340-19349."
+   carries /v1)."
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.string :as str]
             [tools.agents.openai :as oai]
@@ -57,14 +57,14 @@
 ;; Mock server
 ;; ---------------------------------------------------------------------------
 
-(defn- recording-server [port handler]
+(defn- recording-server [handler]
   (let [captured (atom [])
-        srv      (start-server! port "/v1/fine_tuning"
+        srv      (start-server! 0 "/v1/fine_tuning"
                    (fn [req] (swap! captured conj req) (handler req)))]
     (assoc srv :captured captured)))
 
 (deftest every-endpoint-method-path-query-body
-  (let [{:keys [port stop! captured]} (recording-server 19340 (fn [_] {:status 200 :body job-json}))]
+  (let [{:keys [port stop! captured]} (recording-server (fn [_] {:status 200 :body job-json}))]
     (try
       (let [c      (client port)
             create {"model" "gpt-4o-mini-2024-07-18" "training_file" "file-train" "validation_file" "file-val"
@@ -105,7 +105,7 @@
       (finally (stop!)))))
 
 (deftest checkpoint-ids-keep-colons-and-encode-unsafe-chars
-  (let [{:keys [port stop! captured]} (recording-server 19341 (fn [_] {:status 200 :body "{}"}))]
+  (let [{:keys [port stop! captured]} (recording-server (fn [_] {:status 200 :body "{}"}))]
     (try
       (let [c (client port)]
         (ft/checkpoints-permissions-list c checkpoint)
@@ -118,7 +118,7 @@
       (finally (stop!)))))
 
 (deftest admin-key-is-passed-as-api-key
-  (let [{:keys [port stop! captured]} (recording-server 19342
+  (let [{:keys [port stop! captured]} (recording-server
                                         (fn [req]
                                           (if (= "Bearer sk-admin" (get-in req [:headers "authorization"]))
                                             {:status 200 :body "{\"id\":\"cp_1\",\"object\":\"checkpoint.permission\",\"deleted\":true}"}
@@ -133,7 +133,7 @@
       (finally (stop!)))))
 
 (deftest jobs-404-typing
-  (let [{:keys [port stop!]} (recording-server 19343
+  (let [{:keys [port stop!]} (recording-server
                                (fn [_] {:status 404 :body "{\"error\":{\"message\":\"Could not find fine-tune job: ftjob-x\"}}"}))]
     (try
       (let [c (client port)]
@@ -153,7 +153,7 @@
 (deftest jobs-list-events-cursor-paging
   (let [pages {nil        "{\"object\":\"list\",\"data\":[{\"id\":\"ev3\"},{\"id\":\"ev2\"}],\"has_more\":true}"
                "ev2"      "{\"object\":\"list\",\"data\":[{\"id\":\"ev1\"}],\"has_more\":false}"}
-        {:keys [port stop! captured]} (recording-server 19344
+        {:keys [port stop! captured]} (recording-server
                                         (fn [req]
                                           (let [after (some #(second (re-find #"^after=(.*)$" %)) (query-set (:query req)))]
                                             {:status 200 :body (get pages after)})))]

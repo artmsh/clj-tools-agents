@@ -1,7 +1,6 @@
 (ns tools.agents.openai.files-test
   "tools.agents.openai.files: pure part building plus mock-server round trips
-   (shared tools.agents.test-support server; base-url carries /v1). Ports
-   19280-19289."
+   (shared tools.agents.test-support server; base-url carries /v1)."
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.string :as str]
             [tools.agents.http :as http]
@@ -107,7 +106,7 @@
 
 (deftest files-create-multipart-wire-format
   (let [captured (atom nil)
-        {:keys [port stop!]} (start-server! 19280 "/v1/files"
+        {:keys [port stop!]} (start-server! 0 "/v1/files"
                                 (fn [req] (reset! captured req) {:status 200 :body file-object}))]
     (try
       (let [resp (files/files-create (client port)
@@ -142,7 +141,7 @@
   (let [captured (atom nil)
         tmp      (java.io.File/createTempFile "tools-agents-files" ".bin")
         payload  (all-bytes)
-        {:keys [port stop!]} (start-server! 19281 "/v1/files"
+        {:keys [port stop!]} (start-server! 0 "/v1/files"
                                 (fn [req] (reset! captured req) {:status 200 :body file-object}))]
     (try
       (with-open [os (java.io.FileOutputStream. tmp)] (.write os payload))
@@ -161,7 +160,7 @@
 
 (deftest files-list-query-params
   (let [captured (atom [])
-        {:keys [port stop!]} (start-server! 19282 "/v1/files"
+        {:keys [port stop!]} (start-server! 0 "/v1/files"
                                 (fn [req] (swap! captured conj req)
                                   {:status 200
                                    :body "{\"object\":\"list\",\"data\":[],\"first_id\":null,\"last_id\":null,\"has_more\":false}"}))]
@@ -179,7 +178,7 @@
 
 (deftest files-retrieve-delete-and-404-typing
   (let [captured (atom [])
-        {:keys [port stop!]} (start-server! 19283 "/v1/files"
+        {:keys [port stop!]} (start-server! 0 "/v1/files"
                                 (fn [req]
                                   (swap! captured conj req)
                                   (cond
@@ -216,7 +215,7 @@
 (deftest files-content-binary-round-trip
   (let [captured (atom nil)
         payload  (all-bytes)
-        {:keys [port stop!]} (start-server! 19284 "/v1/files"
+        {:keys [port stop!]} (start-server! 0 "/v1/files"
                                 (fn [req] (reset! captured req)
                                   {:status 200 :headers {"content-type" "application/octet-stream"} :body payload}))]
     (try
@@ -231,7 +230,7 @@
 (deftest files-wait-for-processing-polls-until-terminal
   (let [statuses (atom ["uploaded" "uploaded" "processed"])
         hits     (atom 0)
-        {:keys [port stop!]} (start-server! 19285 "/v1/files"
+        {:keys [port stop!]} (start-server! 0 "/v1/files"
                                 (fn [_]
                                   (let [s (nth @statuses (min @hits (dec (count @statuses))))]
                                     (swap! hits inc)

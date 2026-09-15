@@ -10,11 +10,7 @@
             [tools.agents.gemini :as g]
             [tools.agents.sse :as sse]
             [tools.agents.stream :as stream]
-            [tools.agents.test-support :refer [start-server! start-abort-server! start-stall-server! rotating-token-cache]]))
-
-(defn- free-port []
-  (with-open [ss (java.net.ServerSocket. 0 50 (java.net.InetAddress/getByName "127.0.0.1"))]
-    (.getLocalPort ss)))
+            [tools.agents.test-support :refer [closed-port start-server! start-abort-server! start-stall-server! rotating-token-cache]]))
 
 (defn- base-url [port] (str "http://127.0.0.1:" port))
 
@@ -162,7 +158,7 @@
               (is (= 3 @hits))))))))
   (testing "connection refused: retried, then typed"
     (let [slept (atom 0)
-          client (g/client {:api-key "k" :base-url (base-url (free-port)) :max-retries 1})]
+          client (g/client {:api-key "k" :base-url (base-url (closed-port)) :max-retries 1})]
       (binding [g/*sleep-fn* (fn [_] (swap! slept inc))]
         (let [e (try (g/generate-content-stream client "m" {}) nil (catch Exception e e))]
           (is (= :tools.agents.gemini/api-connection-error (:type (ex-data e))))

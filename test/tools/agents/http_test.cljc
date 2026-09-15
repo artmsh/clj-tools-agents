@@ -1,10 +1,6 @@
 (ns tools.agents.http-test
   "tools.agents.http: pure encoders plus request! against the shared mock
-   server, identical on both runtimes.
-
-   Port range 19100-19139 — clear of the provider suites' ranges
-   (anthropic 18930-18975, openai 18950-18971, gemini 18980-18997,
-   openai.agents 19000-19079)."
+   server, identical on both runtimes."
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.string :as str]
             [tools.agents.http :as http]
@@ -104,7 +100,7 @@
 
 (deftest request-sends-every-method-with-body-query-and-headers
   (let [seen (atom [])
-        {:keys [port stop!]} (start-server! 19100 "/echo"
+        {:keys [port stop!]} (start-server! 0 "/echo"
                                (fn [req] (swap! seen conj req) {:status 200 :body (:method req)}))]
     (try
       (doseq [m [:get :post :put :patch :delete]]
@@ -123,7 +119,7 @@
 
 (deftest request-query-appends-to-an-existing-query-string
   (let [seen (atom nil)
-        {:keys [port stop!]} (start-server! 19101 "/q"
+        {:keys [port stop!]} (start-server! 0 "/q"
                                (fn [req] (reset! seen req) {:status 200 :body ""}))]
     (try
       (http/request! {:method :get :url (url port "/q?a=1") :query {"b" ["x"]}})
@@ -132,7 +128,7 @@
       (finally (stop!)))))
 
 (deftest response-headers-are-lower-cased-and-repeats-are-vectors
-  (let [{:keys [port stop!]} (start-server! 19102 "/h"
+  (let [{:keys [port stop!]} (start-server! 0 "/h"
                                (fn [_] {:status 429 :headers {"Retry-After" "30" "X-Dup" ["30" "60"]} :body "no"}))]
     (try
       (let [resp (http/request! {:method :post :url (url port "/h") :body "{}"})]
@@ -145,7 +141,7 @@
 
 (deftest bytes-round-trip-untouched
   (let [seen (atom nil)
-        {:keys [port stop!]} (start-server! 19103 "/bin"
+        {:keys [port stop!]} (start-server! 0 "/bin"
                                (fn [req] (reset! seen req) {:status 200 :body (all-bytes)}))]
     (try
       (let [resp (http/request! {:method :post :url (url port "/bin") :body (all-bytes) :as :bytes})]
@@ -163,7 +159,7 @@
                {:name "image[]" :content "one"}
                {:name "image[]" :content "two"}
                {:name "file" :content f :filename "données.bin"}]
-        {:keys [port stop!]} (start-server! 19104 "/upload"
+        {:keys [port stop!]} (start-server! 0 "/upload"
                                (fn [req] (reset! seen req) {:status 200 :body "ok"}))]
     (try
       (binding [http/*boundary-fn* (constantly "fixed-boundary")]
@@ -184,7 +180,7 @@
 
 (deftest stream-delivers-chunks-before-the-response-ends
   (let [release (promise)
-        {:keys [port stop!]} (start-server! 19105 "/sse"
+        {:keys [port stop!]} (start-server! 0 "/sse"
                                (fn [_] {:status 200 :headers {"content-type" "text/event-stream"}
                                         :body (fn [send!]
                                                 (send! "data: 1\n\n")
@@ -206,7 +202,7 @@
       (finally (deliver release true) (stop!)))))
 
 (deftest timeout-ms-throws-http-timeout-exception
-  (let [{:keys [port stop!]} (start-server! 19106 "/slow"
+  (let [{:keys [port stop!]} (start-server! 0 "/slow"
                                (fn [_] (Thread/sleep 1500) {:status 200 :body "late"}))]
     (try
       (let [e (try (http/request! {:method :get :url (url port "/slow") :timeout-ms 200}) nil
@@ -298,7 +294,7 @@
     (is (nil? (ex-data e)))))
 
 (deftest explicit-client-is-used
-  (let [{:keys [port stop!]} (start-server! 19107 "/c" (fn [_] {:status 200 :body "ok"}))]
+  (let [{:keys [port stop!]} (start-server! 0 "/c" (fn [_] {:status 200 :body "ok"}))]
     (try
       (is (= "ok" (:body (http/request! {:method :get :url (url port "/c")
                                          :client (http/client {:connect-timeout-ms 1000})}))))
