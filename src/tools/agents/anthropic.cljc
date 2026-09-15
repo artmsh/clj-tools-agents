@@ -28,7 +28,8 @@
   (:require [clojure.string :as str]
             [tools.agents.http :as http]
             [tools.agents.json :as json]
-            [tools.agents.token :as token]))
+            [tools.agents.token :as token]
+            [tools.agents.anthropic.credentials :as credentials]))
 
 (def default-base-url "https://api.anthropic.com")
 (def ^:private anthropic-version "2023-06-01")
@@ -124,31 +125,69 @@
                          {:type :tools.agents.anthropic.error/missing-credentials}))))))
 
 (defn- resolve-client-credentials
-  "The full credential chain `client` uses: an explicit :credential-source,
-   else `resolve-credentials` (explicit :api-key > :auth-token >
-   ANTHROPIC_API_KEY > ANTHROPIC_AUTH_TOKEN > throw). Returns
-   {:credential-source src}, {:api-key s} or {:auth-token s}. Refreshable
-   sources from #35 (workload identity) and #38 (profiles) plug in here as
-   further steps returning {:credential-source <TokenSource>}."
-  [opts getenv-fn]
-  (if (contains? opts :credential-source)
-    (let [src (:credential-source opts)]
-      (when-not (token/token-source? src)
-        (throw (ex-info (str "tools.agents.anthropic/client: :credential-source must satisfy "
-                             "tools.agents.token/TokenSource, got: " (type src))
-                        {:type :tools.agents.anthropic.error/invalid-credentials})))
-      (when (or (some? (:api-key opts)) (some? (:auth-token opts)))
-        (throw (ex-info (str "tools.agents.anthropic/client: pass only one of :api-key, :auth-token "
-                             "or :credential-source")
-                        {:type :tools.agents.anthropic.error/invalid-credentials})))
-      {:credential-source src})
-    (resolve-credentials opts getenv-fn)))
+  "The full credential chain `client` uses, first match wins
+   (anthropic-sdk-python v1.5.0 _client.py:186-208, lib/credentials/_chain.py:76-155):
+
+     1. explicit :credential-source, else explicit :api-key > :auth-token
+     2. ANTHROPIC_API_KEY > ANTHROPIC_AUTH_TOKEN
+     3. explicit profile (ANTHROPIC_PROFILE / ANTHROPIC_CONFIG_DIR /
+        active_config pointer): NOT IMPLEMENTED, #36 hook below
+     4. workload identity federation env vars
+        (tools.agents.anthropic.credentials/workload-identity-from-env)
+     5. fallback on-disk profile: NOT IMPLEMENTED, #36 hook below
+     then `resolve-credentials` throws missing-credentials.
+
+   Steps 1-2 are exactly `resolve-credentials`, unchanged. Returns
+   {:credential-source src}, {:api-key s} or {:auth-token s}. base-url is
+   the client's resolved base URL: a token exchange must hit the same
+   deployment as the API calls (_chain.py:72). http-fn performs the
+   exchange (tools.agents.http/request! in production)."
+  ([opts getenv-fn]
+   (resolve-client-credentials opts getenv-fn default-base-url http/request!))
+  ([opts getenv-fn base-url http-fn]
+   (cond
+     (contains? opts :credential-source)
+     (let [src (:credential-source opts)]
+       (when-not (token/token-source? src)
+         (throw (ex-info (str "tools.agents.anthropic/client: :credential-source must satisfy "
+                              "tools.agents.token/TokenSource, got: " (type src))
+                         {:type :tools.agents.anthropic.error/invalid-credentials})))
+       (when (or (some? (:api-key opts)) (some? (:auth-token opts)))
+         (throw (ex-info (str "tools.agents.anthropic/client: pass only one of :api-key, :auth-token "
+                              "or :credential-source")
+                         {:type :tools.agents.anthropic.error/invalid-credentials})))
+       {:credential-source src})
+
+     ;; Steps 1-2: explicit args, then ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN.
+     (or (:api-key opts) (:auth-token opts)
+         (seq (getenv-fn "ANTHROPIC_API_KEY")) (seq (getenv-fn "ANTHROPIC_AUTH_TOKEN")))
+     (resolve-credentials opts getenv-fn)
+
+     :else
+     (or
+      ;; Step 3 hook (#36): explicit profile selection. Errors must
+      ;; propagate (_chain.py:116-129).
+
+      ;; Step 4: WIF env vars. Sits above the fallback profile so a leftover
+      ;; default profile never beats WIF (_chain.py:131-136).
+      (when-let [src (credentials/workload-identity-from-env
+                      {:getenv getenv-fn :base-url base-url :http-fn http-fn})]
+        {:credential-source src})
+
+      ;; Step 5 hook (#36): fallback active profile from disk. Errors are
+      ;; swallowed and the chain falls through (_chain.py:138-153).
+
+      (resolve-credentials opts getenv-fn)))))
 
 (defn client
   "Build an AnthropicClient record — the 'client object' analogue of Python's
    Anthropic(...) constructor. Resolves credentials eagerly (fails fast with
    a catchable ex-info BEFORE any network request, matching the original
    builtin's contract) unless :api-key/:auth-token/env vars are present.
+   Chain: :credential-source | :api-key | :auth-token > ANTHROPIC_API_KEY >
+   ANTHROPIC_AUTH_TOKEN > workload identity federation env vars (a
+   refreshable source, see tools.agents.anthropic.credentials) > throw.
+   See resolve-client-credentials.
 
    opts:
      :api-key      explicit API key -> sent as `x-api-key`
@@ -188,14 +227,15 @@
                    See messages-create's retry note."
   ([] (client {}))
   ([opts]
-   (let [creds       (resolve-client-credentials opts getenv)
+   (let [base-url    (or (:base-url opts) (getenv "ANTHROPIC_BASE_URL") default-base-url)
+         creds       (resolve-client-credentials opts getenv base-url http/request!)
          max-retries (or (:max-retries opts) default-max-retries)]
      (when-not (and (integer? max-retries) (>= max-retries 0))
        (throw (ex-info (str "tools.agents.anthropic/client: :max-retries must be a non-negative "
                              "integer, got: " (pr-str max-retries))
                         {:type :tools.agents.anthropic.error/invalid-max-retries})))
      (map->AnthropicClient
-      (cond-> (merge {:base-url (or (:base-url opts) (getenv "ANTHROPIC_BASE_URL") default-base-url)
+      (cond-> (merge {:base-url base-url
                       :max-retries max-retries}
                      creds)
         (seq (:betas opts)) (assoc :betas (vec (:betas opts))))))))
