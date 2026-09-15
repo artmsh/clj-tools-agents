@@ -6,6 +6,15 @@
                             build-with-claude/streaming
      openai-chat-text       chunk JSON from the chat completions
                             streaming-events Example, framed as `data:` + [DONE]
+     openai-chat-tool-calls-usage
+                            docs-derived: chunks assembled from the chat
+                            completions streaming-events chunk schema
+                            (delta.tool_calls[{index,id,type,function}],
+                            finish_reason, obfuscation) and its
+                            stream_options.include_usage note (last chunk:
+                            empty choices + usage), framed with [DONE]; two
+                            tool calls interleaved by index; also reduced
+                            by openai.stream-test's accumulator
      openai-responses-text  per-event Example JSON (response.created,
                             output_text.delta), trimmed; completed/done events
                             assembled from the same schema
@@ -240,6 +249,13 @@
     (is (every? #(= "message" (:event %)) evs) "chat chunks carry no event names")
     (is (every? #(str/includes? (:data %) "chat.completion.chunk") (butlast evs)))
     (is (= "[DONE]" (:data (last evs))) "[DONE] is plain data at the parser level")))
+
+(deftest openai-chat-tool-calls-usage-fixture
+  (let [evs (check-fixture-framings (fixture "openai-chat-tool-calls-usage"))]
+    (is (= 8 (count evs)))
+    (is (every? #(= "message" (:event %)) evs))
+    (is (str/includes? (:data (nth evs 6)) "\"choices\":[],\"usage\":{"))
+    (is (= "[DONE]" (:data (last evs))))))
 
 (deftest gemini-fixture
   (let [evs (check-fixture-framings (fixture "gemini-text"))]

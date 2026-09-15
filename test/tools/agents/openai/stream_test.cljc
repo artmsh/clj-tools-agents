@@ -1,5 +1,5 @@
 (ns tools.agents.openai.stream-test
-  "responses-stream end to end against the shared streaming mock servers
+  "responses-stream and chat-completions-stream end to end against the shared streaming mock servers
    (tools.agents.test-support), identical on both runtimes.
 
    Ports are taken from the OS (bind 0, read, release) rather than a fixed
@@ -313,3 +313,195 @@
             (is (true? (deref gone 5000 :timeout)))
             (is (nil? (oai/accumulate-response-stream s)) "a reduce after close! returns init")
             (is (= :cancelled (stream/outcome s)))))))))
+
+;; ---------------------------------------------------------------------------
+;; Chat Completions
+;; ---------------------------------------------------------------------------
+
+(def ^:private c-route "/v1/chat/completions")
+
+(defn- c-chunk [choices & {:as extra}]
+  (merge {"id" "chatcmpl-1" "object" "chat.completion.chunk" "created" 1 "model" "gpt-6-astra"
+          "system_fingerprint" "fp_1" "choices" choices}
+         extra))
+
+(defn- c-delta [delta & {:as extra}]
+  (merge {"index" 0 "delta" delta "logprobs" nil "finish_reason" nil} extra))
+
+(defn- send-chunks! [send! chunks & {:keys [done?] :or {done? true}}]
+  (doseq [c chunks] (send! (sse (ev-json c))))
+  (when done? (send! "data: [DONE]\n\n")))
+
+(def ^:private hello-chunks
+  [(c-chunk [(c-delta {"role" "assistant" "content" ""})])
+   (c-chunk [(c-delta {"content" "Hello"})])
+   (c-chunk [(c-delta {} "finish_reason" "stop")])])
+
+(deftest chat-request-line-headers-body-and-done
+  (let [captured (atom nil)]
+    (with-server c-route
+      (fn [req] (reset! captured req)
+        {:status 200 :headers sse-headers :body (fn [send!] (send-chunks! send! hello-chunks))})
+      (fn [client]
+        (let [s   (oai/chat-completions-stream client {"model" "gpt-6-astra"
+                                                       "messages" [{"role" "user" "content" "hi"}]
+                                                       "stream_options" {"include_usage" true}})
+              evs (into [] s)]
+          (is (= hello-chunks evs) "[DONE] is not emitted")
+          (is (= :done (stream/outcome s))))
+        (let [req @captured]
+          (is (= "POST" (:method req)))
+          (is (= "/v1/chat/completions" (:path req)))
+          (is (= "Bearer test-key" (get (:headers req) "authorization")))
+          (is (= {"model" "gpt-6-astra" "messages" [{"role" "user" "content" "hi"}]
+                  "stream_options" {"include_usage" true} "stream" true}
+                 (oai/read-json (:body req)))))))))
+
+(deftest chat-incremental-accumulation-and-completion-text
+  (let [release (promise)]
+    (with-server c-route
+      (fn [_] {:status 200 :headers sse-headers
+               :body (fn [send!]
+                       (send-chunks! send! [(c-chunk [(c-delta {"role" "assistant" "content" "Once "})])] :done? false)
+                       (deref release 5000 nil)
+                       (send-chunks! send! [(c-chunk [(c-delta {"content" "upon a time"} "finish_reason" "stop")])]))})
+      (fn [client]
+        (let [s      (oai/chat-completions-stream client {"model" "m" "messages" []})
+              deltas (atom [])
+              r      (oai/accumulate-chat-completion-stream
+                      (reify clojure.lang.IReduceInit
+                        (reduce [_ f init]
+                          (reduce (fn [acc c]
+                                    (swap! deltas conj (get-in c ["choices" 0 "delta" "content"]))
+                                    (deliver release true)
+                                    (f acc c))
+                                  init s))))]
+          (is (= ["Once " "upon a time"] @deltas))
+          (is (= "Once upon a time" (oai/completion-text r)))
+          (is (= "chat.completion" (get r "object")))
+          (is (false? (oai/stream-complete? r)) "a wrapped stream carries no [DONE] signal")
+          (is (= :done (stream/outcome s))))))))
+
+(deftest chat-tool-calls-usage-fixture-served-over-http
+  (with-server c-route
+    (fn [_] {:status 200 :headers sse-headers
+             :body (fn [send!] (send! (fixture "openai-chat-tool-calls-usage")))})
+    (fn [client]
+      (let [s (oai/chat-completions-stream client {"model" "m" "messages" []
+                                                   "stream_options" {"include_usage" true}})
+            r (oai/accumulate-chat-completion-stream s)]
+        (is (= :done (stream/outcome s)))
+        (is (oai/stream-complete? r))
+        (is (= {"id" "chatcmpl-456" "object" "chat.completion" "created" 1694268190 "model" "gpt-6-astra"
+                "system_fingerprint" "fp_44709d6fcb"
+                "usage" {"prompt_tokens" 82 "completion_tokens" 37 "total_tokens" 119}
+                "choices" [{"index" 0 "logprobs" nil "finish_reason" "tool_calls"
+                            "message" {"role" "assistant" "content" nil "refusal" nil
+                                       "tool_calls" [{"index" 0 "id" "call_kyiv" "type" "function"
+                                                      "function" {"name" "get_weather" "arguments" "{\"city\":\"Kyiv\"}"}}
+                                                     {"index" 1 "id" "call_oslo" "type" "function"
+                                                      "function" {"name" "get_weather" "arguments" "{\"city\":\"Oslo\"}"}}]}}]}
+               r))
+        (is (nil? (oai/completion-text r)))))))
+
+(deftest chat-openai-chat-text-fixture-matches-completion-text
+  (with-server c-route
+    (fn [_] {:status 200 :headers sse-headers :body (fn [send!] (send! (fixture "openai-chat-text")))})
+    (fn [client]
+      (let [r (oai/accumulate-chat-completion-stream (oai/chat-completions-stream client {"model" "m"}))]
+        (is (= "Hello" (oai/completion-text r)))
+        (is (= "stop" (get-in r ["choices" 0 "finish_reason"])))
+        (is (oai/stream-complete? r))))))
+
+(deftest chat-truncated-stream-is-eof-and-not-complete
+  (with-server c-route
+    (fn [_] {:status 200 :headers sse-headers :body (fn [send!] (send-chunks! send! (pop hello-chunks) :done? false))})
+    (fn [client]
+      (let [s (oai/chat-completions-stream client {"model" "m"})
+            r (oai/accumulate-chat-completion-stream s)]
+        (is (= :eof (stream/outcome s)))
+        (is (= "Hello" (oai/completion-text r)))
+        (is (false? (oai/stream-complete? r))))))
+  (testing "finish_reason and usage without [DONE] are still not complete"
+    (with-server c-route
+      (fn [_] {:status 200 :headers sse-headers
+               :body (fn [send!] (send-chunks! send! (conj hello-chunks (c-chunk [] "usage" {"total_tokens" 3}))
+                                               :done? false))})
+      (fn [client]
+        (let [r (oai/accumulate-chat-completion-stream (oai/chat-completions-stream client {"model" "m"}))]
+          (is (= {"total_tokens" 3} (get r "usage")))
+          (is (false? (oai/stream-complete? r)))))))
+  (testing "early termination: :reduced, not complete, connection released"
+    (let [gone (promise)]
+      (with-server c-route
+        (fn [_] {:status 200 :headers sse-headers
+                 :body (fn [send!]
+                         (loop [i 0]
+                           (cond
+                             (not (send! (sse (ev-json (c-chunk [(c-delta {"content" (str "c" i)})])))))
+                             (deliver gone true)
+                             (> i 500) (deliver gone false)
+                             :else (do (Thread/sleep 10) (recur (inc i))))))})
+        (fn [client]
+          (let [s (oai/chat-completions-stream client {"model" "m"})
+                r (oai/accumulate-chat-completion-stream (eduction (take 2) s))]
+            (is (= "c0c1" (oai/completion-text r)))
+            (is (= :reduced (stream/outcome s)))
+            (is (false? (oai/stream-complete? r)))
+            (is (true? (deref gone 5000 :timeout)))))))))
+
+(deftest chat-error-chunk-mid-stream-throws-typed
+  (let [hits (atom 0)
+        err  "{\"error\":{\"message\":\"The server had an error\",\"type\":\"server_error\",\"code\":null}}"]
+    (with-server c-route
+      (fn [_] (swap! hits inc)
+        {:status 200 :headers sse-headers
+         :body (fn [send!] (send-chunks! send! [(first hello-chunks)] :done? false) (send! (sse err)))})
+      (fn [client]
+        (let [s    (oai/chat-completions-stream client {"model" "m"})
+              seen (atom 0)
+              e    (thrown #(run! (fn [_] (swap! seen inc)) s))]
+          (is (= 1 @seen))
+          (is (= :tools.agents.openai/stream-error (:type (ex-data e))))
+          (is (= err (:body (ex-data e))))
+          (is (= "server_error" (get-in (ex-data e) [:error "type"])))
+          (is (= "tools.agents.openai/chat-completions-stream: stream error: The server had an error" (ex-message e)))
+          (is (= :failed (stream/outcome s)))
+          (is (= 1 @hits)))))))
+
+(deftest chat-opening-errors-retries-and-401
+  (testing "HTTP error before the stream"
+    (with-server c-route
+      (fn [_] {:status 404 :body "{\"error\":{\"message\":\"The model `nope` does not exist\"}}"})
+      (fn [client]
+        (let [e (thrown #(oai/chat-completions-stream client {"model" "nope"}))]
+          (is (= :tools.agents.openai/not-found-error (:type (ex-data e))))
+          (is (= 404 (:status (ex-data e))))
+          (is (str/starts-with? (ex-message e) "tools.agents.openai/chat-completions-stream: HTTP 404 The model"))))))
+  (testing "a 500 is retried before the stream starts"
+    (let [hits (atom 0)]
+      (with-server c-route
+        (fn [_] (if (= 1 (swap! hits inc))
+                  {:status 500 :headers fast-retry :body "{}"}
+                  {:status 200 :headers sse-headers :body (fn [send!] (send-chunks! send! hello-chunks))}))
+        (fn [client]
+          (let [r (oai/accumulate-chat-completion-stream (oai/chat-completions-stream client {"model" "m"}))]
+            (is (= "Hello" (oai/completion-text r)))
+            (is (oai/stream-complete? r))
+            (is (= 2 @hits)))))))
+  (testing "credential-source 401: invalidate and retry the open once"
+    (let [auths (atom [])
+          {:keys [source]} (rotating-token-cache)
+          {:keys [port stop!]} (start-server! (free-port) c-route
+                                 (fn [req]
+                                   (swap! auths conj (get (:headers req) "authorization"))
+                                   (if (= 1 (count @auths))
+                                     {:status 401 :body "{\"error\":{\"message\":\"expired\"}}"}
+                                     {:status 200 :headers sse-headers
+                                      :body (fn [send!] (send-chunks! send! hello-chunks))})))]
+      (try
+        (let [client (oai/client {:credential-source source :base-url (base-url port) :max-retries 0})]
+          (is (= "Hello" (oai/completion-text (oai/accumulate-chat-completion-stream
+                                                (oai/chat-completions-stream client {"model" "m"})))))
+          (is (= ["Bearer tok-1" "Bearer tok-2"] @auths)))
+        (finally (stop!))))))
