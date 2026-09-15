@@ -367,6 +367,40 @@ error typing, the whole retry policy, `output-text`/`completion-text`
 extraction, the message-list helpers — is plain, portable `clojure.core`,
 exercised identically by both test runners.
 
+#### Streaming transport
+
+`tools.agents.stream/open-event-stream` is the provider-agnostic layer every
+streaming client function builds on. It sends one `:as :stream` request at
+call time and returns a **single-use reducible** of SSE events
+(`{:event :data :id :retry}`, parsed by the pure `tools.agents.sse`).
+
+| option | meaning |
+|---|---|
+| `:request` | the `request!` map; `:as` is forced to `:stream` |
+| `:open!` | `(fn [attempt]) -> response`: the client's own retry loop. `attempt` does one exchange and returns a 2xx response (unread `InputStream` body), or a non-2xx response whose body is already a String (read and closed), or throws the transport exception. Retries therefore only ever happen before the first byte is handed to a reducer |
+| `:on-error` | called with the final non-2xx `{:status :headers :body String}`; should throw the client's typed error (otherwise `:tools.agents.stream/http-error` is thrown) |
+| `:decode` | applied to each event's `:data` (e.g. `read-json`) |
+| `:done?` | tested on the raw event before `:decode`; the matching event (e.g. chat's `data: [DONE]`) ends the stream and is not emitted |
+| `:xform` | transducer over the decoded events |
+| `:on-read-error` | maps an `IOException` from reading the body mid-stream to the client's connection error; exceptions from the reducing fn or `:decode` propagate unwrapped |
+
+Lifecycle: the one `reduce` (or `transduce`/`into`/`run!`) closes the body
+in `finally` — on EOF, `done?`, early termination such as `(take 1)`, and
+exceptions; a second reduce throws `:tools.agents.stream/consumed`.
+`(stream/close! s)` works from any thread: it unblocks a reduce parked in a
+read, which then returns what it accumulated. On JVM the value is also
+`java.io.Closeable` (`with-open`); Babashka's `reify` allows one Java
+interface only, so `close!` is the portable call. There is no read-idle
+timeout; a watchdog calling `close!` is the way to bound a stalled stream.
+
+**Truncation is the caller's concern.** EOF without a terminal event
+reduces exactly like a complete stream, and an unterminated final event is
+dropped per WHATWG. `(stream/outcome s)` reports `:done` (`done?` matched),
+`:eof`, `:reduced`, `:cancelled` or `:failed`; a client that has no `done?`
+marker (Anthropic's `message_stop`, Responses' `response.completed`) must
+check for its terminal event itself. `(stream/response s)` gives the 2xx
+`{:status :headers}`.
+
 ### Why HTTP/1.1 is pinned
 
 `java.net.http.HttpClient` defaults to `HTTP_2`, and for a **cleartext**
