@@ -13,9 +13,10 @@
    per-attempt headers, error typing), rather than re-implementing or
    forking it. The Agents API lives
    under the SAME `https://api.openai.com/v1` root as Responses and Chat
-   Completions — distinguished only by the `/agents` path prefix and a
-   required `OpenAI-Beta: agents=v1` header this namespace adds to every
-   request — so a client built once with `tools.agents.openai/client` works
+   Completions — distinguished by a required `OpenAI-Beta: agents=v1` header
+   this namespace adds to every request, and by the `/agents` path prefix
+   (except vaults, which live at `/vaults` at the API root) — so a client
+   built once with `tools.agents.openai/client` works
    for both this namespace and its sibling. A consequence worth knowing: a
    malformed-JSON error from this namespace's own transport still surfaces as
    `:type :tools.agents.openai/json-parse-error` (not a `.agents`-suffixed
@@ -57,6 +58,9 @@
      - Files: list and download (`byte[]`) a session's published artifacts,
        delete one; list a connected environment's files (token paging) and
        copy a file into it (inline base64 or a Files API id).
+     - Vaults and their MCP credentials: vault create, retrieve, list,
+       delete; credential create, retrieve, rotate (update), list, delete.
+       Secrets are write-only and never logged.
      - Self-hosted sandboxes: `sessions-create` passes `environment.type`
        \"self_hosted\" straight through like any other field, and
        `self-hosted-executor-command` turns a created session into the
@@ -874,6 +878,153 @@
   (send-request! client "environments-files-create" :post (environment-files-path environment-id)
                  (cond-> request
                    (contains? request "data") (update "data" base64-data))))
+
+;; ---------------------------------------------------------------------------
+;; Public API — vaults and vault credentials
+;;
+;; Source: https://developers.openai.com/api/reference/resources/beta/subresources/agents/subresources/vaults/methods/{create,retrieve,list,delete}/index.md,
+;; .../vaults/subresources/credentials/methods/{create,retrieve,update,list,delete}/index.md,
+;; and openai-python src/openai/resources/beta/agents/vaults/{vaults,credentials}.py.
+;; The paths are `/vaults/...` at the API root, NOT under `/agents`, although
+;; the SDK nests them at `client.beta.agents.vaults` and they still require
+;; `OpenAI-Beta: agents=v1`. There is no vault update endpoint.
+;;
+;; SECRETS: credential create/update bodies carry write-only secrets
+;; (`token`, `access_token`, `refresh_token`, `client_secret`). They are
+;; passed through verbatim and never logged or copied into an exception:
+;; tools.agents.openai/request! puts only the RESPONSE body in ex-data.
+;; ---------------------------------------------------------------------------
+
+(defn- vault-path [vault-id]
+  (str "/vaults/" (path-segment vault-id)))
+
+(defn- credentials-path [vault-id]
+  (str (vault-path vault-id) "/credentials"))
+
+(defn vaults-create
+  "POST {base-url}/vaults — create a vault for the current project, the
+   analogue of `client.beta.agents.vaults.create(**params)`. `request`, if
+   given, is passed through verbatim; both fields are optional:
+
+     \"name\"      1-256 UTF-8 bytes after trimming
+     \"metadata\"  string key-value pairs (e.g. an application or team id)
+
+   Returns the `Vault`: \"id\", \"object\" \"vault\", \"created_at\",
+   \"name\" (or nil), \"metadata\". A vault groups credentials that agent MCP
+   tools authenticate with: pass vault ids as `sessions-create`'s
+   \"vault_ids\", and a credential id as an MCP tool's \"credential_id\"."
+  ([client] (vaults-create client nil))
+  ([client request]
+   (send-request! client "vaults-create" :post "/vaults" request)))
+
+(defn vaults-retrieve
+  "GET {base-url}/vaults/{vault-id} — the analogue of
+   `client.beta.agents.vaults.retrieve(vault_id)`. Returns the `Vault`."
+  [client vault-id]
+  (send-request! client "vaults-retrieve" :get (vault-path vault-id) nil))
+
+(defn vaults-list
+  "GET {base-url}/vaults — the analogue of
+   `client.beta.agents.vaults.list(**params)`. `params`, if given, is a plain
+   map of query parameters: \"after\", \"limit\" (default 20, clamped to
+   1-100), \"order\" (\"asc\"|\"desc\" by \"created_at\", default \"desc\"),
+   \"status\" (\"active\" or \"archived\", or a vector of both, sent as
+   `status[]=active&status[]=archived`; both are included by default).
+
+   CURSOR PAGING (`SyncCursorPage`): the response is {\"object\" \"list\"
+   \"data\" [...] \"first_id\" .. \"last_id\" .. \"has_more\" bool}; page with
+   \"after\" = the previous page's \"last_id\" while \"has_more\" is true,
+   keeping \"order\" and \"status\" fixed."
+  ([client] (vaults-list client nil))
+  ([client params]
+   (send-request! client "vaults-list" :get "/vaults" nil {:query params})))
+
+(defn vaults-delete
+  "DELETE {base-url}/vaults/{vault-id} — deletes the vault AND all its
+   credentials, the analogue of `client.beta.agents.vaults.delete(vault_id)`.
+   Returns {\"id\" ... \"deleted\" true \"object\" \"vault.deleted\"}."
+  [client vault-id]
+  (send-request! client "vaults-delete" :delete (vault-path vault-id) nil))
+
+(defn vaults-credentials-create
+  "POST {base-url}/vaults/{vault-id}/credentials — store an MCP server
+   credential, the analogue of
+   `client.beta.agents.vaults.credentials.create(vault_id, auth=, name=)`.
+   `request` is passed through verbatim:
+
+     \"name\"  required, 1-256 UTF-8 bytes after trimming
+     \"auth\"  required, one of
+       {\"type\" \"static_bearer\" \"mcp_server_url\" \"https://...\"
+        \"token\" <secret>}
+       {\"type\" \"mcp_oauth\" \"mcp_server_url\" \"https://...\"
+        \"access_token\" <secret>
+        \"expires_at\" \"<RFC 3339>\"                        ; optional
+        \"refresh\" {\"client_id\" .. \"refresh_token\" <secret>   ; optional
+                   \"token_endpoint\" \"https://...\"
+                   \"token_endpoint_auth\" {\"type\" \"none\"} |
+                     {\"type\" \"client_secret_basic\"|\"client_secret_post\"
+                      \"client_secret\" <secret>}
+                   \"resource\" ..  \"scope\" ..}}              ; optional
+
+   Secrets are write-only: the returned `Credential` (\"id\", \"object\"
+   \"vault.credential\", \"vault_id\", \"name\", \"created_at\",
+   \"updated_at\", \"auth\") carries only the non-secret \"auth\" fields —
+   no \"token\", \"access_token\", \"refresh_token\" or \"client_secret\".
+   This function never logs `request` and never puts it in an exception; a
+   non-2xx error carries only the server's response body."
+  [client vault-id request]
+  (send-request! client "vaults-credentials-create" :post (credentials-path vault-id) request))
+
+(defn vaults-credentials-retrieve
+  "GET {base-url}/vaults/{vault-id}/credentials/{credential-id} — credential
+   metadata without secret values, the analogue of
+   `client.beta.agents.vaults.credentials.retrieve(credential_id, vault_id=)`."
+  [client vault-id credential-id]
+  (send-request! client "vaults-credentials-retrieve" :get
+                 (str (credentials-path vault-id) "/" (path-segment credential-id)) nil))
+
+(defn vaults-credentials-update
+  "POST {base-url}/vaults/{vault-id}/credentials/{credential-id} — ROTATE a
+   credential's secret, the analogue of
+   `client.beta.agents.vaults.credentials.update(credential_id, vault_id=, auth=)`.
+   `request` is {\"auth\" ...}, passed through verbatim; \"auth\" \"type\"
+   must be the credential's existing method (the name and MCP server URL are
+   not updatable here):
+
+     {\"type\" \"static_bearer\" \"token\" <secret>}             ; token required
+     {\"type\" \"mcp_oauth\"
+      \"access_token\" <secret>                 ; optional
+      \"expires_at\" \"<RFC 3339>\" or nil        ; nil clears; omitted keeps it,
+                                               ; unless a new access_token is sent
+      \"refresh\" {\"refresh_token\" <secret>     ; omitted/nil keeps the stored one
+                 \"scope\" ..                   ; nil stops sending a scope
+                 \"token_endpoint_auth\"
+                 {\"type\" \"client_secret_basic\"|\"client_secret_post\"
+                  \"client_secret\" <secret>}}}  ; omitted/nil keeps it
+
+   Returns the `Credential` metadata, never the secrets. Same no-logging
+   guarantee as `vaults-credentials-create`."
+  [client vault-id credential-id request]
+  (send-request! client "vaults-credentials-update" :post
+                 (str (credentials-path vault-id) "/" (path-segment credential-id)) request))
+
+(defn vaults-credentials-list
+  "GET {base-url}/vaults/{vault-id}/credentials — the analogue of
+   `client.beta.agents.vaults.credentials.list(vault_id, **params)`, without
+   secret values. Same params and CURSOR PAGING as `vaults-list`: \"after\",
+   \"limit\", \"order\", \"status\"."
+  ([client vault-id] (vaults-credentials-list client vault-id nil))
+  ([client vault-id params]
+   (send-request! client "vaults-credentials-list" :get (credentials-path vault-id) nil
+                  {:query params})))
+
+(defn vaults-credentials-delete
+  "DELETE {base-url}/vaults/{vault-id}/credentials/{credential-id} — the
+   analogue of `client.beta.agents.vaults.credentials.delete(credential_id, vault_id=)`.
+   Returns {\"id\" ... \"deleted\" true \"object\" \"vault.credential.deleted\"}."
+  [client vault-id credential-id]
+  (send-request! client "vaults-credentials-delete" :delete
+                 (str (credentials-path vault-id) "/" (path-segment credential-id)) nil))
 
 ;; ---------------------------------------------------------------------------
 ;; Public API — self-hosted sandboxes

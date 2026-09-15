@@ -11,9 +11,10 @@ sends every request through that namespace's public transport,
 `tools.agents.openai/request!` (JSON codec, retry loop, per-attempt headers,
 error typing; see [openai.md](openai.md#shared-transport-request)), adding
 only its `OpenAI-Beta` header and message prefix, because the Agents API lives under the same `https://api.openai.com/v1` root
-— distinguished only by the `/agents` path prefix and a required
-`OpenAI-Beta: agents=v1` header this namespace adds to every request. Build
-one client and use it with both namespaces.
+— distinguished by a required `OpenAI-Beta: agents=v1` header this namespace
+adds to every request, and by the `/agents` path prefix, except vaults, which
+sit at `/vaults` at the root even though openai-python nests them at
+`client.beta.agents.vaults`. Build one client and use it with both namespaces.
 
 ## Where this came from — a primary-source note
 
@@ -66,6 +67,21 @@ pages
 the [files guide](https://developers.openai.com/api/docs/guides/agents-api/environments/files.md)
 and openai-python's `sessions/artifacts.py` / `environments/files.py`.
 The reference has no environment-file retrieve, delete or content endpoint.
+
+Vaults and vault credentials are implemented from the reference pages
+([vaults create](https://developers.openai.com/api/reference/resources/beta/subresources/agents/subresources/vaults/methods/create/index.md),
+[retrieve](https://developers.openai.com/api/reference/resources/beta/subresources/agents/subresources/vaults/methods/retrieve/index.md),
+[list](https://developers.openai.com/api/reference/resources/beta/subresources/agents/subresources/vaults/methods/list/index.md),
+[delete](https://developers.openai.com/api/reference/resources/beta/subresources/agents/subresources/vaults/methods/delete/index.md);
+[credentials create](https://developers.openai.com/api/reference/resources/beta/subresources/agents/subresources/vaults/subresources/credentials/methods/create/index.md),
+[retrieve](https://developers.openai.com/api/reference/resources/beta/subresources/agents/subresources/vaults/subresources/credentials/methods/retrieve/index.md),
+[update](https://developers.openai.com/api/reference/resources/beta/subresources/agents/subresources/vaults/subresources/credentials/methods/update/index.md),
+[list](https://developers.openai.com/api/reference/resources/beta/subresources/agents/subresources/vaults/subresources/credentials/methods/list/index.md),
+[delete](https://developers.openai.com/api/reference/resources/beta/subresources/agents/subresources/vaults/subresources/credentials/methods/delete/index.md))
+and openai-python's `vaults/vaults.py` / `vaults/credentials.py`. Both give
+the paths as `/vaults/...`, not `/agents/vaults/...`. The reference has no
+vault update endpoint, and no archive endpoint despite the `status`
+(`active`/`archived`) list filter. Not yet verified live.
 Verified live on 2026-09-15 (probe P1,
 `artifacts-and-environment-files-probe-against-the-real-api`, 16 assertions):
 artifact content arrives inline as `200` bytes (no redirect), byte-exact
@@ -212,6 +228,15 @@ test suite runs it instantly against a mock server) and
 | `client.beta.agents.sessions.artifacts.delete(artifact_id, session_id=)` — `DELETE /v1/agents/sessions/{session_id}/artifacts/{artifact_id}` | `(sessions-artifacts-delete client session-id artifact-id)` | Deletes the published copy only. Returns `{"deleted" true "object" "agent.session.artifact.deleted"}`. |
 | `client.beta.agents.environments.files.list(environment_id, **params)` — `GET /v1/agents/environments/{environment_id}/files` | `(environments-files-list client environment-id params)` / `(environments-files-list client environment-id)` | **Token paging** (`SyncTokenPage`), not `after`: response `{"object" "page" "has_more" .. "next" ..}`; pass `"page"` = `"next"`, keeping `path`/`order`/`limit`. Connected environments only. Verified live (P1, 2026-09-15). |
 | `client.beta.agents.environments.files.create(environment_id, type=, path=, data=/file_id=)` — `POST /v1/agents/environments/{environment_id}/files` | `(environments-files-create client environment-id request)` | JSON body, not multipart. `{"type" "inline" "path" .. "data" ..}` or `{"type" "file_id" "path" .. "file_id" ..}`. `"data"`: a base64 String is sent verbatim; `byte[]`/`File`/`Path` is read and std-base64-encoded. Inline ≤5 MiB before encoding (API-enforced). No delete/retrieve endpoint exists. |
+| `client.beta.agents.vaults.create(**params)` — `POST /v1/vaults` | `(vaults-create client request)` / `(vaults-create client)` | **Root `/vaults`, not `/agents/vaults`.** `name`, `metadata`, both optional. Returns the `Vault`. Attach to a session with `sessions-create`'s `"vault_ids"`. |
+| `client.beta.agents.vaults.retrieve(vault_id)` — `GET /v1/vaults/{vault_id}` | `(vaults-retrieve client vault-id)` | |
+| `client.beta.agents.vaults.list(**params)` — `GET /v1/vaults` | `(vaults-list client params)` / `(vaults-list client)` | Cursor paging: `after`/`limit`/`order` (default `desc`), plus `status` (`"active"`, `"archived"` or a vector, sent as `status[]=…` repeats). No vault update endpoint exists. |
+| `client.beta.agents.vaults.delete(vault_id)` — `DELETE /v1/vaults/{vault_id}` | `(vaults-delete client vault-id)` | Deletes the vault and all its credentials. `{"deleted" true "object" "vault.deleted"}`. |
+| `client.beta.agents.vaults.credentials.create(vault_id, auth=, name=)` — `POST /v1/vaults/{vault_id}/credentials` | `(vaults-credentials-create client vault-id request)` | `auth` is `static_bearer` or `mcp_oauth`; secrets write-only, never echoed or logged. See Vault credentials below. |
+| `client.beta.agents.vaults.credentials.retrieve(credential_id, vault_id=)` — `GET /v1/vaults/{vault_id}/credentials/{credential_id}` | `(vaults-credentials-retrieve client vault-id credential-id)` | Metadata only. |
+| `client.beta.agents.vaults.credentials.update(credential_id, vault_id=, auth=)` — `POST /v1/vaults/{vault_id}/credentials/{credential_id}` | `(vaults-credentials-update client vault-id credential-id request)` | Rotates secrets within the existing auth `type`; `nil` fields reach the wire as JSON null (keep/clear semantics per field). |
+| `client.beta.agents.vaults.credentials.list(vault_id, **params)` — `GET /v1/vaults/{vault_id}/credentials` | `(vaults-credentials-list client vault-id params)` / `(vaults-credentials-list client vault-id)` | Same params and cursor paging as `vaults-list`. |
+| `client.beta.agents.vaults.credentials.delete(credential_id, vault_id=)` — `DELETE /v1/vaults/{vault_id}/credentials/{credential_id}` | `(vaults-credentials-delete client vault-id credential-id)` | `{"deleted" true "object" "vault.credential.deleted"}`. |
 | `client.beta.agents.sessions.create(..., stream=True)` — `POST /v1/agents/sessions` with `"stream": true` | `(sessions-create-stream client request)` | Sets `"stream" true`; returns a single-use reducible of decoded events for the first turn, starting with `agent.session.created`. See Streaming below. |
 | `client.beta.agents.sessions.events.stream(session_id)` — `GET /v1/agents/sessions/{session_id}/events?stream=true` | `(sessions-events-stream client session-id)` / `(sessions-events-stream client session-id params)` | `Accept: text/event-stream` + `?stream=true`. Request sent at call time; retries and HTTP errors before the first byte, typed as every other method. Events are the decoded JSON maps, verbatim (including `error` events). |
 | the events guide's `stream_session` helper (docs code, not an SDK method) | `(await-root-turn events)` / `(await-root-turn events {:on-event f})` | Reduces until the root turn's `agent.session.turn.completed` and returns that event; throws `turn-failed`, `turn-cancelled`, `session-failed`, `stream-error`, `stream-truncated`. |
@@ -375,6 +400,46 @@ don't already have a webhook receiver; wire one up yourself, following
 OpenAI's [webhook guide](https://developers.openai.com/api/docs/guides/webhooks),
 if you do.
 
+### Vault credentials — secret handling
+
+A vault holds credentials that agent MCP tools use to authenticate. Attach
+vaults to a session with `sessions-create`'s `"vault_ids"`; an MCP tool picks
+a credential with `"credential_id"` (optional when exactly one attached
+credential matches the server URL, per the reference).
+
+`vaults-credentials-create` takes `{"name" .. "auth" ..}`; `"auth"` is one of:
+
+```clojure
+{"type" "static_bearer" "mcp_server_url" "https://mcp.example.com/mcp"
+ "token" "<secret>"}
+
+{"type" "mcp_oauth" "mcp_server_url" "https://mcp.example.com/mcp"
+ "access_token" "<secret>"
+ "expires_at" "2026-10-01T00:00:00Z"                  ; optional
+ "refresh" {"client_id" "…"                           ; optional
+            "refresh_token" "<secret>"
+            "token_endpoint" "https://auth.example.com/token"
+            "token_endpoint_auth" {"type" "none"}     ; or client_secret_basic /
+                                                      ; client_secret_post + "client_secret" "<secret>"
+            "resource" "…" "scope" "…"}}              ; optional
+```
+
+`vaults-credentials-update` rotates within the existing `"type"`:
+`static_bearer` requires a new `"token"`; `mcp_oauth` makes every field
+optional, where an omitted or `nil` `refresh_token`/`client_secret` keeps the
+stored secret, `"expires_at" nil` clears the expiry (omitting it keeps it,
+unless a new `access_token` is sent), and `"scope" nil` stops sending a scope.
+`nil` reaches the wire as JSON null.
+
+Secrets are write-only. Every response is `Credential` metadata whose
+`"auth"` omits `token`, `access_token`, `refresh_token` and `client_secret`.
+This library passes the request body through untouched and never logs it or
+copies it into an exception: `tools.agents.openai/request!` puts only the
+response `:body` in `ex-data` (tested: a 400 on create leaves no trace of the
+token in the message or `ex-data`). A server that echoed a secret in its error
+body would surface it in `:body`; the reference documents no such echo. Keep
+secrets out of the `"name"`, which is returned.
+
 ### Self-hosted sandboxes — what this library does and does not do
 
 "Own infrastructure for sandbox" means `environment.type: "self_hosted"`.
@@ -516,6 +581,18 @@ tested over plain collections.
 turns on an `environment: none` session) streams `sessions-create-stream`
 to completion, then opens `sessions-events-stream` before `send-message` and
 awaits the second turn. It **has not been run yet**.
+
+Vaults and credentials (#49): every method's method, path (asserted as
+`/v1/vaults…`, pinning the root location), beta header, query and JSON body;
+a `"status"` vector encoded as `status[]=active&status[]=archived` (compared
+on the raw query, since `parse-query` collapses repeats); `nil` in a rotate
+body sent as JSON null; and a 400 on credential create typed
+`bad-request-error` with the token absent from the message and `ex-data`.
+`vaults-crud-round-trip-against-the-real-api` (same gate; no inference, no
+credential) runs create → retrieve → list (polled) → empty credential list →
+delete → retrieve 404. It **has not been run yet**.
+
+Tests added in #49 bind port `0` (OS-assigned) through `with-recording-server`.
 
 Port range `19000`–`19079` — chosen not to collide with the sibling suites'
 ranges (anthropic `18930`–`18975`, gemini `18980`–`18997`, openai
