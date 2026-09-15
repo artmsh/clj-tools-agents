@@ -1202,6 +1202,135 @@
           "a null top-level error is not an error"))))
 
 ;; ---------------------------------------------------------------------------
+;; Resources added in #49. Every server binds port 0 (OS-assigned) and
+;; answers every path under /v1 with `respond`, recording each request.
+;; Fixtures follow the API reference's example responses.
+;; ---------------------------------------------------------------------------
+
+(defn- with-recording-server
+  "Start a port-0 mock answering every /v1 path with (respond req), call
+   (f client calls) with a client on it (:max-retries 0) and the atom of
+   recorded requests, and stop the server afterwards."
+  [respond f]
+  (let [calls (atom [])
+        {:keys [port stop!]} (start-server! 0 "/v1" (fn [req] (swap! calls conj req) (respond req)))]
+    (try
+      (f (oai/client {:api-key "k" :base-url (base-url port) :max-retries 0}) calls)
+      (finally (stop!)))))
+
+(defn- ok [body] (constantly {:status 200 :body body}))
+
+(defn- wire
+  "[method path parsed-query body-map] of a recorded request."
+  [req]
+  [(:method req) (:path req) (when (:query req) (parse-query (:query req)))
+   (when (seq (:body req)) (oai/read-json (:body req)))])
+
+(defn- list-page [& item-jsons]
+  (str "{\"object\":\"list\",\"data\":[" (str/join "," item-jsons) "],"
+       "\"first_id\":\"a\",\"last_id\":\"b\",\"has_more\":true}"))
+
+;; --- vaults and credentials -------------------------------------------------
+
+(def ^:private canned-vault
+  "{\"id\":\"vault_1\",\"object\":\"vault\",\"created_at\":0,\"name\":\"team\",\"metadata\":{\"app\":\"docs\"}}")
+
+(def ^:private canned-credential
+  (str "{\"id\":\"cred_1\",\"object\":\"vault.credential\",\"vault_id\":\"vault_1\",\"name\":\"gh\","
+       "\"created_at\":0,\"updated_at\":0,"
+       "\"auth\":{\"type\":\"static_bearer\",\"mcp_server_url\":\"https://mcp.example.com/mcp\"}}"))
+
+(deftest vaults-crud-hits-root-vaults-paths-with-beta-header
+  ;; /vaults is at the API root, not under /agents, although the SDK nests it
+  ;; at client.beta.agents.vaults — pin it against a future /agents prefix.
+  (with-recording-server
+    (fn [{:keys [method path]}]
+      {:status 200
+       :body (cond
+               (= "DELETE" method)   "{\"id\":\"vault_1\",\"deleted\":true,\"object\":\"vault.deleted\"}"
+               (= "/v1/vaults" path) (if (= "GET" method) (list-page canned-vault) canned-vault)
+               :else                 canned-vault)})
+    (fn [client calls]
+      (is (= "vault_1" (get (agents/vaults-create client {"name" "team" "metadata" {"app" "docs"}}) "id")))
+      (is (= "vault" (get (agents/vaults-create client) "object")))
+      (is (= "team" (get (agents/vaults-retrieve client "vault_1") "name")))
+      (is (= "b" (get (agents/vaults-list client {"after" "vault_0" "limit" 5 "order" :asc}) "last_id")))
+      (agents/vaults-list client)
+      (is (= "vault.deleted" (get (agents/vaults-delete client "vault_1") "object")))
+      (is (= [["POST" "/v1/vaults" nil {"name" "team" "metadata" {"app" "docs"}}]
+              ["POST" "/v1/vaults" nil nil]
+              ["GET" "/v1/vaults/vault_1" nil nil]
+              ["GET" "/v1/vaults" {"after" "vault_0" "limit" "5" "order" "asc"} nil]
+              ["GET" "/v1/vaults" nil nil]
+              ["DELETE" "/v1/vaults/vault_1" nil nil]]
+             (mapv wire @calls)))
+      (is (every? #(= "agents=v1" (get-in % [:headers "openai-beta"])) @calls)))))
+
+(deftest vaults-list-sends-a-status-vector-as-bracketed-repeats
+  ;; The reference: `status=active` or `status[]=active&status[]=archived`.
+  ;; parse-query would collapse the repeats, so compare the raw query.
+  (with-recording-server
+    (ok (list-page))
+    (fn [client calls]
+      (agents/vaults-list client {"status" ["active" "archived"]})
+      (agents/vaults-credentials-list client "vault_1" {"status" "archived"})
+      (let [[vaults creds] @calls
+            decode #(java.net.URLDecoder/decode ^String % "UTF-8")]
+        (is (= "status[]=active&status[]=archived" (decode (:query vaults))))
+        (is (= "/v1/vaults/vault_1/credentials" (:path creds)))
+        (is (= "status=archived" (decode (:query creds))))))))
+
+(deftest vaults-credentials-crud-paths-bodies-and-responses
+  (with-recording-server
+    (fn [{:keys [method]}]
+      {:status 200
+       :body (case method
+               "DELETE" "{\"id\":\"cred_1\",\"deleted\":true,\"object\":\"vault.credential.deleted\"}"
+               "GET"    canned-credential
+               canned-credential)})
+    (fn [client calls]
+      (let [create-auth {"type" "mcp_oauth" "mcp_server_url" "https://mcp.example.com/mcp"
+                         "access_token" "placeholder-access"
+                         "refresh" {"client_id" "client" "refresh_token" "placeholder-refresh"
+                                    "token_endpoint" "https://auth.example.com/token"
+                                    "token_endpoint_auth" {"type" "client_secret_post"
+                                                           "client_secret" "placeholder-secret"}}}
+            rotate-auth {"type" "mcp_oauth" "expires_at" nil
+                         "refresh" {"refresh_token" nil "scope" "read"}}]
+        (is (= "vault.credential" (get (agents/vaults-credentials-create client "vault_1"
+                                         {"name" "gh" "auth" create-auth}) "object")))
+        (is (= "gh" (get (agents/vaults-credentials-retrieve client "vault_1" "cred_1") "name")))
+        (is (= "cred_1" (get (agents/vaults-credentials-update client "vault_1" "cred_1"
+                               {"auth" rotate-auth}) "id")))
+        (is (= "gh" (get (agents/vaults-credentials-list client "vault_1" {"limit" 1}) "name"))
+            "list returns the decoded body as-is")
+        (agents/vaults-credentials-list client "vault_1")
+        (is (true? (get (agents/vaults-credentials-delete client "vault_1" "cred_1") "deleted")))
+        (is (= [["POST" "/v1/vaults/vault_1/credentials" nil {"name" "gh" "auth" create-auth}]
+                ["GET" "/v1/vaults/vault_1/credentials/cred_1" nil nil]
+                ["POST" "/v1/vaults/vault_1/credentials/cred_1" nil {"auth" rotate-auth}]
+                ["GET" "/v1/vaults/vault_1/credentials" {"limit" "1"} nil]
+                ["GET" "/v1/vaults/vault_1/credentials" nil nil]
+                ["DELETE" "/v1/vaults/vault_1/credentials/cred_1" nil nil]]
+               (mapv wire @calls))
+            "nil in the rotate body reaches the wire as JSON null (clear/keep semantics)")
+        (is (every? #(= "agents=v1" (get-in % [:headers "openai-beta"])) @calls))))))
+
+(deftest vaults-credentials-errors-never-carry-the-request-secret
+  (with-recording-server
+    (constantly {:status 400 :body "{\"error\":{\"message\":\"mcp_server_url must be HTTPS\"}}"})
+    (fn [client calls]
+      (let [secret "placeholder-bearer-value"
+            e      (try (agents/vaults-credentials-create client "vault_1"
+                          {"name" "x" "auth" {"type" "static_bearer" "token" secret
+                                              "mcp_server_url" "http://insecure"}})
+                        nil (catch Exception e e))]
+        (is (str/includes? (:body (first @calls)) secret) "the secret was sent")
+        (is (= :tools.agents.openai/bad-request-error (:type (ex-data e))))
+        (is (str/includes? (ex-message e) "vaults-credentials-create: HTTP 400 mcp_server_url must be HTTPS"))
+        (is (not (str/includes? (str (ex-message e) (pr-str (ex-data e))) secret)))))))
+
+;; ---------------------------------------------------------------------------
 ;; REAL-API saved-agent CRUD round trip — the one test in this file that
 ;; talks to OpenAI. Skipped (a single passing assertion) unless both
 ;; OPENAI_AGENTS_LIVE=1 and OPENAI_API_KEY are set, so a key merely present in
@@ -1450,3 +1579,37 @@
         (is (= :tools.agents.openai/authentication-error (:type (ex-data e))))
         (is (= [1 1] [@hits @calls])))
       (finally (stop!)))))
+
+;; ---------------------------------------------------------------------------
+;; REAL-API vault CRUD round trip (#49). Same gate and base-URL override as
+;; `agents-crud-round-trip-against-the-real-api`; no inference, no model
+;; tokens, no credential (so no secret leaves this process). Not yet run.
+;; ---------------------------------------------------------------------------
+
+(deftest vaults-crud-round-trip-against-the-real-api
+  (if-let [api-key (and (= "1" (System/getenv "OPENAI_AGENTS_LIVE"))
+                       (not-empty (System/getenv "OPENAI_API_KEY")))]
+    (let [client  (oai/client {:api-key api-key
+                               :base-url (env "OPENAI_AGENTS_BASE_URL" "https://api.openai.com/v1")})
+          created (agents/vaults-create client {"name" "clj-tools-agents-live-test" "metadata" {"probe" "1"}})
+          id      (get created "id")]
+      (try
+        (is (string? id))
+        (is (= "vault" (get created "object")))
+        (is (= "clj-tools-agents-live-test" (get created "name")))
+        (is (= id (get (agents/vaults-retrieve client id) "id")))
+        ;; list consistency is unverified for vaults; poll as agents-list needs
+        (let [page (live-poll #(let [p (agents/vaults-list client {"limit" 100 "status" ["active" "archived"]})]
+                                 (when (some (fn [v] (= id (get v "id"))) (get p "data")) p))
+                              1000 60000)]
+          (is (= "list" (get page "object"))))
+        (is (= [] (get (agents/vaults-credentials-list client id) "data")))
+        (let [deleted (agents/vaults-delete client id)]
+          (is (true? (get deleted "deleted")))
+          (is (= "vault.deleted" (get deleted "object"))))
+        (let [e (try (agents/vaults-retrieve client id) nil (catch Exception e e))]
+          (is (= :tools.agents.openai/not-found-error (:type (ex-data e)))))
+        (catch Exception e
+          (try (agents/vaults-delete client id) (catch Exception _ nil))
+          (throw e))))
+    (is true "skipped: set OPENAI_AGENTS_LIVE=1 and OPENAI_API_KEY")))
