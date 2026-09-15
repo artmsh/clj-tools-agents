@@ -1,0 +1,16 @@
+data: {"id":"chatcmpl-456","object":"chat.completion.chunk","created":1694268190,"model":"gpt-6-astra","system_fingerprint":"fp_44709d6fcb","choices":[{"index":0,"delta":{"role":"assistant","content":null,"refusal":null},"logprobs":null,"finish_reason":null}],"usage":null,"obfuscation":"a1"}
+
+data: {"id":"chatcmpl-456","object":"chat.completion.chunk","created":1694268190,"model":"gpt-6-astra","system_fingerprint":"fp_44709d6fcb","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_kyiv","type":"function","function":{"name":"get_weather","arguments":""}}]},"logprobs":null,"finish_reason":null}],"usage":null,"obfuscation":"b2"}
+
+data: {"id":"chatcmpl-456","object":"chat.completion.chunk","created":1694268190,"model":"gpt-6-astra","system_fingerprint":"fp_44709d6fcb","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"city\":"}}]},"logprobs":null,"finish_reason":null}],"usage":null,"obfuscation":"c3"}
+
+data: {"id":"chatcmpl-456","object":"chat.completion.chunk","created":1694268190,"model":"gpt-6-astra","system_fingerprint":"fp_44709d6fcb","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_oslo","type":"function","function":{"name":"get_weather","arguments":""}}]},"logprobs":null,"finish_reason":null}],"usage":null,"obfuscation":"d4"}
+
+data: {"id":"chatcmpl-456","object":"chat.completion.chunk","created":1694268190,"model":"gpt-6-astra","system_fingerprint":"fp_44709d6fcb","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":"{\"city\":\"Oslo\"}"}},{"index":0,"function":{"arguments":"\"Kyiv\"}"}}]},"logprobs":null,"finish_reason":null}],"usage":null,"obfuscation":"e5"}
+
+data: {"id":"chatcmpl-456","object":"chat.completion.chunk","created":1694268190,"model":"gpt-6-astra","system_fingerprint":"fp_44709d6fcb","choices":[{"index":0,"delta":{},"logprobs":null,"finish_reason":"tool_calls"}],"usage":null,"obfuscation":"f6"}
+
+data: {"id":"chatcmpl-456","object":"chat.completion.chunk","created":1694268190,"model":"gpt-6-astra","system_fingerprint":"fp_44709d6fcb","choices":[],"usage":{"prompt_tokens":82,"completion_tokens":37,"total_tokens":119},"obfuscation":""}
+
+data: [DONE]
+

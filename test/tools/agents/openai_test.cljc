@@ -508,7 +508,103 @@
                  nil (catch Exception e e))]
       (is (= :tools.agents.openai/stream-error (:type (ex-data e))))
       (is (= {"message" "boom" "type" "server_error"} (:error (ex-data e))))))
-  (testing "a null error, or one nested inside response, is not an error"
+  (testing "a null error, or one nested inside response, is not an error (Responses)"
     (is (map? (oai/accumulate-response-event nil {"type" "x" "error" nil})))
     (is (map? (oai/accumulate-response-event nil {"type" "response.failed"
                                                   "response" {"status" "failed" "error" {"message" "m"}}})))))
+
+;; ---------------------------------------------------------------------------
+;; Chat Completions stream accumulation (pure)
+;; ---------------------------------------------------------------------------
+
+(defn- chunk [choices & {:as extra}]
+  (merge {"id" "chatcmpl-1" "object" "chat.completion.chunk" "created" 1 "model" "m"
+          "system_fingerprint" "fp_1" "choices" choices}
+         extra))
+
+(defn- ch [delta & {:as extra}]
+  (merge {"index" 0 "delta" delta "logprobs" nil "finish_reason" nil} extra))
+
+(deftest accumulate-chat-chunk-arities
+  (is (nil? (oai/accumulate-chat-completion-chunk)))
+  (is (= {"a" 1} (oai/accumulate-chat-completion-chunk {"a" 1})))
+  (is (nil? (oai/accumulate-chat-completion-stream [])))
+  (is (nil? (oai/accumulate-chat-completion-stream nil))))
+
+(deftest accumulate-chat-text-and-seed
+  (let [r (oai/accumulate-chat-completion-stream
+           [(chunk [(ch {"role" "assistant" "content" ""})] "obfuscation" "x1")
+            (chunk [(ch {"content" "Hel"})] "obfuscation" "x2")
+            (chunk [(ch {"content" "lo"})] "system_fingerprint" "fp_2")
+            (chunk [(ch {} "finish_reason" "stop")])])]
+    (is (= {"id" "chatcmpl-1" "object" "chat.completion" "created" 1 "model" "m"
+            "system_fingerprint" "fp_1" "usage" nil
+            "choices" [{"index" 0 "message" {"role" "assistant" "content" "Hello"}
+                        "logprobs" nil "finish_reason" "stop"}]}
+           r)
+        "system_fingerprint and usage follow the last chunk, as in the SDK")
+    (is (= "Hello" (oai/completion-text r)))
+    (is (not (contains? r "obfuscation")))
+    (is (false? (oai/stream-complete? r)) "a collection never saw [DONE]")))
+
+(deftest accumulate-chat-refusal
+  (let [r (oai/accumulate-chat-completion-stream
+           [(chunk [(ch {"role" "assistant" "content" nil "refusal" nil})])
+            (chunk [(ch {"refusal" "I can't"})])
+            (chunk [(ch {"refusal" " help with that."} "finish_reason" "stop")])])]
+    (is (= "I can't help with that." (get-in r ["choices" 0 "message" "refusal"])))
+    (is (nil? (oai/completion-text r)))))
+
+(deftest accumulate-chat-tool-calls-by-index
+  (let [r (oai/accumulate-chat-completion-stream
+           [(chunk [(ch {"role" "assistant" "content" nil})])
+            (chunk [(ch {"tool_calls" [{"index" 0 "id" "call_a" "type" "function"
+                                        "function" {"name" "f" "arguments" ""}}
+                                       {"index" 0 "function" {"arguments" "{\"x\""}}]})])
+            (chunk [(ch {"tool_calls" [{"index" 1 "id" "call_b" "type" "function"
+                                        "function" {"name" "g" "arguments" "{}"}}]})])
+            (chunk [(ch {"tool_calls" [{"index" 0 "type" "function" "function" {"arguments" ":1}"}}]})])
+            (chunk [(ch {} "finish_reason" "tool_calls")])])]
+    (is (= [{"index" 0 "id" "call_a" "type" "function" "function" {"name" "f" "arguments" "{\"x\":1}"}}
+            {"index" 1 "id" "call_b" "type" "function" "function" {"name" "g" "arguments" "{}"}}]
+           (get-in r ["choices" 0 "message" "tool_calls"]))
+        "two fragments for one index in the same chunk merge; type is replaced, not concatenated")
+    (is (vector? (get-in r ["choices" 0 "message" "tool_calls"])))
+    (is (= "tool_calls" (get-in r ["choices" 0 "finish_reason"])))
+    (is (nil? (oai/completion-text r)))))
+
+(deftest accumulate-chat-choices-by-index-logprobs-and-usage
+  (let [lp (fn [& toks] {"content" (mapv (fn [t] {"token" t "logprob" -0.1}) toks) "refusal" nil})
+        r  (oai/accumulate-chat-completion-stream
+            [(chunk [(ch {"role" "assistant" "content" "A"} "logprobs" (lp "A"))])
+             (chunk [(ch {"role" "assistant" "content" "B"} "index" 1 "logprobs" (lp "B"))
+                     (ch {"content" "a"} "logprobs" (lp "a"))])
+             (chunk [(ch {"content" "b"} "index" 1 "logprobs" {"content" [] "refusal" nil} "finish_reason" "length")
+                     (ch {} "finish_reason" "stop" "logprobs" nil)])
+             (chunk [] "usage" {"prompt_tokens" 5 "completion_tokens" 4 "total_tokens" 9})])]
+    (is (= ["Aa" "Bb"] (mapv #(get-in % ["message" "content"]) (get r "choices"))))
+    (is (= [0 1] (mapv #(get % "index") (get r "choices"))))
+    (is (= [["A" "a"] ["B"]] (mapv (fn [c] (mapv #(get % "token") (get-in c ["logprobs" "content"]))) (get r "choices")))
+        "a choice first seen mid-stream does not get its logprobs twice")
+    (is (= ["stop" "length"] (mapv #(get % "finish_reason") (get r "choices"))))
+    (is (= {"prompt_tokens" 5 "completion_tokens" 4 "total_tokens" 9} (get r "usage"))
+        "include_usage: the last chunk has empty choices and the usage")
+    (is (= "Aa" (oai/completion-text r)))))
+
+(deftest accumulate-chat-skips-non-chunk-objects-and-throws-on-errors
+  (let [r (oai/accumulate-chat-completion-stream
+           [{"object" "" "choices" [] "prompt_filter_results" []}
+            (chunk [(ch {"role" "assistant" "content" "ok"})])
+            {"object" "" "choices" [{"index" 0 "delta" {"content" "!"}}]}])]
+    (is (= "ok" (oai/completion-text r))))
+  (let [e (try (oai/accumulate-chat-completion-stream
+                [(chunk [(ch {"content" "a"})]) {"error" {"message" "Rate limited" "code" "rate_limit_exceeded"}}])
+               nil (catch Exception e e))]
+    (is (= :tools.agents.openai/stream-error (:type (ex-data e))))
+    (is (= "tools.agents.openai/accumulate-chat-completion-chunk: stream error: Rate limited" (ex-message e)))
+    (is (= "rate_limit_exceeded" (get-in (ex-data e) [:error "code"]))))
+  (let [e (try (oai/accumulate-chat-completion-stream
+                [(chunk [(ch {"tool_calls" [{"index" 0 "id" "call_a"}]})])
+                 (chunk [(ch {"tool_calls" [{"id" "no-index"}]})])])
+               nil (catch Exception e e))]
+    (is (= :tools.agents.openai/invalid-response (:type (ex-data e))))))

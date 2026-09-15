@@ -40,14 +40,18 @@
    \"max_output_tokens\"). See docs/openai.md 'JSON: a small hand-rolled
    codec, not a dependency'.
 
-   STREAMING: `responses-stream` is `client.responses.create(...,
-   stream=True)`. It opens the request NOW through `request!` (`:as
-   :stream`: same retries, 401 retry and error typing, before the first byte
-   only) and returns a single-use reducible (tools.agents.stream) of decoded
-   event maps. `accumulate-response-stream` folds the events into the final
-   Response that `output-text` reads; `stream-complete?` tells a finished
-   stream from a cut-off one. `:stream true` on `responses-create` /
-   `request!` (without `:as :stream`) is still rejected. See docs/openai.md
+   STREAMING: `responses-stream` / `chat-completions-stream` are
+   `client.responses.create(..., stream=True)` /
+   `client.chat.completions.create(..., stream=True)`. Each opens the request
+   NOW through `request!` (`:as :stream`: same retries, 401 retry and error
+   typing, before the first byte only) and returns a single-use reducible
+   (tools.agents.stream) of decoded event / chunk maps.
+   `accumulate-response-stream` folds Responses events into the final
+   Response that `output-text` reads; `accumulate-chat-completion-stream`
+   folds chunks into a ChatCompletion that `completion-text` reads;
+   `stream-complete?` tells a finished stream from a cut-off one. `:stream
+   true` on `responses-create` / `chat-completions-create` / `request!`
+   (without `:as :stream`) is still rejected. See docs/openai.md
    'Streaming'."
   (:require [clojure.string :as str]
             [tools.agents.http :as http]
@@ -518,7 +522,7 @@
 (defn- reject-streaming! [label body multipart]
   (when (streaming-requested? body multipart)
     (throw (ex-info (str label ": :stream true is not supported here — "
-                          "use tools.agents.openai/responses-stream for SSE streaming")
+                          "use tools.agents.openai/responses-stream or chat-completions-stream for SSE streaming")
                      {:type :tools.agents.openai/streaming-unsupported}))))
 
 (defn- own-error?
@@ -709,7 +713,8 @@
    \"tools.agents.openai/chat-completions-create: \".
 
    This is openai-python's *legacy* surface; prefer `responses-create` for new
-   code, exactly as the SDK's own README does."
+   code, exactly as the SDK's own README does. :stream true throws
+   immediately; stream with `chat-completions-stream`."
   [client request]
   (post-json! client "chat-completions-create" "/chat/completions" request))
 
@@ -822,16 +827,45 @@
   [client request]
   (open-sse-stream client "responses-stream" "/responses" request))
 
+(defn chat-completions-stream
+  "POST request (the `chat-completions-create` map) with \"stream\" true to
+   {base-url}/chat/completions: openai-python's
+   client.chat.completions.create(**params, stream=True). Pass
+   {\"stream_options\" {\"include_usage\" true}} for a final usage chunk.
+
+   Opening, retries, HTTP errors, lifecycle and in-stream errors as in
+   `responses-stream` (message prefix
+   \"tools.agents.openai/chat-completions-stream: \").
+
+   Returns a SINGLE-USE reducible of decoded chat.completion.chunk maps.
+   `data: [DONE]` ends it without being emitted, and
+   (tools.agents.stream/outcome s) is then :done; :eof means the body ended
+   without [DONE].
+
+     (let [s (chat-completions-stream client {\"model\" \"gpt-5\" \"messages\" msgs})]
+       (run! #(some-> (get-in % [\"choices\" 0 \"delta\" \"content\"]) print) s))
+     (completion-text (accumulate-chat-completion-stream
+                        (chat-completions-stream client req)))"
+  [client request]
+  (open-sse-stream client "chat-completions-stream" "/chat/completions" request))
+
 ;; ---------------------------------------------------------------------------
 ;; Stream accumulation — pure
 ;; ---------------------------------------------------------------------------
 
 (defn stream-complete?
-  "True when `result`, from `accumulate-response-stream` /
-   `accumulate-response-event`, saw a terminal event: response.completed,
-   response.failed or response.incomplete. False for a stream that ended
-   (EOF, early termination, close!) without one, whose result is the partial
-   response assembled from deltas. Read from `result`'s metadata."
+  "True when an accumulated stream result shows the stream ended on purpose;
+   read from `result`'s metadata:
+     - Responses (`accumulate-response-stream` / `accumulate-response-event`):
+       a terminal event was folded (response.completed, response.failed or
+       response.incomplete). Works on collections of events too.
+     - Chat Completions (`accumulate-chat-completion-stream`): the stream
+       itself hit `data: [DONE]` ((tools.agents.stream/outcome s) is :done).
+       [DONE] is a transport marker the chunks never carry, so a result
+       folded from a plain collection, or from a stream wrapped in an
+       eduction, is never complete.
+   False for a stream that ended (EOF, early termination, close!) without
+   its marker, whose result is the partial response assembled so far."
   [result]
   (true? (::stream-complete? (meta result))))
 
@@ -991,6 +1025,156 @@
    `stream-complete?`."
   [events]
   (transduce identity accumulate-response-event events))
+
+;; Chat Completions: openai-python lib/streaming/chat/_completions.py
+;; `ChatCompletionStreamState._accumulate_chunk` and
+;; `_convert_initial_chunk_into_snapshot`, with lib/streaming/_deltas.py
+;; `accumulate_delta` (@ d421d7a).
+
+(defn- indexed-entries?
+  "_deltas.py `_has_indexed_entries`: a list with a dict carrying \"index\"."
+  [v]
+  (boolean (and (sequential? v) (some #(and (map? %) (contains? % "index")) v))))
+
+(declare accumulate-delta)
+
+(defn- merge-indexed-entry
+  "One entry of an indexed list delta (e.g. tool_calls): merged into the
+   entry at its \"index\", or appended when there is none yet."
+  [v entry]
+  (let [bad (fn [msg] (ex-info (str "tools.agents.openai/accumulate-chat-completion-chunk: " msg)
+                               {:type :tools.agents.openai/invalid-response :status nil :body nil}))]
+    (when-not (map? entry)
+      (throw (bad (str "list delta entry is not an object: " (pr-str entry)))))
+    (let [i (get entry "index")]
+      (when-not (and (integer? i) (not (neg? i)))
+        (throw (bad (str "list delta entry has no non-negative integer \"index\": " (pr-str entry)))))
+      (if (< i (count v))
+        (let [existing (nth v i)]
+          (when-not (map? existing)
+            (throw (bad (str "list entry at index " i " is not an object"))))
+          (assoc v i (accumulate-delta existing entry)))
+        (conj v entry)))))
+
+(defn- accumulate-delta
+  "_deltas.py `accumulate_delta`: merge a delta object into acc. An absent or
+   null value is set (an indexed list starts from []); \"index\" and \"type\"
+   are replaced; strings concatenate, numbers add, objects merge
+   recursively; a list of scalars is extended; an indexed list merges entry
+   by \"index\". Any other combination keeps acc's value."
+  [acc delta]
+  (if-not (map? delta)
+    acc
+    (reduce-kv
+     (fn [acc k dv]
+       (let [av (get acc k)]
+         (cond
+           (and (nil? av) (not (indexed-entries? dv))) (assoc acc k dv)
+           (contains? #{"index" "type"} k)            (assoc acc k dv)
+           :else
+           (let [av (if (nil? av) [] av)]
+             (cond
+               (and (string? av) (string? dv)) (assoc acc k (str av dv))
+               (and (number? av) (number? dv)) (assoc acc k (+ av dv))
+               (and (map? av) (map? dv))       (assoc acc k (accumulate-delta av dv))
+               (and (sequential? av) (sequential? dv))
+               (if (and (every? #(or (string? %) (number? %)) av)
+                        (or (seq av) (not (indexed-entries? dv))))
+                 (assoc acc k (into (vec av) dv))
+                 (assoc acc k (reduce merge-indexed-entry (vec av) dv)))
+               :else (assoc acc k av))))))
+     (if (map? acc) acc {})
+     delta)))
+
+(defn- choice-index [choice]
+  (let [i (get choice "index")] (if (integer? i) i 0)))
+
+(defn- choice-snapshot
+  "A chunk choice as a completion choice: its fields minus \"delta\", plus
+   \"message\" accumulated from the delta."
+  [choice]
+  (assoc (dissoc choice "delta") "message" (accumulate-delta {} (get choice "delta"))))
+
+(defn- merge-logprobs
+  "_accumulate_chunk's logprobs rule: the first non-null logprobs object is
+   taken as {content, refusal}; later non-empty content/refusal arrays are
+   appended."
+  [choice lp]
+  (if (nil? (get choice "logprobs"))
+    (assoc choice "logprobs" {"content" (get lp "content") "refusal" (get lp "refusal")})
+    (cond-> choice
+      (py-truthy? (get lp "content")) (update-in ["logprobs" "content"] (fnil into []) (get lp "content"))
+      (py-truthy? (get lp "refusal")) (update-in ["logprobs" "refusal"] (fnil into []) (get lp "refusal")))))
+
+(defn- fold-choice [choices choice]
+  (let [idx (choice-index choice)
+        pos (first (keep-indexed (fn [i c] (when (= idx (choice-index c)) i)) choices))]
+    (if (nil? pos)
+      ;; A choice first seen now is built whole from this chunk (finish_reason
+      ;; and logprobs included), so its logprobs are not appended twice.
+      (vec (sort-by choice-index (conj choices (choice-snapshot choice))))
+      (let [fr (get choice "finish_reason")
+            lp (get choice "logprobs")]
+        (cond-> (update-in choices [pos "message"] accumulate-delta (get choice "delta"))
+          (py-truthy? fr) (assoc-in [pos "finish_reason"] fr)
+          (some? lp)      (update pos merge-logprobs lp))))))
+
+(defn accumulate-chat-completion-chunk
+  "Reducing fn folding chat.completion.chunk maps into one ChatCompletion
+   map (pure), a port of openai-python's `ChatCompletionStreamState`:
+
+     - the first chunk seeds the completion: its fields (minus
+       \"obfuscation\"), \"object\" \"chat.completion\", \"system_fingerprint\"
+       defaulting to null;
+     - choices are merged by \"index\" into a vector sorted by index. The
+       delta merges into \"message\" (`accumulate_delta`): role and other
+       scalars set once, content and refusal concatenated, tool_calls merged
+       by their own \"index\" (id, type and function.name set, then
+       function.arguments concatenated); a truthy finish_reason replaces;
+       logprobs.content / .refusal arrays are appended;
+     - \"usage\" and \"system_fingerprint\" are taken from every chunk, so the
+       stream_options.include_usage chunk (empty choices, sent last) sets
+       usage;
+     - a chunk whose \"object\" is not \"chat.completion.chunk\" (e.g. Azure's
+       asynchronous content-filter events) is skipped, as the SDK does;
+     - a chunk with a top-level \"error\" object throws
+       :tools.agents.openai/stream-error.
+
+   `completion-text` works on the result. Arities: [] -> nil, [acc] -> acc,
+   [acc chunk] -> acc."
+  ([] nil)
+  ([acc] acc)
+  ([acc chunk]
+   (when-let [e (stream-event-error "accumulate-chat-completion-chunk" chunk nil)] (throw e))
+   (cond
+     (not (and (map? chunk) (= "chat.completion.chunk" (get chunk "object"))))
+     acc
+
+     (nil? acc)
+     (merge {"system_fingerprint" nil}
+            (-> chunk
+                (dissoc "obfuscation")
+                (assoc "object" "chat.completion"
+                       "choices" (reduce fold-choice [] (filter map? (get chunk "choices"))))))
+
+     :else
+     (-> acc
+         (update "choices" #(reduce fold-choice (if (vector? %) % []) (filter map? (get chunk "choices"))))
+         (assoc "usage" (get chunk "usage")
+                "system_fingerprint" (get chunk "system_fingerprint"))))))
+
+(defn accumulate-chat-completion-stream
+  "Reduce `chunks` — a `chat-completions-stream` reducible (consumed and
+   closed) or any collection of chunk maps — with
+   `accumulate-chat-completion-chunk`. Returns the ChatCompletion map, or nil
+   for no chunks. Given the stream itself, the result's metadata records
+   whether it ended at `data: [DONE]` (see `stream-complete?`). Never throws
+   on truncation."
+  [chunks]
+  (let [r (transduce identity accumulate-chat-completion-chunk chunks)]
+    (if (and (some? r) (satisfies? stream/EventStream chunks))
+      (vary-meta r assoc ::stream-complete? (= :done (stream/outcome chunks)))
+      r)))
 
 ;; ---------------------------------------------------------------------------
 ;; Public API — response accessors

@@ -224,7 +224,9 @@ header, no query string) plus Microsoft's documentation.
 | `timeout` (default 10 min) / `APITimeoutError` | *(not implemented)* | Each runtime's HTTP leaf uses its own default timeout; a timeout surfaces as `:tools.agents.openai/api-connection-error` (which is also where Python's `APITimeoutError` sits in the hierarchy, as a subclass of `APIConnectionError`) and is retried like any other transport failure, exactly as the SDK does. |
 | `client.responses.create(..., stream=True)` | `(responses-stream client params)` | Single-use reducible of decoded event maps, opened (and retried) at call time through `request!`. `:stream true` on `responses-create` is still rejected. See Streaming below. |
 | `ResponseStreamState.accumulate_event` / `stream.get_final_response()` | `(accumulate-response-event acc event)` / `(accumulate-response-stream s)` + `(stream-complete? r)` | Final Response from `response.completed`/`failed`/`incomplete`; assembled from deltas when the stream is cut off. `output-text` works on both. |
-| `client.responses.stream(...)` helper events (`snapshot`, `parsed`, `text_format`) | *(not implemented)* | Raw events plus the accumulator only; no structured-output parsing. |
+| `client.chat.completions.create(..., stream=True)` | `(chat-completions-stream client params)` | Single-use reducible of decoded `chat.completion.chunk` maps until `data: [DONE]`; same opening, retries and errors as `responses-stream`. `:stream true` on `chat-completions-create` is still rejected. |
+| `ChatCompletionStreamState.handle_chunk` / `get_final_completion()` | `(accumulate-chat-completion-chunk acc chunk)` / `(accumulate-chat-completion-stream s)` + `(stream-complete? r)` | ChatCompletion-shaped map (`"object" "chat.completion"`): choices merged by index, `delta` merged by `accumulate_delta` (content/refusal concatenated, `tool_calls` by index with `function.arguments` concatenated), `finish_reason`, `logprobs` arrays, `usage` from the `include_usage` chunk. `completion-text` works on it. Complete means the stream hit `[DONE]`, visible to `stream-complete?` only when the stream itself is passed; for a wrapped stream check `(stream/outcome s)`. |
+| `client.responses.stream(...)` / `client.chat.completions.stream(...)` helper events (`snapshot`, `parsed`, `response_format`/`text_format`) | *(not implemented)* | Raw events plus the accumulators only; no structured-output parsing. |
 | `client.embeddings.create(**params)` | `(tools.agents.openai.embeddings/embeddings-create client params)` | `POST /embeddings` (`resources/embeddings.py`). Omitted `encoding_format` → sent as `"base64"` and each string `data[].embedding` decoded as little-endian float32 into doubles (`lib/_parsing/_embeddings.py`); an explicit `"float"`/`"base64"` is returned untouched. Empty `data` with the implicit format → `:tools.agents.openai/invalid-response`. Helper: `decode-embedding-base64`. |
 | `client.webhooks.verify_signature(payload, headers, secret=, tolerance=300)` / `client.webhooks.unwrap(payload, headers, secret=)` | `(tools.agents.openai.webhooks/verify-signature payload headers {:secret :tolerance :now-s})` / `(tools.agents.openai.webhooks/unwrap payload headers opts)` | Pure, no HTTP (`lib/_webhooks.py`). Standard Webhooks HMAC-SHA256 over `{webhook-id}.{webhook-timestamp}.{body}`; `payload` must be the raw body (String or `byte[]`). Two-sided 300 s window, `whsec_` secrets base64-decoded (others used as raw bytes), space-separated `v1,<b64>` or bare signatures, constant-time compare. Secret: `:secret` → `(:webhook-secret client)` (pass `{:client c}` in opts; `client` resolves `:webhook-secret` → `OPENAI_WEBHOOK_SECRET`, as `_client.py` does for `webhook_secret`) → `OPENAI_WEBHOOK_SECRET`. `unwrap` returns the event parsed by `read-json`. |
 | `client.realtime.client_secrets.create(**params)` | `(tools.agents.openai.realtime/realtime-client-secrets-create client params)` | `POST /realtime/client_secrets` (`resources/realtime/client_secrets.py`); `expires_after` / `session` pass through verbatim. |
@@ -419,11 +421,25 @@ See [divergences.md](divergences.md) for the per-contract table across all four 
 ;; => the final Response; (oai/output-text r), (oai/stream-complete? r)
 ```
 
-`responses-stream` POSTs the `responses-create` map with `"stream" true`
-(a caller's `:stream` key is replaced). Sources: the streaming guide
+```clojure
+(let [s (oai/chat-completions-stream client {"model" "gpt-6-astra" "messages" msgs
+                                             "stream_options" {"include_usage" true}})
+      r (oai/accumulate-chat-completion-stream s)]   ; pass the stream itself
+  [(oai/completion-text r) (get r "usage") (oai/stream-complete? r)])
+```
+
+Chat completeness is `data: [DONE]`, a transport fact the chunks never carry:
+`stream-complete?` sees it only when `accumulate-chat-completion-stream` gets
+the stream itself. If you wrap the stream (an `eduction` printing deltas, a
+`take`), check `(= :done (tools.agents.stream/outcome s))` instead.
+
+`responses-stream` / `chat-completions-stream` POST the `responses-create` /
+`chat-completions-create` map with `"stream" true` (a caller's `:stream` key
+is replaced). Sources: the streaming guide
 (`developers.openai.com/api/docs/guides/streaming-responses`), the Responses
-streaming-events reference, and openai-python @ `d421d7a`
-(`src/openai/_streaming.py`, `lib/streaming/responses/_responses.py`).
+and Chat Completions streaming-events references, and openai-python @
+`d421d7a` (`src/openai/_streaming.py`, `lib/streaming/responses/_responses.py`,
+`lib/streaming/chat/_completions.py`, `lib/streaming/_deltas.py`).
 
 - **Opening.** The request goes out when the function is called, through
   `request!` with `:as :stream` as `tools.agents.stream/open-event-stream`'s
@@ -447,7 +463,7 @@ streaming-events reference, and openai-python @ `d421d7a`
   second reduce throws `:tools.agents.stream/consumed`. An unreduced stream
   is released with `(tools.agents.stream/close! s)`, also the cross-thread
   cancel. No resume: a dropped stream is not reopened.
-- **Accumulator.** `accumulate-response-event` is a pure reducing fn
+- **Responses accumulator.** `accumulate-response-event` is a pure reducing fn
   (`[]`, `[acc]`, `[acc event]`) ported from `ResponseStreamState`. The
   result is the `response` of the terminal event (`response.completed`,
   `response.failed`, `response.incomplete`); a failed or incomplete
@@ -460,16 +476,32 @@ streaming-events reference, and openai-python @ `d421d7a`
   `function_call_arguments.delta`, with each `*.done` replacing the
   accumulated value. `output` and message `content` are vectors, so
   `output-text` reads partial results too.
-- **Truncation.** A stream cut off at an event boundary reduces normally and
+- **Chat Completions accumulator.** `accumulate-chat-completion-chunk` ports
+  `ChatCompletionStreamState._accumulate_chunk`: the first chunk seeds the
+  completion (minus `obfuscation`, `"object" "chat.completion"`); each
+  choice's `delta` merges into `message` by `accumulate_delta` (strings
+  concatenate, `index`/`type` replace, indexed lists such as `tool_calls`
+  merge entry by `index`); a truthy `finish_reason` replaces; `logprobs`
+  `content`/`refusal` arrays append; `usage` and `system_fingerprint` follow
+  the latest chunk, so the `include_usage` chunk (empty `choices`, sent last)
+  sets `usage`. Chunks whose `object` is not `chat.completion.chunk` (Azure's
+  async content filter) are skipped, as in the SDK.
+- **Truncation.** A stream cut off at an event boundary reduces normally.
+  Responses has no end marker on the wire besides its terminal event, so
   `(tools.agents.stream/outcome s)` is `:eof` for complete and cut-off
-  Responses streams alike. `stream-complete?` on the accumulated result
-  (metadata set by the terminal event) is the signal; the accumulator never
-  throws on truncation.
+  Responses streams alike, and `stream-complete?` reads the metadata the
+  terminal event sets. Chat ends with `data: [DONE]`, which `outcome` reports
+  as `:done`; `accumulate-chat-completion-stream` copies that into the
+  result's metadata only when handed the stream itself (a collection or an
+  `eduction` over the stream is never complete; check `outcome` directly).
+  Neither accumulator throws on truncation.
 - **Deviations from openai-python.** A delta for an output item that was
   never added is ignored (the SDK raises `RuntimeError`); a text delta with
   no `content_part.added` creates an `output_text` part; no
   `text_format`/`parsed` structured-output parsing and no `snapshot` fields
-  on delta events.
+  on delta events. Chat choices are matched by their `index` field and kept
+  sorted (the SDK indexes the list positionally), and a choice first seen
+  after the first chunk does not get its `logprobs` appended twice.
 
 ### Requiring `examples/` from the tests
 
@@ -627,17 +659,20 @@ codec's error contract, credential
 resolution, client construction, `output-text`, `completion-text`, the full
 retry policy — `parse-retry-after-ms` including HTTP-dates and leap days,
 `should-retry?`, the `retry-delay-ms` backoff curve and jitter bounds —
-message helpers, `:stream true` rejection, the Responses stream accumulator)
+message helpers, `:stream true` rejection, both stream accumulators)
 — zero I/O, zero network, zero sleeping (the clock and the RNG are
 injected), identical on both runtimes.
 
-`test/tools/agents/openai/stream_test.cljc` drives `responses-stream`
-against the streaming mock server on OS-assigned ports (bind 0, so it never
+`test/tools/agents/openai/stream_test.cljc` drives `responses-stream` and
+`chat-completions-stream` against the streaming mock server on OS-assigned ports (bind 0, so it never
 collides with the fixed bands below): request body and headers, incremental
 delivery, the docs-derived `openai-responses-function-call.sse` fixture,
 failed/incomplete terminal events, `error` event typing, HTTP errors and
 retries before the stream, the credential-source 401 retry, truncation,
-`[DONE]`, a mid-stream transport failure, early termination and `close!`.
+`[DONE]`, a mid-stream transport failure, early termination and `close!`;
+for chat also `[DONE]` completeness, the docs-derived
+`openai-chat-tool-calls-usage.sse` fixture (interleaved tool-call argument
+deltas, `include_usage` final chunk) and an error chunk mid-stream.
 
 `test/tools/agents/openai/live_test.cljc` runs a local mock server on both
 runtimes: request line and required headers, `OpenAI-Organization` /
