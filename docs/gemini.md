@@ -15,10 +15,9 @@ Sibling of [tools.agents.anthropic](anthropic.md) and
 [tools.agents.openai](openai.md) in this same repo — same architecture
 (single leaf for network I/O, hand-rolled portable JSON codec,
 `ex-info`-with-`:type` error hierarchy, two-runtime test matrix). The
-places where this library deliberately behaves *differently* from its two
-siblings are called out in "Divergences from tools.agents.anthropic/
-tools.agents.openai" below; they all come from following python-genai rather
-than the other two vendor SDKs.
+places where this library deliberately behaves *differently* from its
+siblings are tabulated in [divergences.md](divergences.md); they all come from
+following python-genai rather than the other vendor SDKs.
 
 ## Usage
 
@@ -210,21 +209,9 @@ no-op and exercise the retry loop's *counting* without paying real wall-clock
 prove is honored, so there is nothing finer-grained to test than "the retry
 happened."
 
-### Divergences from tools.agents.anthropic/tools.agents.openai
+### Divergences from the sibling clients
 
-| | tools.agents.anthropic | tools.agents.openai | tools.agents.gemini |
-|---|---|---|---|
-| model location | request body (`"model"` key) | request body (`"model"` key) | **URL path** — a separate `model` argument, never a request key |
-| auth header | `x-api-key` **or** `Authorization: Bearer` + `anthropic-beta` | always `Authorization: Bearer` | always `x-goog-api-key` (bare key, no scheme prefix) |
-| `output-text` on no text | **throws** `:no-text-content` | **returns `""`** (SDK's documented contract); still throws on malformed shape | **returns `nil`**, never throws — matches the SDK's `None`-returning property, not an exception |
-| default `:max-retries` | 2 | 2 | **4** — ported from python-genai's `_RETRY_ATTEMPTS = 5` (attempts, not retries) |
-| retryable statuses | 408/409/429/5xx | 408/409/429/5xx | **408/429/500/502/503/504** — 409 excluded, and not "all 5xx" (501/etc. excluded too) |
-| `Retry-After`-equivalent header | clamped `[0, 60]`s, private | `retry-after-ms`/`Retry-After` **and** `x-should-retry`, public, honored | **not implemented** — no such header found in python-genai's retry predicate |
-| request-key casing | snake_case verbatim (`max_tokens`) | snake_case verbatim (`max_output_tokens`) | **camelCase** verbatim (`maxOutputTokens`) — matches the REST API's own field names |
-
-Everything else — the JSON codec, the leaf-I/O split, `ex-info` typing
-style, and the two-runtime test harness — is
-intentionally identical.
+See [divergences.md](divergences.md) for the per-contract table across all four clients.
 
 ### Streaming is not supported
 

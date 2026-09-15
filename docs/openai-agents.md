@@ -99,7 +99,7 @@ test suite runs it instantly against a mock server) and
 | `GET /v1/agents/sessions/{id}/turns` (API reference; verified live) | `(sessions-turns-list client session-id params)` / `(sessions-turns-list client session-id)` | Newest first by default. Each turn carries `"status"` and `"error"` — the only pollable record of a failed turn. |
 | `GET /v1/agents/sessions/{id}/turns/{turn_id}` (API reference; verified live) | `(sessions-turns-retrieve client session-id turn-id)` | |
 | *(no SDK helper)* | `(latest-root-turn turns-response)` / `(turn-finished? turn)` | Pure: newest turn with `"subagent_id"` nil; terminal status check. See Streaming below. |
-| `item.content[…].text` traversal (no single SDK helper — see below) | `(items-output-text items-response)` | Concatenates every assistant `output_text` block, oldest-first when called with `{"order" "asc"}`. See its own docstring for one deliberate divergence from `tools.agents.openai/output-text`'s stricter contract. |
+| `item.content[…].text` traversal (no single SDK helper — see below) | `(items-output-text items-response)` | Concatenates every assistant `output_text` block, oldest-first when called with `{"order" "asc"}`. Deliberately more lenient than `tools.agents.openai/output-text` on a non-array `"content"`; see [divergences.md](divergences.md). |
 | `GET /v1/agents/environments/{id}` (literal endpoint text, not an SDK example) | `(environments-retrieve client environment-id)` | Poll an `openai_hosted` sandbox's provisioning state: `"provisioning"` → `"connected"`/`"failed"`. |
 | `codex exec-server --remote ... --environment-id ...` (shell, not an SDK call) | `(self-hosted-executor-command session)` | Pure function from a created self-hosted session to the executor's argv — see Self-hosted sandboxes below for what this library does and does not do here. |
 | `client.beta.agents.create/list/retrieve/delete` (saved, reusable agent config) | *(not implemented)* | No literal REST path or schema shown anywhere in OpenAI's docs — see the primary-source note above. `sessions-create`'s inline `"agent"` / `"agent_id"` fields are unaffected and pass through fine. |
@@ -111,7 +111,10 @@ test suite runs it instantly against a mock server) and
 Identical to `tools.agents.openai` in every respect but one: every request
 here also carries `OpenAI-Beta: agents=v1`. Build a client with
 `tools.agents.openai/client` and pass it to both namespaces; there is no
-separate `agents/client` constructor.
+separate `agents/client` constructor. Every contract where this namespace, or
+`tools.agents.openai` itself, differs from the other clients (headers, HTTP
+methods, error keywords, streaming) is tabulated in
+[divergences.md](divergences.md).
 
 ### Error hierarchy
 
