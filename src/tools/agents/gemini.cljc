@@ -59,13 +59,11 @@
    there is no `should-retry?`, since no header input exists to decide on.
 
    JSON: there is no JSON library available on both runtimes without
-   adding a dependency, so `write-json`/`read-json` below are the same small
-   hand-written codec as tools.agents.anthropic/tools.agents.openai. Map keys
-   are strings or keywords passed through VERBATIM (no kebab<->snake
-   conversion — camelCase request/response keys like \"generationConfig\"/
-   \"maxOutputTokens\" are typed exactly as the REST API expects). Known gap:
-   control characters other than \\n \\r \\t and backspace/form-feed are not
-   \\u00XX-escaped on output — see docs/gemini.md 'JSON: a small
+   adding a dependency, so `write-json`/`read-json` below wrap the small
+   hand-written codec shared in tools.agents.json. Map keys are strings or
+   keywords passed through VERBATIM (no kebab<->snake conversion — camelCase
+   request/response keys like \"generationConfig\"/\"maxOutputTokens\" are
+   typed exactly as the REST API expects). See docs/gemini.md 'JSON: a small
    hand-rolled codec, not a dependency'.
 
    STREAMING: not offered. The Gemini REST API's streaming variant is a
@@ -74,6 +72,7 @@
    here, only an absent function. See docs/gemini.md 'Streaming is not
    supported'."
   (:require [clojure.string :as str]
+            [tools.agents.json :as json]
             #?@(:bb [[babashka.http-client :as http]] :clj [])))
 
 ;; python-genai's HttpOptions defaults (Gemini Developer API, not Vertex):
@@ -94,224 +93,29 @@
 (defrecord GeminiClient [api-key base-url api-version max-retries])
 
 ;; ---------------------------------------------------------------------------
-;; JSON codec — pure, portable, zero dependencies. Byte-for-byte the same
-;; algorithm as tools.agents.anthropic/tools.agents.openai's own codecs
-;; (kept as separate copies rather than a shared ns — see those files' own
-;; ns docstrings for why each provider ns stays a self-contained sibling).
+;; JSON codec — tools.agents.json, bound to this namespace's error contract.
 ;; ---------------------------------------------------------------------------
 
-(defn- json-encode-error! [v]
-  (throw (ex-info (str "tools.agents.gemini/write-json: unsupported value: " (pr-str v))
-                   {:type :tools.agents.gemini/json-encode-error})))
-
-(defn- json-key->str [k]
-  (cond
-    (string? k) k
-    (keyword? k) (name k)
-    (symbol? k) (name k)
-    :else (json-key->str (json-encode-error! k))))
-
-(defn- json-encode-string [s]
-  (str "\""
-       (-> s
-           (str/replace "\\" "\\\\")   ;; MUST run first — later rules insert backslashes
-           (str/replace "\"" "\\\"")
-           (str/replace "\n" "\\n")
-           (str/replace "\r" "\\r")
-           (str/replace "\t" "\\t")
-           (str/replace "\b" "\\b")
-           (str/replace "\f" "\\f"))
-       "\""))
+(def ^:private json-codec
+  (json/codec {:prefix      "tools.agents.gemini"
+               :encode-type :tools.agents.gemini/json-encode-error
+               :parse-type  :tools.agents.gemini/json-parse-error}))
 
 (defn write-json
-  "Encode a Clojure value as a JSON string. Map keys may be strings or
-   keywords (encoded via `name`, verbatim — no case conversion). Keyword
-   values are encoded the same way as strings."
+  "Encode a Clojure value as a JSON string (tools.agents.json/write-json). Map
+   keys may be strings or keywords, encoded verbatim; every character below
+   0x20 is \\u00XX-escaped. Throws ex-info
+   {:type :tools.agents.gemini/json-encode-error} on an unsupported value."
   [v]
-  (cond
-    (nil? v) "null"
-    (true? v) "true"
-    (false? v) "false"
-    (string? v) (json-encode-string v)
-    (keyword? v) (json-encode-string (name v))
-    (and (number? v) (ratio? v)) (json-encode-error! v)
-    (number? v) (str v)
-    (map? v) (str "{" (str/join "," (map (fn [[k val]] (str (json-encode-string (json-key->str k)) ":" (write-json val))) v)) "}")
-    (or (vector? v) (list? v) (seq? v)) (str "[" (str/join "," (map write-json v)) "]")
-    :else (json-encode-error! v)))
-
-(defn- json-parse-error! [msg]
-  (throw (ex-info (str "tools.agents.gemini/read-json: " msg)
-                   {:type :tools.agents.gemini/json-parse-error})))
-
-(defn- ws-char? [c] (contains? #{" " "\t" "\n" "\r"} c))
-(defn- digit-str? [c] (contains? #{"0" "1" "2" "3" "4" "5" "6" "7" "8" "9"} c))
-
-(defn- peek-char [s i]
-  (when (< i (count s)) (subs s i (inc i))))
-
-(defn- skip-ws [s i]
-  (let [n (count s)]
-    (loop [i i]
-      (if (and (< i n) (ws-char? (subs s i (inc i))))
-        (recur (inc i))
-        i))))
-
-(declare parse-value)
-
-(defn- parse-literal [s i lit val]
-  (let [end (+ i (count lit))]
-    (if (and (<= end (count s)) (= (subs s i end) lit))
-      [val end]
-      (json-parse-error! (str "invalid literal at position " i)))))
-
-(defn- json-int-leading-zero?
-  "True when tok is an integer token (no '.'/'e'/'E') with a disallowed
-   leading zero, e.g. \"010\" or \"-010\". JSON's own number grammar forbids
-   this shape, but Clojure's reader silently treats such tokens as *octal*
-   literals (\"010\" -> 8) — so parse-number must reject them itself rather
-   than hand them to `read-string`."
-  [tok]
-  (let [digits (if (str/starts-with? tok "-") (subs tok 1) tok)]
-    (and (> (count digits) 1)
-         (str/starts-with? digits "0")
-         (every? digit-str? (map str digits)))))
-
-(defn- parse-number [s i]
-  (let [n (count s) start i]
-    (loop [j i]
-      (if (and (< j n)
-               (let [c (subs s j (inc j))]
-                 (or (digit-str? c) (contains? #{"-" "+" "." "e" "E"} c))))
-        (recur (inc j))
-        (if (= j start)
-          (json-parse-error! (str "invalid number at position " i))
-          (let [tok (subs s start j)]
-            (if (and (not (str/includes? tok "."))
-                     (not (str/includes? tok "e"))
-                     (not (str/includes? tok "E"))
-                     (json-int-leading-zero? tok))
-              (json-parse-error! (str "invalid number (leading zero) at position " i))
-              [(read-string tok) j])))))))
-
-(defn- parse-string-escaped
-  "Slow path for a JSON string that actually contains a backslash escape:
-   accumulate decoded pieces and join them. i points at the opening quote."
-  [s i]
-  (let [n (count s)]
-    (loop [j (inc i) pieces []]
-      (when (>= j n) (json-parse-error! "unterminated string"))
-      (let [c (subs s j (inc j))]
-        (cond
-          (= c "\"") [(str/join "" pieces) (inc j)]
-
-          (= c "\\")
-          (do
-            (when (>= (inc j) n) (json-parse-error! "unterminated escape"))
-            (let [esc (subs s (inc j) (+ j 2))]
-              (cond
-                (= esc "\"") (recur (+ j 2) (conj pieces "\""))
-                (= esc "\\") (recur (+ j 2) (conj pieces "\\"))
-                (= esc "/")  (recur (+ j 2) (conj pieces "/"))
-                (= esc "n")  (recur (+ j 2) (conj pieces "\n"))
-                (= esc "r")  (recur (+ j 2) (conj pieces "\r"))
-                (= esc "t")  (recur (+ j 2) (conj pieces "\t"))
-                (= esc "b")  (recur (+ j 2) (conj pieces "\b"))
-                (= esc "f")  (recur (+ j 2) (conj pieces "\f"))
-                (= esc "u")
-                (do
-                  (when (> (+ j 6) n) (json-parse-error! "unterminated unicode escape"))
-                  (let [hex (subs s (+ j 2) (+ j 6))
-                        code (Integer/parseInt hex 16)]
-                    (recur (+ j 6) (conj pieces (str (char code))))))
-                :else (json-parse-error! (str "invalid escape at position " j)))))
-
-          ;; Literal run: take it to the next quote or backslash in ONE piece
-          ;; rather than one piece per character, so the piece count tracks the
-          ;; number of escapes rather than the length of the string.
-          :else
-          (let [k (loop [k j]
-                    (if (or (>= k n)
-                            (= (subs s k (inc k)) "\"")
-                            (= (subs s k (inc k)) "\\"))
-                      k
-                      (recur (inc k))))]
-            (recur k (conj pieces (subs s j k)))))))))
-
-(defn- parse-string
-  "Decode a JSON string starting at the opening quote i. Fast path: scan to the
-   closing quote and, if no backslash was seen on the way, one `subs` IS the
-   result — no per-character work at all. Only a string that actually contains
-   an escape falls through to parse-string-escaped."
-  [s i]
-  (let [n (count s)]
-    (loop [j (inc i)]
-      (if (>= j n)
-        (json-parse-error! "unterminated string")
-        (let [c (subs s j (inc j))]
-          (cond
-            (= c "\"") [(subs s (inc i) j) (inc j)]
-            (= c "\\") (parse-string-escaped s i)
-            :else (recur (inc j))))))))
-
-(defn- parse-array [s i]
-  (let [i (skip-ws s (inc i))] ;; skip '['
-    (if (= (peek-char s i) "]")
-      [[] (inc i)]
-      (loop [i i acc []]
-        (let [[v i2] (parse-value s i)
-              acc (conj acc v)
-              i3 (skip-ws s i2)
-              c (peek-char s i3)]
-          (cond
-            (= c ",") (recur (skip-ws s (inc i3)) acc)
-            (= c "]") [acc (inc i3)]
-            :else (json-parse-error! (str "expected ',' or ']' at position " i3))))))))
-
-(defn- parse-object [s i]
-  (let [i (skip-ws s (inc i))] ;; skip '{'
-    (if (= (peek-char s i) "}")
-      [{} (inc i)]
-      (loop [i i acc {}]
-        (when (not= (peek-char s i) "\"") (json-parse-error! (str "expected string key at position " i)))
-        (let [[k i2] (parse-string s i)
-              i3 (skip-ws s i2)]
-          (when (not= (peek-char s i3) ":") (json-parse-error! (str "expected ':' at position " i3)))
-          (let [i4 (skip-ws s (inc i3))
-                [v i5] (parse-value s i4)
-                acc (assoc acc k v)
-                i6 (skip-ws s i5)
-                c (peek-char s i6)]
-            (cond
-              (= c ",") (recur (skip-ws s (inc i6)) acc)
-              (= c "}") [acc (inc i6)]
-              :else (json-parse-error! (str "expected ',' or '}' at position " i6)))))))))
-
-(defn- parse-value [s i]
-  (let [i (skip-ws s i)
-        c (peek-char s i)]
-    (cond
-      (nil? c) (json-parse-error! "unexpected end of input")
-      (= c "{") (parse-object s i)
-      (= c "[") (parse-array s i)
-      (= c "\"") (parse-string s i)
-      (= c "t") (parse-literal s i "true" true)
-      (= c "f") (parse-literal s i "false" false)
-      (= c "n") (parse-literal s i "null" nil)
-      (or (digit-str? c) (= c "-")) (parse-number s i)
-      :else (json-parse-error! (str "unexpected character '" c "' at position " i)))))
+  ((:write json-codec) v))
 
 (defn read-json
-  "Decode a JSON string into a Clojure value: objects become maps with STRING
-   keys, arrays become vectors, numbers stay numbers (ints stay integers).
-   Throws ex-info {:type :tools.agents.gemini/json-parse-error} on malformed
-   input — never returns a partial result."
+  "Decode a JSON string into a Clojure value (tools.agents.json/read-json):
+   objects become maps with STRING keys, arrays become vectors, numbers stay
+   numbers. Throws ex-info {:type :tools.agents.gemini/json-parse-error} on
+   malformed input — never returns a partial result."
   [s]
-  (try
-    (first (parse-value s (skip-ws s 0)))
-    (catch Exception e
-      (throw (ex-info (str "tools.agents.gemini/read-json: malformed JSON: " (str e))
-                       {:type :tools.agents.gemini/json-parse-error})))))
+  ((:read json-codec) s))
 
 ;; ---------------------------------------------------------------------------
 ;; I/O leaves — `http-post!` is the only runtime-specific function in this

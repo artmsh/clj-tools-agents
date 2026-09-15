@@ -223,13 +223,13 @@ flag, so there is simply no streaming function offered at all.
 ### JSON: a small hand-rolled codec, not a dependency
 
 There is no JSON library available on both runtimes without adding a
-dependency, so `write-json`/`read-json` in `tools/agents/gemini.cljc` are the
-same small hand-written codec as the two siblings (byte-for-byte identical
-algorithm, kept as a separate copy rather than a shared ns — see
-`gemini.cljc`'s own ns docstring). It supports exactly what this API needs
-and decodes JSON objects into maps with **string** keys. Known gap: control
-characters other than `\n \r \t` and backspace/form-feed are not
-`\u00XX`-escaped on output.
+dependency, so `write-json`/`read-json` in `tools/agents/gemini.cljc` are thin
+wrappers over the shared hand-written codec the two siblings also use,
+`tools.agents.json` (see the README's "JSON: one shared hand-rolled codec"
+section). It decodes JSON objects into maps with **string** keys. The
+wrappers throw this namespace's own `:tools.agents.gemini/json-encode-error`
+/ `json-parse-error` with `tools.agents.gemini/write-json: ` /
+`tools.agents.gemini/read-json: ` message prefixes.
 
 ### Isolating runtime-specific I/O
 
@@ -241,7 +241,9 @@ apply here verbatim, including the HTTP/1.1 pin).
 
 ## Testing
 
-`test/tools/agents/gemini_test.cljc` is pure logic (JSON codec, credential
+The shared JSON codec itself is covered by `test/tools/agents/json_test.cljc`
+in the core suite (`-M:test-core` / `bb test-core`). `test/tools/agents/gemini_test.cljc` is pure logic (the JSON
+codec's error contract, credential
 resolution, `output-text`, the retry policy's `retryable-status?`/
 `retry-delay-ms`, contents-list helpers) — zero I/O, zero network, zero
 sleeping (the RNG is injected), identical on both runtimes.

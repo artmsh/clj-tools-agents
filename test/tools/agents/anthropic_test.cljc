@@ -9,97 +9,22 @@
 ;; JSON codec
 ;; ---------------------------------------------------------------------------
 
-(deftest write-json-scalars
-  (is (= "null" (a/write-json nil)))
-  (is (= "true" (a/write-json true)))
-  (is (= "false" (a/write-json false)))
-  (is (= "42" (a/write-json 42)))
-  (is (= "1.5" (a/write-json 1.5)))
-  (is (= "\"hi\"" (a/write-json "hi")))
-  (is (= "\"hi\"" (a/write-json :hi))))
+;; Codec behaviour is tested once, in tools.agents.json-test. This pins the
+;; wrapper wiring and this namespace's documented error contract.
 
-(deftest write-json-string-escaping
-  (is (= "\"a\\nb\"" (a/write-json "a\nb")))
-  (is (= "\"a\\tb\"" (a/write-json "a\tb")))
-  (is (= "\"a\\\"b\"" (a/write-json "a\"b")))
-  (is (= "\"a\\\\b\"" (a/write-json "a\\b"))))
-
-(deftest write-json-collections
-  (is (= "[1,2,3]" (a/write-json [1 2 3])))
-  (is (= "[1,2,3]" (a/write-json '(1 2 3))))
-  (is (contains? #{"{\"a\":1,\"b\":2}" "{\"b\":2,\"a\":1}"} (a/write-json {:a 1 "b" 2})))
-  (is (= "{\"max_tokens\":10}" (a/write-json {:max_tokens 10}))))
-
-(deftest write-json-rejects-unsupported
-  (is (thrown? Exception (a/write-json (fn [])))))
-
-(deftest write-json-rejects-ratios
-  ;; A bare ratio (e.g. from ordinary integer division on JVM/bb) would
-  ;; otherwise be stringified as unquoted `n/d` — syntactically invalid JSON.
-  (let [e (try (a/write-json {"max_tokens" 2/3}) nil (catch Exception e e))]
-    (is (some? e))
-    (is (= :tools.agents.anthropic.error/json-encode (:type (ex-data e))))))
-
-(deftest read-json-scalars
-  (is (= nil (a/read-json "null")))
-  (is (= true (a/read-json "true")))
-  (is (= false (a/read-json "false")))
-  (is (= 42 (a/read-json "42")))
-  (is (integer? (a/read-json "42")))
-  (is (= 1.5 (a/read-json "1.5")))
-  (is (= "hi" (a/read-json "\"hi\""))))
-
-(deftest read-json-string-escapes
-  (is (= "a\nb" (a/read-json "\"a\\nb\"")))
-  (is (= "a\tb" (a/read-json "\"a\\tb\"")))
-  (is (= "a\"b" (a/read-json "\"a\\\"b\"")))
-  (is (= "a\\b" (a/read-json "\"a\\\\b\"")))
-  (is (= "é" (a/read-json "\"\\u00e9\""))))
-
-(deftest read-json-collections
-  (is (= [1 2 3] (a/read-json "[1,2,3]")))
-  (is (vector? (a/read-json "[1,2,3]")))
-  (is (= {} (a/read-json "{}")))
-  (is (= [] (a/read-json "[]")))
-  (is (= {"a" 1 "b" [1 2 {"c" true}]} (a/read-json "{\"a\":1,\"b\":[1,2,{\"c\":true}]}"))))
-
-(deftest read-json-object-keys-are-strings
-  (let [decoded (a/read-json "{\"model\":\"x\"}")]
-    (is (= "x" (get decoded "model")))
-    (is (not (contains? decoded :model)))))
-
-(deftest read-json-roundtrip
-  (let [v {"model" "claude" "max_tokens" 10 "messages" [{"role" "user" "content" "hi"}]
-           "temperature" 1.0 "ok" true "nothing" nil}]
-    (is (= v (a/read-json (a/write-json v))))))
-
-(deftest read-json-rejects-leading-zero-numbers
-  ;; JSON's number grammar forbids a leading zero followed by more digits;
-  ;; Clojure's reader would otherwise silently misread such a token as an
-  ;; *octal* literal ("010" -> 8) if handed straight to read-string.
-  (doseq [bad ["010" "-010" "{\"input_tokens\":010}"]]
-    (testing bad
+(deftest json-codec-error-contract
+  (is (= {"a" [1 "x"]} (a/read-json (a/write-json {:a [1 "x"]}))))
+  (testing "every character below 0x20 is \\u00XX-escaped"
+    (is (= "\"a\\u0001b\"" (a/write-json (str "a" (char 1) "b")))))
+  (testing "encode"
+    (let [e (try (a/write-json {"n" 2/3}) nil (catch Exception e e))]
+      (is (= :tools.agents.anthropic.error/json-encode (:type (ex-data e))))
+      (is (clojure.string/starts-with? (ex-message e) "tools.agents.anthropic/write-json: "))))
+  (testing "parse"
+    (doseq [bad ["{bad" "010"]]
       (let [e (try (a/read-json bad) nil (catch Exception e e))]
-        (is (some? e))
-        (is (= :tools.agents.anthropic.error/json-parse (:type (ex-data e))))))))
-
-(deftest read-json-decodes-a-long-string-value-without-crashing
-  ;; Regression guard: parse-string used to collect every character of a
-  ;; JSON string value into a vector and spread it through `(apply str
-  ;; pieces)` — one argument per character. str/join has no such arg-count
-  ;; limit.
-  (let [long-text (clojure.string/join (repeat 1500 "x"))]
-    (is (= long-text (a/read-json (a/write-json long-text)))))
-  ;; Longer, and through the escaped slow path too (every 10th char is an
-  ;; escape) — the fast path returns one `subs`, the slow path accumulates
-  ;; whole literal runs, and both must round-trip identically.
-  (doseq [n [5000 50000]]
-    (testing (str "plain, " n " chars")
-      (let [text (clojure.string/join (repeat n "x"))]
-        (is (= text (get (a/read-json (str "{\"t\":" (a/write-json text) "}")) "t")))))
-    (testing (str "escaped, " n " chars")
-      (let [text (clojure.string/join (repeat (quot n 10) "abcdefghi\n"))]
-        (is (= text (get (a/read-json (str "{\"t\":" (a/write-json text) "}")) "t")))))))
+        (is (= :tools.agents.anthropic.error/json-parse (:type (ex-data e))) bad)
+        (is (clojure.string/starts-with? (ex-message e) "tools.agents.anthropic/read-json: ") bad)))))
 
 (deftest output-text-concatenates-many-blocks-without-crashing
   ;; Same arg-count trap as read-json's, one argument per text BLOCK rather
@@ -108,14 +33,6 @@
   ;; limit.
   (let [content (vec (repeat 5000 {"type" "text" "text" "ab"}))]
     (is (= (* 2 5000) (count (a/output-text {"content" content}))))))
-
-(deftest read-json-malformed-throws
-  (doseq [bad ["{bad" "[1,2" "\"unterminated" "not json at all" "{\"a\":}" "{\"a\" 1}"]]
-    (testing bad
-      (let [e (try (a/read-json bad) nil (catch Exception e e))]
-        (is (some? e))
-        (is (= :tools.agents.anthropic.error/json-parse (:type (ex-data e))))
-        (is (clojure.string/starts-with? (str (ex-message e)) "tools.agents.anthropic/read-json: "))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Credential resolution (pure — env access is injected, real env untouched)

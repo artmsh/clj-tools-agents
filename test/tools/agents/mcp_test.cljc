@@ -56,19 +56,22 @@
 ;; JSON codec
 ;; ---------------------------------------------------------------------------
 
-(deftest write-json-scalars
-  (is (= "null" (mcp/write-json nil)))
-  (is (= "true" (mcp/write-json true)))
-  (is (= "false" (mcp/write-json false)))
-  (is (= "42" (mcp/write-json 42)))
-  (is (= "\"hi\"" (mcp/write-json "hi")))
-  (is (= "\"hi\"" (mcp/write-json :hi))))
+;; Codec behaviour is tested once, in tools.agents.json-test. This pins the
+;; wrapper wiring and this namespace's documented error contract.
 
-(deftest write-json-collections
-  (is (= "[1,2,3]" (mcp/write-json [1 2 3])))
-  (is (= "[1,2,3]" (mcp/write-json '(1 2 3))))
-  (is (= "{\"a\":1}" (mcp/write-json {:a 1})))
-  (is (= "{}" (mcp/write-json {}))))
+(deftest json-codec-error-contract
+  (is (= {"a" [1 "x"]} (mcp/read-json (mcp/write-json {:a [1 "x"]}))))
+  (testing "every character below 0x20 is \\u00XX-escaped"
+    (is (= "\"a\\u0001b\"" (mcp/write-json (str "a" (char 1) "b")))))
+  (testing "encode"
+    (let [e (try (mcp/write-json {"n" 2/3}) nil (catch Exception e e))]
+      (is (= :tools.agents.mcp.error/json-encode (:type (ex-data e))))
+      (is (str/starts-with? (ex-message e) "tools.agents.mcp/write-json: "))))
+  (testing "parse"
+    (doseq [bad ["{bad" "010"]]
+      (let [e (try (mcp/read-json bad) nil (catch Exception e e))]
+        (is (= :tools.agents.mcp.error/json-parse (:type (ex-data e))) bad)
+        (is (str/starts-with? (ex-message e) "tools.agents.mcp/read-json: ") bad)))))
 
 (deftest write-json-escapes-every-control-character
   ;; stdio frames one message per LINE. A tool that echoes a newline back must
@@ -85,25 +88,6 @@
     (let [line (mcp/write-json (mcp/result-response 1 (mcp/tool-result "x\ny\r\nz")))]
       (is (not (str/includes? line "\n")))
       (is (not (str/includes? line "\r"))))))
-
-(deftest read-json-round-trips
-  (doseq [v [nil true false 42 -7 "hi" "a\nb" "äöü" "日本語" "🎉" []
-             [1 "two" nil] {} {"a" 1 "b" [true nil]}]]
-    (is (= v (mcp/read-json (mcp/write-json v))) (pr-str v))))
-
-(deftest read-json-decodes-unicode-escapes
-  (is (= "a\nb" (mcp/read-json "\"a\\u000ab\"")))
-  (is (= "ä" (mcp/read-json "\"\\u00e4\"")))
-  (is (= "ä" (mcp/read-json "\"ä\"")))
-  (testing "a code point above the BMP arrives as a surrogate PAIR of escapes"
-    ;; The two halves must be decoded together — a lone surrogate is not a
-    ;; character.
-    (is (= "🎉" (mcp/read-json "\"\\ud83c\\udf89\"")))
-    (is (= "a🎉b" (mcp/read-json "\"a\\ud83c\\udf89b\"")))))
-
-(deftest read-json-rejects-garbage
-  (is (thrown? Exception (mcp/read-json "{")))
-  (is (thrown? Exception (mcp/read-json "not json"))))
 
 (deftest json-key->str-normalises
   (is (= "a" (mcp/json-key->str :a)))

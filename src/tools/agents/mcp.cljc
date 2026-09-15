@@ -39,17 +39,15 @@
    The boundary between the two is exactly the boundary between 'this is a
    protocol value' and 'this is your program'.
 
-   JSON: a hand-written codec, as in the sibling libraries — there is no
-   JSON library available on both runtimes without adding a dependency. It
-   diverges from theirs in one deliberate way: `write-json`
-   here \\u00XX-escapes EVERY control character below 0x20, not just the
-   five with short escapes. That gap is cosmetic for an HTTP request body
-   but load-bearing here, because the stdio transport's framing contract is
-   'messages are delimited by newlines, and MUST NOT contain embedded
-   newlines' — a raw \\u0001 (or, before this, an unescaped exotic control
-   char) in a tool's output would produce a message that is not valid JSON
-   at all."
-  (:require [clojure.string :as str]))
+   JSON: the shared hand-written codec in tools.agents.json — there is no
+   JSON library available on both runtimes without adding a dependency.
+   `write-json` \\u00XX-escapes EVERY control character below 0x20, which is
+   load-bearing here: the stdio transport's framing contract is 'messages
+   are delimited by newlines, and MUST NOT contain embedded newlines', and a
+   raw \\u0001 in a tool's output would produce a message that is not valid
+   JSON at all."
+  (:require [clojure.string :as str]
+            [tools.agents.json :as json]))
 
 ;; ---------------------------------------------------------------------------
 ;; Protocol constants
@@ -119,242 +117,36 @@
     (boolean (and a b (>= a b)))))
 
 ;; ---------------------------------------------------------------------------
-;; JSON codec — pure, portable, zero dependencies.
+;; JSON codec — tools.agents.json, bound to this namespace's error contract.
 ;; ---------------------------------------------------------------------------
 
-(defn- json-encode-error! [v]
-  (throw (ex-info (str "tools.agents.mcp/write-json: unsupported value: " (pr-str v))
-                  {:type :tools.agents.mcp.error/json-encode})))
+(def ^:private json-codec
+  (json/codec {:prefix      "tools.agents.mcp"
+               :encode-type :tools.agents.mcp.error/json-encode
+               :parse-type  :tools.agents.mcp.error/json-parse}))
 
 (defn json-key->str
   "Coerce a map key (string/keyword/symbol) to its wire string form, verbatim
-   — no case conversion. Throws the same typed
-   {:type :tools.agents.mcp.error/json-encode} ex-info as the rest of
-   write-json on anything else."
+   — no case conversion. Throws ex-info
+   {:type :tools.agents.mcp.error/json-encode} on anything else."
   [k]
-  (cond
-    (string? k) k
-    (keyword? k) (name k)
-    (symbol? k) (name k)
-    :else (json-key->str (json-encode-error! k))))
-
-(defn- control-char? [c] (< (int c) 0x20))
-
-(defn- json-escape-controls
-  "Slow path: \\u00XX-escape every remaining character below 0x20. Entered
-   only when one is actually present, so an ordinary string pays a single
-   linear scan and no allocation."
-  [s]
-  (str/join (map (fn [c] (if (control-char? c) (format "\\u%04x" (int c)) (str c))) s)))
-
-(defn- json-encode-string [s]
-  (let [escaped (-> s
-                    (str/replace "\\" "\\\\")   ;; MUST run first — later rules insert backslashes
-                    (str/replace "\"" "\\\"")
-                    (str/replace "\n" "\\n")
-                    (str/replace "\r" "\\r")
-                    (str/replace "\t" "\\t")
-                    (str/replace "\b" "\\b")
-                    (str/replace "\f" "\\f"))]
-    (str "\""
-         (if (some control-char? escaped) (json-escape-controls escaped) escaped)
-         "\"")))
+  ((:key->str json-codec) k))
 
 (defn write-json
-  "Encode a Clojure value as a JSON string. Map keys may be strings or
-   keywords (encoded via `name`, verbatim — no case conversion). Keyword
-   values are encoded the same way as strings. The output never contains a
-   raw character below 0x20, so it is always safe as one line of the stdio
-   transport's newline-delimited framing."
+  "Encode a Clojure value as a JSON string (tools.agents.json/write-json). Map
+   keys may be strings or keywords, encoded verbatim; every character below
+   0x20 is \\u00XX-escaped. Throws ex-info
+   {:type :tools.agents.mcp.error/json-encode} on an unsupported value."
   [v]
-  (cond
-    (nil? v) "null"
-    (true? v) "true"
-    (false? v) "false"
-    (string? v) (json-encode-string v)
-    (keyword? v) (json-encode-string (name v))
-    (and (number? v) (ratio? v)) (json-encode-error! v)
-    (number? v) (str v)
-    (map? v) (str "{" (str/join "," (map (fn [[k val]] (str (json-encode-string (json-key->str k)) ":" (write-json val))) v)) "}")
-    (or (vector? v) (list? v) (seq? v)) (str "[" (str/join "," (map write-json v)) "]")
-    :else (json-encode-error! v)))
-
-(defn- json-parse-error! [msg]
-  (throw (ex-info (str "tools.agents.mcp/read-json: " msg)
-                  {:type :tools.agents.mcp.error/json-parse})))
-
-(defn- ws-char? [c] (contains? #{" " "\t" "\n" "\r"} c))
-(defn- digit-str? [c] (contains? #{"0" "1" "2" "3" "4" "5" "6" "7" "8" "9"} c))
-
-(defn- peek-char [s i]
-  (when (< i (count s)) (subs s i (inc i))))
-
-(defn- skip-ws [s i]
-  (let [n (count s)]
-    (loop [i i]
-      (if (and (< i n) (ws-char? (subs s i (inc i))))
-        (recur (inc i))
-        i))))
-
-(declare parse-value)
-
-(defn- parse-literal [s i lit val]
-  (let [end (+ i (count lit))]
-    (if (and (<= end (count s)) (= (subs s i end) lit))
-      [val end]
-      (json-parse-error! (str "invalid literal at position " i)))))
-
-(defn- json-int-leading-zero?
-  "True when tok is an integer token with a disallowed leading zero, e.g.
-   \"010\". JSON's grammar forbids it, but Clojure's reader would silently
-   treat such a token as an OCTAL literal (\"010\" -> 8)."
-  [tok]
-  (let [digits (if (str/starts-with? tok "-") (subs tok 1) tok)]
-    (and (> (count digits) 1)
-         (str/starts-with? digits "0")
-         (every? digit-str? (map str digits)))))
-
-(defn- parse-number [s i]
-  (let [n (count s) start i]
-    (loop [j i]
-      (if (and (< j n)
-               (let [c (subs s j (inc j))]
-                 (or (digit-str? c) (contains? #{"-" "+" "." "e" "E"} c))))
-        (recur (inc j))
-        (if (= j start)
-          (json-parse-error! (str "invalid number at position " i))
-          (let [tok (subs s start j)]
-            (if (and (not (str/includes? tok "."))
-                     (not (str/includes? tok "e"))
-                     (not (str/includes? tok "E"))
-                     (json-int-leading-zero? tok))
-              (json-parse-error! (str "invalid number (leading zero) at position " i))
-              [(read-string tok) j])))))))
-
-(defn- parse-string-escaped
-  "Slow path for a JSON string that actually contains a backslash escape.
-   i points at the opening quote."
-  [s i]
-  (let [n (count s)]
-    (loop [j (inc i) pieces []]
-      (when (>= j n) (json-parse-error! "unterminated string"))
-      (let [c (subs s j (inc j))]
-        (cond
-          (= c "\"") [(str/join pieces) (inc j)]
-
-          (= c "\\")
-          (do
-            (when (>= (inc j) n) (json-parse-error! "unterminated escape"))
-            (let [esc (subs s (inc j) (+ j 2))]
-              (cond
-                (= esc "\"") (recur (+ j 2) (conj pieces "\""))
-                (= esc "\\") (recur (+ j 2) (conj pieces "\\"))
-                (= esc "/")  (recur (+ j 2) (conj pieces "/"))
-                (= esc "n")  (recur (+ j 2) (conj pieces "\n"))
-                (= esc "r")  (recur (+ j 2) (conj pieces "\r"))
-                (= esc "t")  (recur (+ j 2) (conj pieces "\t"))
-                (= esc "b")  (recur (+ j 2) (conj pieces "\b"))
-                (= esc "f")  (recur (+ j 2) (conj pieces "\f"))
-                (= esc "u")
-                (do
-                  (when (> (+ j 6) n) (json-parse-error! "unterminated unicode escape"))
-                  (let [code (Integer/parseInt (subs s (+ j 2) (+ j 6)) 16)
-                        ;; A code point above the BMP is ALWAYS written as a
-                        ;; surrogate pair in JSON; recognise the pair here so
-                        ;; the two halves are re-joined rather than emitted
-                        ;; as lone surrogates.
-                        low (when (and (<= 0xD800 code 0xDBFF)
-                                       (<= (+ j 12) n)
-                                       (= "\\u" (subs s (+ j 6) (+ j 8))))
-                              (let [l (Integer/parseInt (subs s (+ j 8) (+ j 12)) 16)]
-                                (when (<= 0xDC00 l 0xDFFF) l)))]
-                    (if low
-                      (recur (+ j 12) (conj pieces (str (char code) (char low))))
-                      (recur (+ j 6) (conj pieces (str (char code)))))))
-                :else (json-parse-error! (str "invalid escape at position " j)))))
-
-          ;; Literal run: take it to the next quote or backslash in ONE piece.
-          :else
-          (let [k (loop [k j]
-                    (if (or (>= k n)
-                            (= (subs s k (inc k)) "\"")
-                            (= (subs s k (inc k)) "\\"))
-                      k
-                      (recur (inc k))))]
-            (recur k (conj pieces (subs s j k)))))))))
-
-(defn- parse-string
-  "Decode a JSON string starting at the opening quote i. Fast path: scan to
-   the closing quote and, if no backslash was seen on the way, one `subs` IS
-   the result."
-  [s i]
-  (let [n (count s)]
-    (loop [j (inc i)]
-      (if (>= j n)
-        (json-parse-error! "unterminated string")
-        (let [c (subs s j (inc j))]
-          (cond
-            (= c "\"") [(subs s (inc i) j) (inc j)]
-            (= c "\\") (parse-string-escaped s i)
-            :else (recur (inc j))))))))
-
-(defn- parse-array [s i]
-  (let [i (skip-ws s (inc i))]
-    (if (= (peek-char s i) "]")
-      [[] (inc i)]
-      (loop [i i acc []]
-        (let [[v i2] (parse-value s i)
-              acc (conj acc v)
-              i3 (skip-ws s i2)
-              c (peek-char s i3)]
-          (cond
-            (= c ",") (recur (skip-ws s (inc i3)) acc)
-            (= c "]") [acc (inc i3)]
-            :else (json-parse-error! (str "expected ',' or ']' at position " i3))))))))
-
-(defn- parse-object [s i]
-  (let [i (skip-ws s (inc i))]
-    (if (= (peek-char s i) "}")
-      [{} (inc i)]
-      (loop [i i acc {}]
-        (when (not= (peek-char s i) "\"") (json-parse-error! (str "expected string key at position " i)))
-        (let [[k i2] (parse-string s i)
-              i3 (skip-ws s i2)]
-          (when (not= (peek-char s i3) ":") (json-parse-error! (str "expected ':' at position " i3)))
-          (let [i4 (skip-ws s (inc i3))
-                [v i5] (parse-value s i4)
-                acc (assoc acc k v)
-                i6 (skip-ws s i5)
-                c (peek-char s i6)]
-            (cond
-              (= c ",") (recur (skip-ws s (inc i6)) acc)
-              (= c "}") [acc (inc i6)]
-              :else (json-parse-error! (str "expected ',' or '}' at position " i6)))))))))
-
-(defn- parse-value [s i]
-  (let [i (skip-ws s i)
-        c (peek-char s i)]
-    (cond
-      (nil? c) (json-parse-error! "unexpected end of input")
-      (= c "{") (parse-object s i)
-      (= c "[") (parse-array s i)
-      (= c "\"") (parse-string s i)
-      (= c "t") (parse-literal s i "true" true)
-      (= c "f") (parse-literal s i "false" false)
-      (= c "n") (parse-literal s i "null" nil)
-      (or (digit-str? c) (= c "-")) (parse-number s i)
-      :else (json-parse-error! (str "unexpected character '" c "' at position " i)))))
+  ((:write json-codec) v))
 
 (defn read-json
-  "Decode a JSON string into a Clojure value: objects become maps with STRING
-   keys, arrays become vectors, numbers stay numbers. Throws ex-info
-   {:type :tools.agents.mcp.error/json-parse} on malformed input."
+  "Decode a JSON string into a Clojure value (tools.agents.json/read-json):
+   objects become maps with STRING keys, arrays become vectors, numbers stay
+   numbers. Throws ex-info {:type :tools.agents.mcp.error/json-parse} on
+   malformed input — never returns a partial result."
   [s]
-  (try
-    (first (parse-value s (skip-ws s 0)))
-    (catch Exception e
-      (throw (ex-info (str "tools.agents.mcp/read-json: malformed JSON: " (str e))
-                      {:type :tools.agents.mcp.error/json-parse})))))
+  ((:read json-codec) s))
 
 ;; ---------------------------------------------------------------------------
 ;; JSON-RPC framing
