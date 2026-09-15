@@ -82,6 +82,17 @@ and openai-python's `vaults/vaults.py` / `vaults/credentials.py`. Both give
 the paths as `/vaults/...`, not `/agents/vaults/...`. The reference has no
 vault update endpoint, and no archive endpoint despite the `status`
 (`active`/`archived`) list filter. Not yet verified live.
+
+Environment templates are implemented from the reference pages
+([create](https://developers.openai.com/api/reference/resources/beta/subresources/agents/subresources/environments/subresources/templates/methods/create/index.md),
+[retrieve](https://developers.openai.com/api/reference/resources/beta/subresources/agents/subresources/environments/subresources/templates/methods/retrieve/index.md),
+[update](https://developers.openai.com/api/reference/resources/beta/subresources/agents/subresources/environments/subresources/templates/methods/update/index.md),
+[list](https://developers.openai.com/api/reference/resources/beta/subresources/agents/subresources/environments/subresources/templates/methods/list/index.md),
+[delete](https://developers.openai.com/api/reference/resources/beta/subresources/agents/subresources/environments/subresources/templates/methods/delete/index.md))
+and openai-python's `environments/templates.py`. A session uses one through
+`environment` `{"type" "openai_hosted" "environment_template_id" …}` (the
+sessions create reference: inline fields override it; a network override
+cannot broaden its policy). Not yet verified live.
 Verified live on 2026-09-15 (probe P1,
 `artifacts-and-environment-files-probe-against-the-real-api`, 16 assertions):
 artifact content arrives inline as `200` bytes (no redirect), byte-exact
@@ -228,6 +239,11 @@ test suite runs it instantly against a mock server) and
 | `client.beta.agents.sessions.artifacts.delete(artifact_id, session_id=)` — `DELETE /v1/agents/sessions/{session_id}/artifacts/{artifact_id}` | `(sessions-artifacts-delete client session-id artifact-id)` | Deletes the published copy only. Returns `{"deleted" true "object" "agent.session.artifact.deleted"}`. |
 | `client.beta.agents.environments.files.list(environment_id, **params)` — `GET /v1/agents/environments/{environment_id}/files` | `(environments-files-list client environment-id params)` / `(environments-files-list client environment-id)` | **Token paging** (`SyncTokenPage`), not `after`: response `{"object" "page" "has_more" .. "next" ..}`; pass `"page"` = `"next"`, keeping `path`/`order`/`limit`. Connected environments only. Verified live (P1, 2026-09-15). |
 | `client.beta.agents.environments.files.create(environment_id, type=, path=, data=/file_id=)` — `POST /v1/agents/environments/{environment_id}/files` | `(environments-files-create client environment-id request)` | JSON body, not multipart. `{"type" "inline" "path" .. "data" ..}` or `{"type" "file_id" "path" .. "file_id" ..}`. `"data"`: a base64 String is sent verbatim; `byte[]`/`File`/`Path` is read and std-base64-encoded. Inline ≤5 MiB before encoding (API-enforced). No delete/retrieve endpoint exists. |
+| `client.beta.agents.environments.templates.create(**params)` — `POST /v1/agents/environments/templates` | `(environments-templates-create client request)` / `(environments-templates-create client)` | All fields optional, passed through: `name`, `capability_directories`, `env`, `files`, `network`, `packages`, `plugins`, `setup_commands`, `skills`. `files` `data` must already be base64 (not encoded here, unlike `environments-files-create`). Response omits `env` and `setup_commands`. |
+| `client.beta.agents.environments.templates.retrieve(environment_template_id)` — `GET /v1/agents/environments/templates/{environment_template_id}` | `(environments-templates-retrieve client template-id)` | |
+| `client.beta.agents.environments.templates.update(environment_template_id, **params)` — `POST /v1/agents/environments/templates/{environment_template_id}` | `(environments-templates-update client template-id request)` | Same fields; `env`/`files`/`plugins`/`setup_commands`/`skills` replace; `"name" nil` clears. |
+| `client.beta.agents.environments.templates.list(**params)` — `GET /v1/agents/environments/templates` | `(environments-templates-list client params)` / `(environments-templates-list client)` | Cursor paging (`after`/`limit`/`order`), not the token paging of `environments-files-list`. |
+| `client.beta.agents.environments.templates.delete(environment_template_id)` — `DELETE /v1/agents/environments/templates/{environment_template_id}` | `(environments-templates-delete client template-id)` | `{"deleted" true "object" "agent.environment.template.deleted"}`. |
 | `client.beta.agents.vaults.create(**params)` — `POST /v1/vaults` | `(vaults-create client request)` / `(vaults-create client)` | **Root `/vaults`, not `/agents/vaults`.** `name`, `metadata`, both optional. Returns the `Vault`. Attach to a session with `sessions-create`'s `"vault_ids"`. |
 | `client.beta.agents.vaults.retrieve(vault_id)` — `GET /v1/vaults/{vault_id}` | `(vaults-retrieve client vault-id)` | |
 | `client.beta.agents.vaults.list(**params)` — `GET /v1/vaults` | `(vaults-list client params)` / `(vaults-list client)` | Cursor paging: `after`/`limit`/`order` (default `desc`), plus `status` (`"active"`, `"archived"` or a vector, sent as `status[]=…` repeats). No vault update endpoint exists. |
@@ -591,6 +607,12 @@ body sent as JSON null; and a 400 on credential create typed
 `vaults-crud-round-trip-against-the-real-api` (same gate; no inference, no
 credential) runs create → retrieve → list (polled) → empty credential list →
 delete → retrieve 404. It **has not been run yet**.
+
+Environment templates (#49): method, path, beta header, query and body for
+all five methods (a `nil` `"name"` on update sent as JSON null) and a 404
+typed `not-found-error`. `environments-templates-crud-round-trip-against-the-real-api`
+(same gate; a template only, no session) runs create → retrieve → update →
+list (polled) → delete. It **has not been run yet**.
 
 Tests added in #49 bind port `0` (OS-assigned) through `with-recording-server`.
 

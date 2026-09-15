@@ -1230,6 +1230,60 @@
   (str "{\"object\":\"list\",\"data\":[" (str/join "," item-jsons) "],"
        "\"first_id\":\"a\",\"last_id\":\"b\",\"has_more\":true}"))
 
+;; --- environment templates --------------------------------------------------
+
+(def ^:private canned-template
+  (str "{\"id\":\"envtpl_1\",\"object\":\"agent.environment.template\",\"created_at\":0,\"updated_at\":0,"
+       "\"name\":\"py\",\"capability_directories\":[],"
+       "\"files\":[{\"type\":\"inline\",\"path\":\"/workspace/a.txt\",\"size_bytes\":5}],"
+       "\"network\":{\"access\":\"restricted\",\"allowed_domains\":[\"pypi.org\"]},"
+       "\"packages\":{\"npm\":[],\"python\":[\"requests\"],\"system\":[]},\"plugins\":[],\"skills\":[]}"))
+
+(deftest environments-templates-crud-paths-bodies-and-responses
+  (with-recording-server
+    (fn [{:keys [method path]}]
+      {:status 200
+       :body (cond
+               (= "DELETE" method)
+               "{\"id\":\"envtpl_1\",\"deleted\":true,\"object\":\"agent.environment.template.deleted\"}"
+               (and (= "GET" method) (= "/v1/agents/environments/templates" path)) (list-page canned-template)
+               :else canned-template)})
+    (fn [client calls]
+      (let [create {"name" "py"
+                    "env" {"TOKEN_NAME" "placeholder"}
+                    "files" [{"type" "inline" "path" "/workspace/a.txt" "data" "aGVsbG8="}]
+                    "network" {"access" "restricted" "allowed_domains" ["pypi.org"]}
+                    "packages" {"python" ["requests"]}
+                    "setup_commands" [{"command" "pip list" "cwd" "/workspace"}]}
+            tpl    (agents/environments-templates-create client create)]
+        (is (= "agent.environment.template" (get tpl "object")))
+        (is (not (contains? tpl "env")) "confidential fields are not returned")
+        (agents/environments-templates-create client)
+        (is (= "envtpl_1" (get (agents/environments-templates-retrieve client "envtpl_1") "id")))
+        (agents/environments-templates-update client "envtpl_1" {"name" nil "packages" {"python" []}})
+        (is (true? (get (agents/environments-templates-list client {"after" "envtpl_0" "limit" 2 "order" "asc"})
+                        "has_more")))
+        (agents/environments-templates-list client)
+        (is (= "agent.environment.template.deleted"
+               (get (agents/environments-templates-delete client "envtpl_1") "object")))
+        (is (= [["POST" "/v1/agents/environments/templates" nil create]
+                ["POST" "/v1/agents/environments/templates" nil nil]
+                ["GET" "/v1/agents/environments/templates/envtpl_1" nil nil]
+                ["POST" "/v1/agents/environments/templates/envtpl_1" nil {"name" nil "packages" {"python" []}}]
+                ["GET" "/v1/agents/environments/templates" {"after" "envtpl_0" "limit" "2" "order" "asc"} nil]
+                ["GET" "/v1/agents/environments/templates" nil nil]
+                ["DELETE" "/v1/agents/environments/templates/envtpl_1" nil nil]]
+               (mapv wire @calls)))
+        (is (every? #(= "agents=v1" (get-in % [:headers "openai-beta"])) @calls))))))
+
+(deftest environments-templates-retrieve-404-maps-to-not-found
+  (with-recording-server
+    (constantly {:status 404 :body "{\"error\":{\"message\":\"No such template\"}}"})
+    (fn [client _]
+      (let [e (try (agents/environments-templates-retrieve client "envtpl_missing") nil (catch Exception e e))]
+        (is (= :tools.agents.openai/not-found-error (:type (ex-data e))))
+        (is (str/includes? (ex-message e) "environments-templates-retrieve: HTTP 404 No such template"))))))
+
 ;; --- vaults and credentials -------------------------------------------------
 
 (def ^:private canned-vault
@@ -1611,5 +1665,38 @@
           (is (= :tools.agents.openai/not-found-error (:type (ex-data e)))))
         (catch Exception e
           (try (agents/vaults-delete client id) (catch Exception _ nil))
+          (throw e))))
+    (is true "skipped: set OPENAI_AGENTS_LIVE=1 and OPENAI_API_KEY")))
+
+;; ---------------------------------------------------------------------------
+;; REAL-API environment template CRUD round trip (#49). Same gate; creates
+;; only a template (no session, no environment provisioned, no inference).
+;; Not yet run.
+;; ---------------------------------------------------------------------------
+
+(deftest environments-templates-crud-round-trip-against-the-real-api
+  (if-let [api-key (and (= "1" (System/getenv "OPENAI_AGENTS_LIVE"))
+                       (not-empty (System/getenv "OPENAI_API_KEY")))]
+    (let [client  (oai/client {:api-key api-key
+                               :base-url (env "OPENAI_AGENTS_BASE_URL" "https://api.openai.com/v1")})
+          created (agents/environments-templates-create client {"name" "clj-tools-agents-live-test"
+                                                                "network" {"access" "disabled"}})
+          id      (get created "id")]
+      (try
+        (is (string? id))
+        (is (= "agent.environment.template" (get created "object")))
+        (is (= "disabled" (get-in created ["network" "access"])))
+        (is (= id (get (agents/environments-templates-retrieve client id) "id")))
+        (is (= "clj-tools-agents-live-test-2"
+               (get (agents/environments-templates-update client id {"name" "clj-tools-agents-live-test-2"}) "name")))
+        (let [page (live-poll #(let [p (agents/environments-templates-list client {"limit" 100})]
+                                 (when (some (fn [t] (= id (get t "id"))) (get p "data")) p))
+                              1000 60000)]
+          (is (= "list" (get page "object"))))
+        (let [deleted (agents/environments-templates-delete client id)]
+          (is (true? (get deleted "deleted")))
+          (is (= "agent.environment.template.deleted" (get deleted "object"))))
+        (catch Exception e
+          (try (agents/environments-templates-delete client id) (catch Exception _ nil))
           (throw e))))
     (is true "skipped: set OPENAI_AGENTS_LIVE=1 and OPENAI_API_KEY")))
