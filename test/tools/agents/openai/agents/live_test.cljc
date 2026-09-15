@@ -1137,6 +1137,16 @@
 
 (defn- env [k default] (let [v (System/getenv k)] (if (seq v) v default)))
 
+(defn- live-poll
+  "Call `f` every `interval-ms` until it returns truthy, up to `timeout-ms`."
+  [f interval-ms timeout-ms]
+  (let [deadline (+ (System/currentTimeMillis) timeout-ms)]
+    (loop []
+      (or (f)
+          (if (< (System/currentTimeMillis) deadline)
+            (do (Thread/sleep (long interval-ms)) (recur))
+            (throw (ex-info "live probe: poll timed out" {:timeout-ms timeout-ms})))))))
+
 (deftest agents-crud-round-trip-against-the-real-api
   (if-let [api-key (and (= "1" (System/getenv "OPENAI_AGENTS_LIVE"))
                        (not-empty (System/getenv "OPENAI_API_KEY")))]
@@ -1154,7 +1164,10 @@
         (let [updated (agents/agents-update client id {"name" "clj-tools-agents-live-test-2"})]
           (is (= "clj-tools-agents-live-test-2" (get updated "name")))
           (is (= model (get updated "model")) "omitted fields are left unchanged"))
-        (let [page (agents/agents-list client {"limit" 100})]
+        ;; listing is eventually consistent: a fresh agent shows up after a few seconds
+        (let [page (live-poll #(let [p (agents/agents-list client {"limit" 100})]
+                                 (when (some (fn [a] (= id (get a "id"))) (get p "data")) p))
+                              1000 60000)]
           (is (= "list" (get page "object")))
           (is (some #(= id (get % "id")) (get page "data"))))
         (let [deleted (agents/agents-delete client id)]
@@ -1176,16 +1189,6 @@
 ;; arrives inline or as a 3xx (this client does not follow redirects), bytes
 ;; intact, env-file create on the live environment, token paging.
 ;; ---------------------------------------------------------------------------
-
-(defn- live-poll
-  "Call `f` every `interval-ms` until it returns truthy, up to `timeout-ms`."
-  [f interval-ms timeout-ms]
-  (let [deadline (+ (System/currentTimeMillis) timeout-ms)]
-    (loop []
-      (or (f)
-          (if (< (System/currentTimeMillis) deadline)
-            (do (Thread/sleep (long interval-ms)) (recur))
-            (throw (ex-info "live probe: poll timed out" {:timeout-ms timeout-ms})))))))
 
 (defn- live-cleanup-session! [client session-id]
   (try (agents/cancel-turn client session-id) (catch Exception _ nil))
