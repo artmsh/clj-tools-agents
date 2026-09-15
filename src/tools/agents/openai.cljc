@@ -680,6 +680,8 @@
                  a non-2xx body is read and closed here)
      :timeout-ms / :connect-timeout-ms
                  per-request override of the client's values (nil disables)
+                 a distinct :connect-timeout-ms selects a cached shared
+                 HttpClient per value, so vary it on the client, not per call
 
    A `stream` true body field or multipart part throws
    :tools.agents.openai/streaming-unsupported before any network I/O, except

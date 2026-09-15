@@ -30,8 +30,9 @@
    reduce then returns the accumulated result normally instead of throwing,
    and `(outcome s)` is `:cancelled`. `close!` before the reduce starts
    makes the reduce return `init` untouched. There is no read-idle timeout:
-   a stalled server blocks the read until someone calls `close!` (e.g. from
-   a watchdog thread).
+   a client's `:timeout-ms` bounds only the wait for the response headers
+   (inside `:open!`), never the body, so a stalled server blocks the read
+   until someone calls `close!` (e.g. from a watchdog thread).
 
    TRUNCATION IS THE CALLER'S CONCERN. A stream that hits EOF without a
    terminal event reduces normally, exactly like a complete one; the SSE
