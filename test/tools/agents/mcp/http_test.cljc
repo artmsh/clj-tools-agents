@@ -11,7 +11,8 @@
             [clojure.test :refer [deftest is testing]]
             [tools.agents.mcp :as mcp]
             [tools.agents.mcp.http :as http]
-            [tools.agents.mcp.server :as server]))
+            [tools.agents.mcp.server :as server]
+            [tools.agents.sse :as sse]))
 
 ;; ---------------------------------------------------------------------------
 ;; UTF-8 and Base64
@@ -231,17 +232,22 @@
   (is (= 500 (http/error-code->status mcp/internal-error)))
   (is (= 200 (http/error-code->status -31000)) "an unpinned code is still a successful exchange"))
 
+(defn- sse-messages
+  "The JSON-RPC messages of a complete SSE body, via the shared parser."
+  [body]
+  (mapv (comp mcp/read-json :data) (sse/parse-string body)))
+
 (deftest sse-events-frame-and-parse
   (let [msg (mcp/result-response 1 {"x" 1})]
     (is (= (str "event: message\ndata: " (mcp/write-json msg) "\n\n") (http/sse-event msg)))
-    (is (= [msg] (http/parse-sse (http/sse-event msg))))
-    (is (= [msg msg] (http/parse-sse (str (http/sse-event msg) (http/sse-event msg)))))))
+    (is (= [msg] (sse-messages (http/sse-event msg))))
+    (is (= [msg msg] (sse-messages (str (http/sse-event msg) (http/sse-event msg)))))))
 
-(deftest parse-sse-skips-keep-alive-comments
+(deftest sse-parsing-skips-keep-alive-comments
   (let [msg (mcp/result-response 1 {"x" 1})]
-    (is (= [msg] (http/parse-sse (str ": keep-alive\n\n" (http/sse-event msg)))))
-    (is (= [] (http/parse-sse ": keep-alive\n\n")))
-    (is (= [] (http/parse-sse "")))))
+    (is (= [msg] (sse-messages (str ": keep-alive\n\n" (http/sse-event msg)))))
+    (is (= [] (sse-messages ": keep-alive\n\n")))
+    (is (= [] (sse-messages "")))))
 
 ;; ---------------------------------------------------------------------------
 ;; handle-http
@@ -334,7 +340,7 @@
                                     :client-capabilities {}
                                     :progress-token "p"})})
         r (post msg)
-        events (http/parse-sse (:body r))]
+        events (sse-messages (:body r))]
     (is (= 200 (:status r)))
     (is (= "text/event-stream" (get (:headers r) "Content-Type")))
     (is (= "no" (get (:headers r) "X-Accel-Buffering"))
@@ -346,7 +352,7 @@
 (deftest subscriptions-listen-opens-a-stream-instead-of-answering
   (let [m (a-message "subscriptions/listen" {"notifications" {"toolsListChanged" true}})
         r (post m)
-        events (http/parse-sse (:body r))]
+        events (sse-messages (:body r))]
     (is (= 200 (:status r)))
     (is (= "text/event-stream" (get (:headers r) "Content-Type")))
     (is (= {:id 1 :filter {"toolsListChanged" true}} (:subscription r)))

@@ -93,6 +93,18 @@ request map to an HTTP response map, so plugging it into whatever server you
 already run is the whole integration. The HTTP *client* half works on both
 runtimes.
 
+`http/connect!` returns `{:url :send! :close!}`. A JSON answer is returned
+as the response, whatever its HTTP status (a 4xx carrying a JSON-RPC error is
+that error, typed by `client/result-of`); a notification POST's 202 returns
+nil. An SSE answer is read incrementally through `tools.agents.stream` and
+the shared `tools.agents.sse` parser: every message other than the response
+to the request's id goes to `:on-notification` the moment its event
+arrives, and the response ends the stream and closes the connection. A
+stream that ends or breaks before the response throws
+`::error/transport`. Cancelling — `notifications/cancelled` for that request
+id, or `:close!` for every in-flight request — closes the connection and
+makes the pending `:send!` return nil.
+
 ### Examples
 
 - `examples/mcp/weather.cljc` — a line-for-line port of the official [Build an
@@ -224,7 +236,7 @@ spec's MUST-NOTs still obeys them.
 | `await client.read_resource(uri)` | `(read-resource! c uri)` |
 | `await client.get_prompt(name, args)` | `(get-prompt! c name args)` |
 | `await client.complete(ref, argument)` | `(complete! c ref argument context)` |
-| `client.listen(...)` | `(client/listen! c filter)` builds the request; sending it over a stdio transport blocks for the life of the stream, with notifications going to that transport's `:on-notification` |
+| `client.listen(...)` | `(client/listen! c filter)` builds the request; sending it over either transport's `:send!` blocks for the life of the stream, with each notification going to that transport's `:on-notification` as it arrives |
 | `client.server_capabilities` / `server_info` / `instructions` | Fields of `(discover! c)` — there is no cached handshake to read them from |
 | `@deprecated send_ping`, `set_logging_level`, `subscribe_resource`, `unsubscribe_resource` | **Not exposed.** The Python SDK keeps them, marked deprecated, to drive 2025-era servers; this library implements one revision |
 | `input_handlers` for elicitation/sampling/roots | `:input-handlers {"elicitation/create" (fn [req] result)}` |
@@ -277,7 +289,12 @@ notifications are tagged. Request-scoped notifications (`progress`,
 `message`) are deliberately *not* deliverable on a listen stream: the spec
 confines them to the response stream of the request they belong to.
 
-On stdio, `notifications/cancelled` closes the stream.
+On stdio, `notifications/cancelled` closes the stream. On Streamable HTTP
+the stream is the listen request's own SSE response, read live by
+`http/connect!`: the server ends it gracefully with the closure response,
+and the client ends it by closing the connection — `client/cancel!` (which
+also POSTs `notifications/cancelled`) or the transport's `:close!`. A
+cancelled `:send!` returns nil.
 
 ### Streamable HTTP: header mirroring
 
@@ -476,12 +493,12 @@ bb test-mcp                                     # Babashka
 ./script/test-all.sh                            # every runtime, every library
 ```
 
-The MCP suite is green on both runtimes: 186 tests / 687 assertions. So is
-the rest of `test-all.sh` — core 49/341, anthropic 156/368, openai 154/536,
+The MCP suite is green on both runtimes: 193 tests / 719 assertions. So is
+the rest of `test-all.sh` — core 75/464, anthropic 156/368, openai 154/536,
 gemini 38/97 and fusion 5/19.
 
-Six suites, hermetic — no network, no
-fixed ports, and the only subprocess is this repo's own weather server.
+Seven suites, hermetic — loopback only, ephemeral ports, and the only
+subprocess is this repo's own weather server.
 
 - **`mcp_test.cljc`** — the core namespace: the JSON codec's error contract
   and framing safety (codec behaviour itself — round trips, full C0 escaping,
@@ -507,21 +524,22 @@ fixed ports, and the only subprocess is this repo's own weather server.
   `cancel!`, and all three `probe!` classifications.
 - **`http_test.cljc`** — RFC 4648 Base64 vectors, UTF-8 round trips including
   astral planes, the header sentinel, `x-mcp-header` validation, `Mcp-Name`
-  mirroring, every `-32020` case, code→status mapping, SSE framing and
-  parsing, and `handle-http` end to end (JSON, 405, 403, `-32700`, 202, SSE,
-  listen streams).
+  mirroring, every `-32020` case, code→status mapping, SSE framing (parsed
+  back with the shared `tools.agents.sse`), and `handle-http` end to end
+  (JSON, 405, 403, `-32700`, 202, SSE, listen streams).
+- **`http_client_test.cljc`** — `http/connect!` over a real loopback socket
+  (`tools.agents.test-support` mock, ephemeral ports), identical on both
+  runtimes: mirrored headers as they arrive on the wire, `handle-http` JSON
+  answers including a typed 404, 202 → nil, empty body and truncated
+  streams as `::error/transport`; a notification observed while the server
+  is still holding the response back; a `subscriptions/listen` stream
+  delivering acknowledgment and change notifications live, then ending on
+  the graceful-closure response; and `client/cancel!` and `:close!` each
+  closing the connection, observed server-side as a disconnect.
 
-  Not covered: `http/serve!` and `http/connect!`, the two adapters that put
-  this logic on a real socket. Both are thin — `serve!` binds
-  `com.sun.net.httpserver` and delegates every request to `handle-http`;
-  `connect!` is a `tools.agents.http/request!` call (covered by the core
-  suite) plus `parse-sse` — and testing either
-  means binding a fixed port, which is a host-state assumption the
-  anthropic/openai/gemini suites accept and this one chose not to take on.
-  The logic underneath both
-  is tested; the socket wiring is not. A change to `serve!` therefore has
-  to be checked out of band; the shared request function under `connect!`
-  is exercised by the core suite and by every provider suite.
+  Not covered: `http/serve!`, which binds `com.sun.net.httpserver` (JVM
+  only) and delegates every request to `handle-http`. The logic underneath
+  it is tested; its socket wiring has to be checked out of band.
 - **`stdio_test.cljc`** — framing (one message per line; tool output that
   contains newlines cannot break it), `-32700` with a null id, notification
   ordering, listen/notify/cancel/close, `log!` writing nothing to stdout, and

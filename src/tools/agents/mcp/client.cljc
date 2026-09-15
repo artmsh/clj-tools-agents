@@ -283,12 +283,14 @@
   "subscriptions/listen — builds the request for a long-lived notification
    stream. It only BUILDS it: the stream itself is the transport's business.
 
-   Over `tools.agents.mcp.stdio/connect!`, sending it with `(:send! c)`
-   blocks for the life of the subscription — every notification on the
-   stream goes to that transport's `:on-notification`, and the call returns
-   only when the server closes the stream gracefully. So a caller who also
-   wants to issue ordinary requests dedicates a thread (or a second
-   connection) to the subscription.
+   Over `tools.agents.mcp.stdio/connect!` or `tools.agents.mcp.http/connect!`,
+   sending it with `(:send! c)` blocks for the life of the subscription —
+   every notification on the stream goes to that transport's
+   `:on-notification` as it arrives, and the call returns the closure
+   response when the server closes the stream gracefully. So a caller who
+   also wants to issue ordinary requests dedicates a thread (or a second
+   connection) to the subscription. On HTTP, `cancel!` or the transport's
+   `:close!` closes the stream and the pending send returns nil.
 
    `notifications` is the SubscriptionFilter: any of \"toolsListChanged\",
    \"promptsListChanged\", \"resourcesListChanged\",
@@ -298,8 +300,8 @@
 
 (defn cancel!
   "notifications/cancelled — a client-to-server notification, so there is no
-   response and nothing to unwrap. On stdio this is also how a
-   `subscriptions/listen` stream is closed."
+   response and nothing to unwrap. This is also how a
+   `subscriptions/listen` stream is closed, on stdio and on HTTP."
   [c request-id reason]
   ((:send! c) (mcp/cancelled-notification request-id reason))
   nil)

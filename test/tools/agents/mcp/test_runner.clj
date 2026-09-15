@@ -10,6 +10,7 @@
             tools.agents.mcp.conformance-test
             tools.agents.mcp.examples-test
             tools.agents.mcp.http-test
+            tools.agents.mcp.http-client-test
             tools.agents.mcp.stdio-test))
 
 (def suites
@@ -17,6 +18,7 @@
    'tools.agents.mcp.conformance-test
    'tools.agents.mcp.client-test
    'tools.agents.mcp.http-test
+   'tools.agents.mcp.http-client-test
    'tools.agents.mcp.stdio-test
    'tools.agents.mcp.examples-test])
 
