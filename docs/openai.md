@@ -227,7 +227,7 @@ It returns a `tools.agents.token` source; pass it as `:credential-source`:
 | `subject_token_type` | `jwt` → `urn:ietf:params:oauth:token-type:jwt`, `id` → `…:id_token` (`_workload.py:20-23`) | same (`:jwt`/`:id` or the strings) |
 | response | 400/401/403 → `OAuthError` (message = `error_description`); other non-2xx → `OpenAIError`; 2xx needs a non-empty string `access_token` and numeric `expires_in` (`_workload.py:283-310`) | `:tools.agents.openai/oauth-error` `{:status :error}`; `:tools.agents.openai/token-exchange-error` `{:status}`. Neither the subject token, the access token nor the body is ever in a message or `ex-data` |
 | cache / refresh | single-flight; refresh at `expires_in - min(buffer, expires_in/2)`, buffer 1200 s (`_workload.py:227-254,325-328`) | `token-cache` with `:refresh-skew-ms` = buffer, same formula, single-flight |
-| API 401 | invalidate the token sent, retry once (`_client.py:579-589`) | `invalidate!` returns true → `request!` retries once outside `:max-retries` |
+| API 401 | invalidate the token sent on every 401, retry once (`_client.py:579-589`; invalidation at `:582` precedes the `retried` check) | same: `request!` invalidates on every 401, including a second consecutive one, so the next call exchanges again; retries once outside `:max-retries` |
 | exchange retries | runs inside the API request's retry loop: a non-`OpenAIError` (transport failure, timeout, raw provider exception) is retried with the client's `max_retries`, then `APIConnectionError`; `OpenAIError`s are not retried (`_base_client.py:1076-1111`) | the source retries the same failures with its own `:max-retries` (default 2), then `:tools.agents.openai/api-connection-error`; typed errors are not retried |
 | providers | `k8s_service_account_token_provider` (file, default `/var/run/secrets/kubernetes.io/serviceaccount/token`), `azure_managed_identity_token_provider` (IMDS), `gcp_id_token_provider` (metadata server) (`_workload.py:78-204`) | `k8s-service-account-token-provider`, `azure-managed-identity-token-provider`, `gcp-id-token-provider`; failures → `:tools.agents.openai/subject-token-provider-error`. `:url` override instead of `http_client` |
 
@@ -240,9 +240,6 @@ Divergences:
   call's: the client asks for its token before its own retry loop. A client
   with `:max-retries 0` still retries a failed exchange unless the source
   also gets `:max-retries 0`; in the SDK that is one knob.
-- On a second consecutive 401 the SDK invalidates the token again
-  (`_client.py:582`, before its `retried` check); `request!` does not, so the
-  next call reuses the cached token until it expires or another 401.
 - X.509 (mTLS) workload identity (`auth/_x509.py`) is not ported.
 
 Not verified against the live `auth.openai.com`; tests use a local mock.
@@ -647,7 +644,7 @@ public function, so there is exactly one copy of the retry loop:
 - `post-json!` stays public as `(request! client fn-name {:path path :body request})`.
 - **401:** for a `:credential-source` client the loop invalidates the token
   the failed attempt sent and retries once outside `:max-retries`; a second
-  401 throws. A static or callable `:api-key` 401 is never retried (a
+  401 invalidates again (`_client.py:582`) and throws. A static or callable `:api-key` 401 is never retried (a
   callable one is a source whose `invalidate!` declines).
 
 Everything else — URL/header building, the JSON codec, credential resolution,

@@ -82,7 +82,8 @@ openai (and so openai.agents) and gemini clients:
   retried as connection errors.
 - On a 401 the client calls `(token/invalidate! src used-token)` and retries
   **once**, outside `:max-retries` and without backoff. A second 401 throws
-  the usual authentication error. Static keys never retry a 401.
+  the usual authentication error (openai also invalidates the token again, as
+  openai-python does, so the next call refetches). Static keys never retry a 401.
 - `:credential-source` replaces `:api-key`/`:auth-token` and the env vars;
   combining them throws `invalid-credentials` (per-client `:type`).
   Anthropic sends the token as `Authorization: Bearer` plus

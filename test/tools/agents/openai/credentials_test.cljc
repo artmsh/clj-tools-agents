@@ -205,7 +205,30 @@
             (is (= :tools.agents.openai/authentication-error (:type (ex-data e))))
             (is (= 2 @hits))
             (is (= 2 @n))
-            (is (leak-free? e "tok-1" "tok-2" "subject-jwt-SECRET"))))))))
+            (is (leak-free? e "tok-1" "tok-2" "subject-jwt-SECRET"))
+            (testing "the second 401 invalidated tok-2 too: the next call re-exchanges"
+              (is (some? (thrown #(oai/responses-create c {"model" "m"}))))
+              (is (= 4 @hits))
+              (is (= 4 @n) "tok-3 for the next call, tok-4 for its auth retry")))))))
+  (testing "stream open: two 401s invalidate twice, next open re-exchanges"
+    (let [n     (atom 0)
+          auths (atom [])]
+      (with-server
+        (fn [req]
+          (if (= "/oauth/token" (:path req))
+            (exchange-ok (str "tok-" (swap! n inc)) 3600)
+            (do (swap! auths conj (get (:headers req) "authorization"))
+                (if (<= (count @auths) 2)
+                  {:status 401 :body "{\"error\":{\"message\":\"no\"}}"}
+                  {:status 200 :headers {"content-type" "text/event-stream"}
+                   :body "data: {\"type\":\"ping\"}\n\n"}))))
+        (fn [port]
+          (let [c (oai/client {:credential-source (source port) :base-url (base-url port) :max-retries 0})]
+            (is (= :tools.agents.openai/authentication-error
+                   (:type (ex-data (thrown #(oai/responses-stream c {"model" "m"}))))))
+            (is (= ["ping"] (map #(get % "type") (into [] (oai/responses-stream c {"model" "m"})))))
+            (is (= ["Bearer tok-1" "Bearer tok-2" "Bearer tok-3"] @auths))
+            (is (= 3 @n))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Exchange failures: typed, never retried except without a response, no leaks

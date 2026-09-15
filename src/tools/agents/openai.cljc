@@ -178,9 +178,11 @@
   "The full credential chain `client` uses: an explicit :credential-source,
    else a zero-arg :api-key fn (wrapped by `api-key-fn-source`), else
    `resolve-credentials` (explicit :api-key > OPENAI_API_KEY > throw).
-   Returns {:credential-source src} or {:api-key s}. Later refreshable
-   sources (#36 workload identity) plug in here as further steps that return
-   {:credential-source <TokenSource>}."
+   Returns {:credential-source src} or {:api-key s}. Refreshable sources
+   are never discovered here: workload identity
+   (tools.agents.openai.credentials/workload-identity-source) is passed
+   explicitly as :credential-source, since openai-python reads no env vars
+   for it."
   [opts getenv-fn]
   (cond
     (contains? opts :credential-source)
@@ -545,10 +547,12 @@
     (if (number? n) (max 0 (long n)) default-max-retries)))
 
 (defn- invalidate-credentials!
-  "`request!` calls this on a 401, at most once per call, with the credential
-   that attempt sent. True means the client's :credential-source dropped that
-   token and the next attempt may get a fresh one; `request!` then retries
-   once, OUTSIDE the :max-retries budget. Static :api-key credentials have
+  "`request!` calls this on EVERY 401, with the credential that attempt
+   sent, including a 401 on the auth retry itself: openai-python invalidates
+   before checking `retried` (`_client.py:582-584`), so the next call does not
+   reuse a token rejected twice. True means the client's :credential-source
+   dropped that token and the next attempt may get a fresh one; `request!`
+   then retries, once per call, OUTSIDE the :max-retries budget. Static :api-key credentials have
    nothing to refresh, so this returns false and a 401 surfaces at once as
    :tools.agents.openai/authentication-error."
   [client used-credential]
@@ -621,9 +625,10 @@
      - malformed 2xx JSON: :tools.agents.openai/json-parse-error, not retried
        (the SDK decodes after its retry loop)
 
-   401: with a :credential-source client, the first 401 invalidates the token
-   that attempt sent and retries once, outside :max-retries and without
-   backoff; a second 401 throws. A static :api-key 401 is never retried."
+   401: with a :credential-source client, every 401 invalidates the token
+   that attempt sent (`_client.py:582`); the first also retries once, outside
+   :max-retries and without backoff; a second 401 throws. A static :api-key
+   401 is never retried."
   ([client req] (request! client "request!" req))
   ([client fn-name {:keys [method path query body multipart headers as]
                     :or   {method :post as :json}}]
@@ -663,7 +668,8 @@
                  (and status (>= status 200) (< status 300))
                  (if (= as :stream) (:resp outcome) (decode-success as resp-body))
 
-                 (and (= status 401) (not auth-retried?) (invalidate-credentials! client credential))
+                 ;; Invalidate first, on every 401; retry only once.
+                 (and (= status 401) (invalidate-credentials! client credential) (not auth-retried?))
                  (recur retries-taken true)
 
                  (and (< retries-taken max-retries) (should-retry? status resp-hdrs (now-ms)))
