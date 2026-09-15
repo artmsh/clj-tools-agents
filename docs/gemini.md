@@ -4,8 +4,9 @@ A pure-Clojure client for the [Gemini Developer
 API](https://ai.google.dev/gemini-api/docs), ergonomically modeled on the
 official [python-genai](https://github.com/googleapis/python-genai) client: a
 `GeminiClient` record standing in for `genai.Client(api_key=...)`,
-`generate-content` / `count-tokens` standing in for
+`generate-content` / `generate-content-stream` / `count-tokens` standing in for
 `client.models.generate_content(model=..., contents=..., config=...)` /
+`client.models.generate_content_stream(...)` /
 `client.models.count_tokens(...)`, and a typed error hierarchy matching the
 SDK's `APIError`.
 
@@ -81,10 +82,10 @@ model id) is used verbatim.
 | `GOOGLE_API_KEY` / `GEMINI_API_KEY` | same env vars, same precedence (`GOOGLE_API_KEY` wins when both are set) | Explicit `:api-key` wins over both. python-genai logs a warning when both env vars are set; this library just picks `GOOGLE_API_KEY` silently (the two runtimes share no common logging facility). |
 | `x-goog-api-key` header | same header | Confirmed from `_api_client.py`: a bare API key, **no** `Bearer ` prefix — unlike `tools.agents.openai`'s `Authorization: Bearer`. |
 | `HttpOptions(base_url=..., api_version=...)` | `:base-url` (default `https://generativelanguage.googleapis.com`), `:api-version` (default `"v1beta"`) | Kept as two separate client fields, joined at request time, rather than one pre-concatenated base-url string — see `client`'s docstring. |
-| `client.models.generate_content_stream(...)` | *(not implemented)* | See Streaming below - same rationale as the two siblings. |
+| `client.models.generate_content_stream(model=model, contents=..., config=request)` | `(generate-content-stream client model request)` | Same `{model}:streamGenerateContent?alt=sse` path. Returns a single-use reducible of chunk maps instead of a generator; `accumulate-stream` joins them (python-genai has no joiner). See Streaming below. |
 | tenacity-backed automatic retries, `_RETRY_ATTEMPTS = 5` | `:max-retries` client opt, default 4 | Implemented — see Retries below. |
 | `client.chats.create(...)` (multi-turn chat session object) | *(not implemented)* | A stateful wrapper over `generate_content` with local history bookkeeping; `add-user-message`/`add-model-message` below give the same history-building ergonomics without the stateful object. |
-| `client.files.*` / `.caches.*` / `.tunings.*` / `.batches.*` / `.live.*` (Live API) / embeddings / image & video generation | *(not implemented)* | Only `generateContent`/`countTokens` are in scope for this port. `post-json!` is the shared transport, so adding another POST resource is a small change. |
+| `client.files.*` / `.caches.*` / `.tunings.*` / `.batches.*` / `.live.*` (Live API) / embeddings / image & video generation | *(not implemented)* | Only `generateContent`/`streamGenerateContent`/`countTokens` are in scope for this port. `post-json!` is the shared transport, so adding another POST resource is a small change. |
 | Vertex AI mode (`vertexai=True`, ADC/service-account credentials, `us-central1`-style locations) | *(not implemented)* | This library only targets the Gemini Developer API (API-key auth against `generativelanguage.googleapis.com`), not the separate Vertex AI code path python-genai also supports. |
 
 ### Credential resolution & headers (confirmed from python-genai source)
@@ -213,12 +214,92 @@ happened."
 
 See [divergences.md](divergences.md) for the per-contract table across all four clients.
 
-### Streaming is not supported
+### Streaming
 
-There is no `stream-generate-content`/`:stream true` flag to reject here, the
-way the two siblings each reject one — Gemini's REST streaming variant
-(`:streamGenerateContent`) is a **separate endpoint**, not a request-body
-flag, so there is simply no streaming function offered at all.
+```clojure
+(let [s (gemini/generate-content-stream client "gemini-2.5-flash" request)]
+  (run! #(print (gemini/output-text %)) s))            ; text as it arrives
+
+(let [r (gemini/accumulate-stream
+          (gemini/generate-content-stream client "gemini-2.5-flash" request))]
+  (when-not (gemini/stream-complete? r) (throw (ex-info "truncated" {})))
+  (gemini/output-text r))                              ; the joined text
+```
+
+**Wire.** Streaming is a separate endpoint, not a request-body flag, so
+`generate-content` has no `stream` flag to refuse.
+`POST {base}/{version}/models/{model}:streamGenerateContent?alt=sse`, same
+request body and `x-goog-api-key` header as `generateContent`. Sources: the
+REST reference's `models.streamGenerateContent` ("stream of
+`GenerateContentResponse`"; every curl example passes `?alt=sse`), and
+python-genai (`models.py` path `'{model}:streamGenerateContent?alt=sse'`,
+googleapis/python-genai @ b88fded). Without `alt=sse` the body is a JSON
+array, not SSE (Google REST convention; the reference page does not say
+so). Each `data:` line is one complete `GenerateContentResponse`
+chunk. There are no event names and no `[DONE]`.
+
+**Lifecycle.** `generate-content-stream` sends the request at call time and
+returns the `tools.agents.stream` reducible. It is single-use: one reduce
+consumes it and closes the connection, including on early termination such
+as `(into [] (take 1) s)`. A stream you never reduce must be released with
+`(tools.agents.stream/close! s)`, which is also the cross-thread cancel.
+`with-open`/`.close` work on the JVM only, because Babashka's `reify`
+cannot add `java.io.Closeable`. `(tools.agents.stream/response s)` gives the
+2xx status and headers.
+
+**Retries and errors.** The retry policy is `generate-content`'s (statuses
+408/429/500/502/503/504 and connection failures, `:max-retries`,
+`*sleep-fn*`), applied to the opening exchange only. python-genai also
+retries only in `_request`, before the chunk iterator starts. Nothing is
+retried once a 2xx body is being read.
+
+| failure | when it throws | `:type` |
+|---|---|---|
+| non-2xx after retries | from `generate-content-stream` | the status table above, same `:status`/`:body`/`:retries-taken` |
+| no connection after retries | from `generate-content-stream` | `api-connection-error` |
+| error chunk `{"error": {"code": c, ...}}` | from the reduce, after earlier chunks were delivered | `c` treated as a status (python-genai `request_streamed` → `APIError.raise_error(code, ...)`), e.g. 503 → `internal-server-error`; `:body` is the raw `data:` string |
+| connection lost mid-stream | from the reduce | `api-connection-error`, cause the `IOException` |
+| undecodable chunk | from the reduce | `json-parse-error` |
+
+**Truncation.** Gemini has no terminal event, so EOF is the normal end:
+`(tools.agents.stream/outcome s)` is `:eof` for a complete stream **and**
+for one cut off cleanly at a chunk boundary. Completeness is in the data.
+The last chunk of a finished candidate carries `finishReason`, and a
+blocked prompt carries `promptFeedback.blockReason` with no candidates.
+`(stream-complete? response)` checks exactly that, on the joined response
+or on a last chunk. python-genai's `Chat.send_message_stream` uses the same
+criterion: a turn whose `finish_reason` stayed `None` is left out of the
+curated history. Neither the stream nor `accumulate-stream` throws on
+truncation. A connection that drops mid-chunk is a transport error and
+throws, see above. One wire case is not covered: python-genai's
+`_iter_response_stream` also brace-balances raw, non-`data:` JSON lines
+into an error chunk. Such lines are not SSE fields, so the WHATWG parser in
+`tools.agents.sse` ignores them. That stream ends at `:eof` without
+`finishReason` and reads as truncated rather than typed.
+
+**Joining chunks.** `accumulate-chunk` is a pure reducing fn (`[]` → `nil`,
+`[acc]` → `acc`, `[acc chunk]`), and `(accumulate-stream chunks)` is
+`(transduce identity accumulate-chunk chunks)` over the stream or any
+collection. The result is an ordinary response map, so `output-text`
+works on it. python-genai has no joiner: `generate_content_stream` yields
+chunks, and `Chat` stores each chunk's `Content` unmerged. The join ports
+the deprecated google-generativeai SDK's `generation_types._join_chunks`
+(google-gemini/deprecated-generative-ai-python @ 7a7cc54), the merge
+behind its streamed `response.resolve()`:
+
+| field | rule | vs. `_join_chunks` |
+|---|---|---|
+| `candidates` | grouped by `index` (default 0), a vector sorted by index | same |
+| `content.parts` | appended; adjacent text parts concatenated; adjacent `executableCode` join `code`, adjacent `codeExecutionResult` join `output` (outcome from the later one); other parts (`functionCall`, `inlineData`, ...) kept whole | text joins only when both parts have the same `thought` flag, so `output-text` still skips thoughts; the later part's other keys (`thoughtSignature`) are kept rather than dropped |
+| `content.role` | first chunk that has one | same |
+| `finishReason`, `citationMetadata`, other candidate fields | last non-nil | same, except the SDK read the literal last chunk |
+| `safetyRatings` | last non-nil | simplified: the SDK merged per category and OR-ed `blocked` |
+| `usageMetadata`, `modelVersion`, other top-level fields | last non-nil (usage is cumulative per chunk) | the SDK took the last chunk's value even when absent |
+| `promptFeedback` | first | same |
+
+An error chunk passed to `accumulate-chunk` throws the same typed ex-info as
+the stream does, so a fixture reduced without the transport cannot swallow
+it.
 
 ### JSON: a small hand-rolled codec, not a dependency
 
@@ -264,6 +345,22 @@ no-op so they cost no measurable wall-clock, since — unlike
 `tools.agents.openai`'s live-test — there is no `retry-after-ms` header
 trick available to shrink the real ~1s-per-retry floor). All three
 `examples/gemini/*.clj` ports run end-to-end against the mock server too.
+
+`gemini_test.cljc` also covers the pure chunk join (`accumulate-chunk`,
+`accumulate-stream`, `stream-complete?`): thought/answer separation, whole `functionCall` parts, code-execution joins, multiple
+candidates by index, top-level field rules, a blocked prompt and error
+chunks. `test/tools/agents/gemini/stream_test.cljc` runs
+the join over the SSE fixture `test/resources/sse/gemini-text.sse`, which
+is **synthetic** (hand-built, because the REST docs show no streamed
+response body), then `generate-content-stream` against the streaming mock
+servers: request line,
+`alt=sse` query, headers and body; incremental multi-chunk accumulation
+read by `output-text`; retries of the opening request (503 then a stream,
+exhaustion, connection refused); a non-2xx before the stream; an error chunk
+mid-stream (typed, not retried); a body cut off mid-chunk
+(`api-connection-error`); a stream that ends at `:eof` without
+`finishReason`; and early termination and `close!` releasing the
+connection. Its ports come from the OS (bind port 0), not a fixed band.
 
 The mock server is `tools.agents.test-support/start-server!`, shared by all three provider suites: two leaves, Babashka
 `org.httpkit.server` and JVM Clojure `com.sun.net.httpserver.HttpServer`.

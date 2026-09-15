@@ -66,14 +66,23 @@
    typed exactly as the REST API expects). See docs/gemini.md 'JSON: a small
    hand-rolled codec, not a dependency'.
 
-   STREAMING: not offered. The Gemini REST API's streaming variant is a
-   SEPARATE endpoint (`:streamGenerateContent`), not a `:stream true` request
-   flag the way anthropic/openai model it — so there is no flag to reject
-   here, only an absent function. See docs/gemini.md 'Streaming is not
-   supported'."
+   STREAMING: `generate-content-stream` is python-genai's
+   `client.models.generate_content_stream`. The streaming variant is a
+   SEPARATE endpoint (`:streamGenerateContent?alt=sse`), not a `:stream true`
+   request flag the way anthropic/openai model it, so there is no flag to
+   reject on `generate-content`. It returns a single-use reducible (see
+   tools.agents.stream) of decoded GenerateContentResponse chunks; retries
+   cover only the opening request. `accumulate-chunk`/`accumulate-stream`
+   join the chunks into one response that `output-text` reads. Gemini sends
+   NO terminal event: EOF is the normal end (`tools.agents.stream/outcome`
+   is `:eof` for a complete stream AND for a cut-off one), so completeness
+   is read from the data, via `stream-complete?` (a finishReason on every
+   candidate, or a promptFeedback.blockReason). See docs/gemini.md
+   'Streaming'."
   (:require [clojure.string :as str]
             [tools.agents.http :as http]
-            [tools.agents.json :as json]))
+            [tools.agents.json :as json]
+            [tools.agents.stream :as stream]))
 
 ;; python-genai's HttpOptions defaults (Gemini Developer API, not Vertex):
 ;; base_url = 'https://generativelanguage.googleapis.com/', api_version =
@@ -305,6 +314,15 @@
   (let [n (:max-retries client)]
     (if (number? n) (max 0 (long n)) default-max-retries)))
 
+(defn- http-status-error
+  "The typed ex-info for a final non-2xx response."
+  [fn-name status resp-body retries-taken]
+  (let [err-msg (extract-error-message resp-body)
+        detail  (cond err-msg err-msg (seq resp-body) resp-body :else nil)]
+    (ex-info (str "tools.agents.gemini/" fn-name ": HTTP " status (when detail (str " " detail)))
+             {:type (status->type status) :status status :body resp-body
+              :retries-taken retries-taken})))
+
 (defn- post-json!
   "Shared transport for generate-content/count-tokens: build URL + headers,
    encode the request map, POST it, classify the status, decode the body —
@@ -345,11 +363,7 @@
               (if (and (< retries-taken max-retries) (retryable-status? status))
                 (do (*sleep-fn* (retry-delay-ms retries-taken))
                     (recur (inc retries-taken)))
-                (let [err-msg (extract-error-message resp-body)
-                      detail  (cond err-msg err-msg (seq resp-body) resp-body :else nil)]
-                  (throw (ex-info (str "tools.agents.gemini/" fn-name ": HTTP " status (when detail (str " " detail)))
-                                   {:type (status->type status) :status status :body resp-body
-                                    :retries-taken retries-taken})))))))))))
+                (throw (http-status-error fn-name status resp-body retries-taken))))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Public API — resource methods
@@ -381,6 +395,247 @@
    Same retry policy, error hierarchy and ex-data shape as generate-content."
   [client model request]
   (post-json! client "count-tokens" model "countTokens" request))
+
+;; ---------------------------------------------------------------------------
+;; Public API — streaming
+;; ---------------------------------------------------------------------------
+
+(defn- error-chunk?
+  "python-genai `_api_client.request_streamed` raises on a chunk whose JSON
+   starts with `{\"error\":`; here: any chunk with a top-level \"error\" map."
+  [chunk]
+  (and (map? chunk) (map? (get chunk "error"))))
+
+(defn- stream-error
+  "The typed ex-info for an in-stream error chunk. Like python-genai's
+   `APIError.raise_error(error.code, ...)`, `error.code` stands in for the
+   status: it picks the :type and is :status (nil when not an integer)."
+  [fn-name chunk body retries-taken]
+  (let [err    (get chunk "error")
+        code   (get err "code")
+        status (when (integer? code) code)
+        msg    (get err "message")]
+    (ex-info (str "tools.agents.gemini/" fn-name ": stream error"
+                  (when status (str " " status)) (when (string? msg) (str " " msg)))
+             {:type (status->type status) :status status :body body
+              :retries-taken retries-taken})))
+
+(defn generate-content-stream
+  "POST request (same map as generate-content) to POST {base-url}/
+   {api-version}/models/{model}:streamGenerateContent?alt=sse — python-genai's
+   client.models.generate_content_stream(model=model, contents=...,
+   config=request), whose path is literally
+   '{model}:streamGenerateContent?alt=sse'.
+
+   The request is sent NOW, with generate-content's retry policy
+   (retryable-status?/retry-delay-ms, :max-retries on the client) applied to
+   the opening exchange only; once a 2xx arrives nothing is retried. A final
+   non-2xx or connection failure throws from this call with the same
+   :type/:status/:body/:retries-taken ex-data as generate-content.
+
+   Returns a SINGLE-USE reducible (tools.agents.stream/open-event-stream) of
+   decoded GenerateContentResponse chunk maps:
+
+     (let [s (generate-content-stream client \"gemini-2.5-flash\" req)]
+       (run! #(print (output-text %)) s))               ; per-chunk text
+     (output-text (accumulate-stream
+                    (generate-content-stream client model req))) ; joined
+
+   Reducing closes the connection (EOF, early termination, exception). A
+   stream that is never reduced must be released with
+   (tools.agents.stream/close! s), which is also the cross-thread cancel;
+   `.close`/with-open work on the JVM only. (tools.agents.stream/response s)
+   gives the 2xx {:status :headers}.
+
+   While reducing, throws:
+     - an error chunk ({\"error\" {\"code\" c \"message\" m}}) — ex-info typed
+       from `c` as a status (e.g. 429 -> :resource-exhausted-error), :body
+       the raw data string;
+     - a mid-stream transport failure — :tools.agents.gemini/api-connection-error;
+     - an undecodable chunk — :tools.agents.gemini/json-parse-error.
+
+   There is no terminal event: EOF ends a complete stream and a cut-off one
+   alike, and (tools.agents.stream/outcome s) is :eof for both. Check
+   `stream-complete?` on the accumulated response."
+  [client model request]
+  (let [fn-name     "generate-content-stream"
+        url         (str (endpoint-url client model "streamGenerateContent") "?alt=sse")
+        body-str    (write-json request)
+        headers     (request-headers fn-name client)
+        max-retries (resolve-max-retries client)
+        retries     (atom 0)
+        backoff!    (fn [n] (*sleep-fn* (retry-delay-ms n)) (swap! retries inc))
+        open!       (fn [attempt]
+                      (loop []
+                        (let [n       @retries
+                              outcome (try {:resp (attempt)}
+                                           (catch Exception e
+                                             (if (own-error? e) (throw e) {:error e})))]
+                          (if-let [e (:error outcome)]
+                            (if (< n max-retries)
+                              (do (backoff! n) (recur))
+                              (throw (ex-info (str "tools.agents.gemini/" fn-name ": connection failed: " e)
+                                              {:type :tools.agents.gemini/api-connection-error :status nil
+                                               :body nil :retries-taken n})))
+                            (let [status (:status (:resp outcome))]
+                              (if (and (not (and status (<= 200 status 299)))
+                                       (retryable-status? status)
+                                       (< n max-retries))
+                                (do (backoff! n) (recur))
+                                (:resp outcome)))))))]
+    (stream/open-event-stream
+     {:request       {:method :post :url url :headers headers :body body-str}
+      :open!         open!
+      :on-error      (fn [{:keys [status body]}]
+                       (throw (http-status-error fn-name status body @retries)))
+      :decode        (fn [data]
+                       (let [chunk (read-json data)]
+                         (if (error-chunk? chunk)
+                           (throw (stream-error fn-name chunk data @retries))
+                           chunk)))
+      :xform         (map :data)
+      :on-read-error (fn [e]
+                       (ex-info (str "tools.agents.gemini/" fn-name ": connection failed mid-stream: " e)
+                                {:type :tools.agents.gemini/api-connection-error :status nil :body nil
+                                 :retries-taken @retries}
+                                e))})))
+
+;; ---------------------------------------------------------------------------
+;; Stream accumulation — pure
+;; ---------------------------------------------------------------------------
+;; python-genai has no chunk-joining helper: generate_content_stream yields
+;; chunks and Chat.send_message_stream stores each chunk's Content unmerged.
+;; The join below ports the deprecated google-generativeai SDK's
+;; `generation_types._join_chunks` (google-gemini/deprecated-generative-ai-
+;; python @ 7a7cc54), the documented merge behind its streamed
+;; `response.resolve()`, adapted to REST JSON; see docs/gemini.md 'Streaming'.
+
+(defn- text-part? [part]
+  (and (map? part) (string? (get part "text"))))
+
+(defn- join-parts
+  "_join_contents' merge of two ADJACENT parts, or nil when they stay
+   separate. Text + text concatenate, but only when both carry the same
+   `thought` flag (a divergence: the old SDK predates thinking, and merging
+   across that boundary would break output-text's thought exclusion); the
+   later part's other keys (e.g. thoughtSignature) win. executableCode joins
+   `code` (language from the first), codeExecutionResult joins `output`
+   (outcome from the later)."
+  [a b]
+  (cond
+    (and (text-part? a) (text-part? b)
+         (= (true? (get a "thought")) (true? (get b "thought"))))
+    (assoc (merge a b) "text" (str (get a "text") (get b "text")))
+
+    (and (map? (get a "executableCode")) (map? (get b "executableCode")))
+    (update-in a ["executableCode" "code"] str (get-in b ["executableCode" "code"]))
+
+    (and (map? (get a "codeExecutionResult")) (map? (get b "codeExecutionResult")))
+    (-> a
+        (update-in ["codeExecutionResult" "output"] str (get-in b ["codeExecutionResult" "output"]))
+        (assoc-in ["codeExecutionResult" "outcome"] (get-in b ["codeExecutionResult" "outcome"])))))
+
+(defn- append-parts [parts new-parts]
+  (reduce (fn [acc part]
+            (if-let [joined (when-let [prev (peek acc)] (join-parts prev part))]
+              (conj (pop acc) joined)
+              (conj acc part)))
+          (vec parts)
+          new-parts))
+
+(defn- last-non-nil
+  "`acc` with every non-nil entry of `m` (except `skip` keys) assoc'ed over it."
+  [acc m skip]
+  (reduce-kv (fn [a k v] (if (or (nil? v) (contains? skip k)) a (assoc a k v))) acc m))
+
+(defn- join-candidate
+  "_join_candidates: content parts appended and joined, role from the first
+   chunk that has one; every other field (finishReason, safetyRatings,
+   citationMetadata, groundingMetadata, tokenCount, ...) last non-nil."
+  [acc cand]
+  (let [base    (last-non-nil (or acc {}) cand #{"content"})
+        content (get cand "content")]
+    (if (map? content)
+      (let [old   (get acc "content")
+            parts (get content "parts")]
+        (assoc base "content"
+               (assoc (merge (dissoc content "parts") (dissoc old "parts"))
+                      "parts" (append-parts (get old "parts" []) (if (sequential? parts) parts [])))))
+      base)))
+
+(defn- candidate-index [cand]
+  (let [i (get cand "index")] (if (integer? i) i 0)))
+
+(defn- join-candidate-list
+  "_join_candidate_lists: chunks' candidates grouped by \"index\" (default 0),
+   returned as a vector sorted by index."
+  [cands new-cands]
+  (reduce (fn [acc cand]
+            (let [idx (candidate-index cand)
+                  pos (first (keep-indexed (fn [i c] (when (= idx (candidate-index c)) i)) acc))]
+              (if pos
+                (update acc pos join-candidate cand)
+                (vec (sort-by candidate-index (conj acc (join-candidate nil cand)))))))
+          (vec cands)
+          (filter map? new-cands)))
+
+(defn accumulate-chunk
+  "Reducing fn joining GenerateContentResponse chunks into one response
+   (pure; the join is the deprecated google-generativeai SDK's
+   `_join_chunks`, see docs/gemini.md 'Streaming'):
+
+     - candidates grouped by \"index\" (default 0) into a VECTOR sorted by
+       index; per candidate, content.parts appended with ADJACENT text parts
+       concatenated when their `thought` flag matches (so output-text still
+       skips thoughts), adjacent executableCode/codeExecutionResult parts
+       joined, other parts (functionCall, inlineData, ...) kept as-is;
+       content.role from the first chunk; finishReason, safetyRatings,
+       citationMetadata, groundingMetadata etc. last non-nil
+     - top-level usageMetadata, modelVersion, responseId and any other key:
+       last non-nil (usage is cumulative per chunk)
+     - promptFeedback: the first one seen
+
+   Arities: [] -> nil, [acc] -> acc, [acc chunk] -> acc, so it works with
+   reduce (init nil) and transduce. Throws the same typed ex-info as the
+   stream on an error chunk ({\"error\" {...}}), so a fixture reduced
+   without the transport still fails loudly."
+  ([] nil)
+  ([acc] acc)
+  ([acc chunk]
+   (when (error-chunk? chunk)
+     (throw (stream-error "accumulate-chunk" chunk nil nil)))
+   (let [acc       (or acc {})
+         top       (last-non-nil acc chunk #{"candidates" "promptFeedback"})
+         top       (if (and (nil? (get acc "promptFeedback")) (some? (get chunk "promptFeedback")))
+                     (assoc top "promptFeedback" (get chunk "promptFeedback"))
+                     top)
+         new-cands (get chunk "candidates")]
+     (if (sequential? new-cands)
+       (assoc top "candidates" (join-candidate-list (get acc "candidates" []) new-cands))
+       top))))
+
+(defn accumulate-stream
+  "Reduce `chunks` — a generate-content-stream reducible (consumed and
+   closed) or any collection of chunk maps — with accumulate-chunk. Returns
+   the joined response map, or nil for no chunks. Never throws on a
+   truncated stream; check `stream-complete?`."
+  [chunks]
+  (transduce identity accumulate-chunk chunks))
+
+(defn stream-complete?
+  "True when a (joined) response shows the stream ended on purpose: at least
+   one candidate and every candidate has a \"finishReason\", or the prompt was
+   blocked (promptFeedback.blockReason, which comes with no candidates).
+   Gemini has no terminal SSE event, so a stream cut off at a chunk boundary
+   looks like a clean EOF; this is the only signal. The same criterion
+   python-genai's Chat.send_message_stream uses to keep a streamed turn out
+   of its curated history (finish_reason is None -> invalid)."
+  [response]
+  (let [cands (get response "candidates")]
+    (boolean
+     (or (some? (get-in response ["promptFeedback" "blockReason"]))
+         (and (sequential? cands) (seq cands)
+              (every? #(some? (get % "finishReason")) cands))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Public API — response accessors

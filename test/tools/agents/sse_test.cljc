@@ -9,8 +9,9 @@
      openai-responses-text  per-event Example JSON (response.created,
                             output_text.delta), trimmed; completed/done events
                             assembled from the same schema
-     gemini-text            hand-built GenerateContentResponse chunks (docs show
-                            only the ?alt=sse curl, no response body)
+     gemini-text            SYNTHETIC: hand-built GenerateContentResponse chunks
+                            (docs show only the ?alt=sse curl, no response
+                            body); also reduced by gemini-test's accumulator
      agents-turn            per-event schema Examples from the agents
                             streaming-events reference, placeholders replaced"
   (:require [clojure.string :as str]
