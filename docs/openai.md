@@ -77,6 +77,25 @@ Images (`tools.agents.openai.images`, openai-python's `client.images.*`):
 ;; => {"data" [{"url" "https://..."}]}  — image-bytes returns nil; fetch the URL (valid 60 min)
 ```
 
+Batches (`tools.agents.openai.batches`, openai-python's `client.batches.*`):
+
+```clojure
+(require '[tools.agents.openai.batches :as batches])
+
+(def in (batches/batch-input-jsonl "/v1/responses"               ;; fills "method" "POST" and "url"
+          [{"custom_id" "q1" "body" {"model" "gpt-5" "input" "2+2?"}}
+           {"custom_id" "q2" "body" {"model" "gpt-5" "input" "3+3?"}}]))
+(def in-file (files/files-create client {"file" {:content (.getBytes in "UTF-8") :filename "batch.jsonl"}
+                                         "purpose" "batch"}))
+(def b (batches/batches-create client {"input_file_id" (get in-file "id")
+                                       "endpoint" "/v1/responses"
+                                       "completion_window" "24h"}))
+(batches/batches-list client {"limit" 20})                       ;; cursor page; "after" = previous "last_id"
+;; poll (batches/batches-retrieve client (get b "id")) until "status" is "completed", then:
+(def res (batches/batches-results client (get b "id") {:errors? true}))
+(get-in res ["q1" "response" "body"])                            ;; lines are unordered — look up by custom_id
+```
+
 `client` resolves credentials eagerly — explicit `:api-key` first, then
 `OPENAI_API_KEY`, else it throws a catchable `ex-info` **before any network
 request is attempted** (fail fast). Failed requests are retried per
@@ -177,7 +196,10 @@ header, no query string) plus Microsoft's documentation.
 | `stream=True` on `images.generate` / `images.edit` (`ImageGenStreamEvent` / `ImageEditStreamEvent`) | *(not implemented)* | `"stream" true` throws `:tools.agents.openai/streaming-unsupported` before I/O, on both the JSON and the multipart path. |
 | `ImagesResponse.data[i].b64_json` (base64 decode by caller) | `(image-bytes item)` → `byte[]` | Not an SDK method. Standard Base64 decode of one `data` item; `nil` for a `url` item (dall-e `response_format` `url`, the dall-e default), which the caller fetches. All images: `(keep image-bytes (get resp "data"))`. |
 | `client.uploads.*` (`/uploads`, multi-part, up to 8 GB) | *(not implemented)* | Out of scope: `/files` takes up to 512 MB in one request. The SDK's `upload_file_chunked` uses 64 MB parts (`resources/uploads/uploads.py`). |
-| `client.batches.*` / `.fine_tuning.*` / Assistants / Realtime `connect` + `calls.*` | *(not implemented)* | Not yet ported. `request!` is the shared transport (any method, `:query`, JSON or multipart body, `:as :json`/`:string`/`:bytes`), so a new resource method is a single call. See Shared transport below. |
+| `client.batches.create(completion_window=, endpoint=, input_file_id=, metadata=, output_expires_after=)` | `(tools.agents.openai.batches/batches-create client {"input_file_id" id "endpoint" e "completion_window" "24h" ...})` | `POST /batches` JSON body, verbatim (`resources/batches.py`, `types/batch_create_params.py`); `output_expires_after` is a nested JSON object. `endpoint` is one of 8 values (`batches/endpoints`: `/v1/responses`, `/v1/chat/completions`, `/v1/embeddings`, `/v1/completions`, `/v1/moderations`, `/v1/images/generations`, `/v1/images/edits`, `/v1/videos`), sent verbatim, not validated. |
+| `client.batches.retrieve(batch_id)` / `.list(after=, limit=)` / `.cancel(batch_id)` | `(batches-retrieve client id)` / `(batches-list client params)` / `(batches-cancel client id)` | `GET /batches/{id}`, `GET /batches` (cursor page; no `order`), `POST /batches/{id}/cancel`. Ids are encoded as the SDK's `path_template` (`tools.agents.http/encode-path-segment`); an empty id throws `:tools.agents.openai/invalid-request` before I/O. The SDK has no batch wait helper, so none is ported. |
+| *(no SDK equivalent)* | `(batch-input-jsonl url requests)` / `(batches-results client batch {:errors? b})` | Helpers. `batch-input-jsonl` builds the input JSONL (unique non-empty `custom_id` enforced). `batches-results` takes a `Batch` map or id, downloads `output_file_id` (plus `error_file_id` with `:errors?`) via `files-content`, decodes with `tools.agents.openai/read-jsonl` and returns `{custom_id line}` — the output file is **not** in input order. No file id to read → `:invalid-request`; a malformed line → `:json-parse-error` (`:line`); a line without `custom_id` or a repeated one → `:invalid-response`. |
+| `client.fine_tuning.*` / Assistants / Realtime `connect` + `calls.*` | *(not implemented)* | Not yet ported. `request!` is the shared transport (any method, `:query`, JSON or multipart body, `:as :json`/`:string`/`:bytes`), so a new resource method is a single call. See Shared transport below. |
 | `admin_api_key` / `OPENAI_ADMIN_KEY`, Workload Identity Federation | *(not implemented)* | The credential chain here is explicit `:credential-source` → explicit `:api-key` → `OPENAI_API_KEY` → throw. Admin keys and the token exchange are not ported; the cache, per-attempt token and 401 retry they need are (`:credential-source`, see README, Refreshable credentials). |
 | Azure OpenAI v1: `OpenAI(base_url="https://<resource>.openai.azure.com/openai/v1/", api_key=...)` | `(client {:base-url "https://<resource>.openai.azure.com/openai/v1" :api-key ...})` | Works through `:base-url`; no Azure-specific code. API key or a static Entra ID token, both as `Authorization: Bearer`. A refreshing Entra token provider needs callable `:api-key` (#37). Not verified against a live Azure resource. See Azure OpenAI (v1 API) above. |
 | `AzureOpenAI(azure_endpoint=, azure_deployment=, api_version=)` (legacy) | *(not supported)* | Deployment path rewriting, the required `api-version` query and `AZURE_OPENAI_*` / `OPENAI_API_VERSION` env vars are not ported. Use the v1 API. |
@@ -231,9 +253,9 @@ Non-status error types:
 | missing credentials (client construction or a hand-built client map) | `:tools.agents.openai/missing-credentials` |
 | `:credential-source` not a `TokenSource`, or combined with `:api-key` | `:tools.agents.openai/invalid-credentials` |
 | `:stream true` requested | `:tools.agents.openai/streaming-unsupported` |
-| request rejected before any I/O (bad `:as`; files/images: missing/unsupported file or required field, empty file id — the SDK's `ValueError`) | `:tools.agents.openai/invalid-request` |
+| request rejected before any I/O (bad `:as`; files/images: missing/unsupported file or required field; an empty file or batch id — the SDK's `ValueError`; batches: bad `custom_id` in `batch-input-jsonl`, no result file id in `batches-results`) | `:tools.agents.openai/invalid-request` |
 | `files-wait-for-processing` gave up after `:max-wait-ms` (the SDK's `RuntimeError`; not an HTTP timeout; never retried) | `:tools.agents.openai/wait-timeout` |
-| response has no `"output"` / `"choices"` array, or an empty `"choices"` | `:tools.agents.openai/invalid-response` |
+| response has no `"output"` / `"choices"` array, or an empty `"choices"`; a batch result line without a string `custom_id`, or a repeated one | `:tools.agents.openai/invalid-response` |
 | structurally wrong content (non-array `"content"`, non-string `"text"`, non-string non-null `"content"`) | `:tools.agents.openai/invalid-content-shape` |
 | webhook: bad timestamp format, timestamp outside tolerance, or no matching signature (`InvalidWebhookSignatureError`) | `:tools.agents.openai/invalid-webhook-signature-error` |
 | webhook: `webhook-id` / `webhook-timestamp` / `webhook-signature` header absent (`:header` in ex-data) | `:tools.agents.openai/missing-webhook-header` |
@@ -511,7 +533,10 @@ invalidate-and-retry, token per attempt), `19280`–`19285` for the
 disk, list query, retrieve/delete, 404 typing, binary content round-trip,
 wait-for-processing), and `19300`–`19303` for the
 `tools.agents.openai.images` tests (generate JSON body, edit/variation multipart
-wire format, 4xx typing). Port `18999` is additionally used by the three tests that deliberately
+wire format, 4xx typing), and `19320`–`19325` for the
+`tools.agents.openai.batches` tests (create body, retrieve/cancel, 404
+typing, list paging, results shuffled and matched by `custom_id`, error file,
+malformed and duplicate lines). Port `18999` is additionally used by the three tests that deliberately
 start *no* server (missing credentials and the two connection-failure tests,
 which actually dial it and so assume nothing else on the host has `18999`
 bound).

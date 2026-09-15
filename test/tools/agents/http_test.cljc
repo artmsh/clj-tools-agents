@@ -40,6 +40,13 @@
   (testing "nil and empty values are dropped, as in openai-python"
     (is (= [] (http/flatten-params {"after" nil "q" ""})))))
 
+(deftest encode-path-segment-matches-openai-python-quoting
+  (is (= "ft:gpt-4o-mini:org:custom:ckpt-step-100" (http/encode-path-segment "ft:gpt-4o-mini:org:custom:ckpt-step-100")))
+  (is (= "a%2Fb%3Fc%23d%25e%20f" (http/encode-path-segment "a/b?c#d%e f")))
+  (is (= "!$&'()*+,;=:@-._~" (http/encode-path-segment "!$&'()*+,;=:@-._~")))
+  (is (= "caf%C3%A9%22%5B%5D" (http/encode-path-segment "café\"[]")))
+  (is (= "batch_1" (http/encode-path-segment :batch_1))))
+
 (deftest encode-params-url-encodes-names-and-values
   (is (= "metadata%5Bk%5D=a+b&image%5B%5D=x%2Fy"
          (http/encode-params (array-map "metadata" {"k" "a b"} "image" ["x/y"]))))
