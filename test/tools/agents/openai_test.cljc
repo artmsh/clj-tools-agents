@@ -8,7 +8,7 @@
             [tools.agents.openai.files :as files]
             [tools.agents.stream :as stream]
             [tools.agents.token :as token]
-            [tools.agents.test-support :refer [recording-http input-stream]]))
+            [tools.agents.test-support :refer [recording-http input-stream recording-codec throwing-codec]]))
 
 ;; ---------------------------------------------------------------------------
 ;; JSON codec
@@ -679,3 +679,67 @@
     (let [e (try (oai/client {:api-key "k" :http bad}) nil (catch Exception e e))]
       (is (= :tools.agents.openai/invalid-options (:type (ex-data e))) (pr-str bad))))
   (is (not (contains? (oai/client {:api-key "k"}) :http)) "absent unless injected"))
+
+;; ---------------------------------------------------------------------------
+;; Injected :json (#10)
+;; ---------------------------------------------------------------------------
+
+(deftest injected-json-encodes-and-decodes-the-wire
+  (let [{:keys [json reads writes]} (recording-codec)
+        {:keys [http calls]} (recording-http
+                              (fn [_] {:status 200 :headers {}
+                                       :body "{\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"hi\"}]}]}"}))
+        c (fake-client http :json json)]
+    (is (= "hi" (oai/output-text (oai/responses-create c {"model" "m"}))))
+    (is (= [1 1] [@writes @reads]))
+    (is (clojure.string/starts-with? (:body (first @calls)) " "))))
+
+(deftest injected-json-decodes-stream-events
+  (let [{:keys [json reads]} (recording-codec)
+        {:keys [http]} (recording-http (fn [_] {:status 200 :headers {}
+                                                :body (input-stream (slurp "test/resources/sse/openai-chat-text.sse"))}))
+        r (oai/accumulate-chat-completion-stream
+           (oai/chat-completions-stream (fake-client http :json json) {"model" "m" "messages" []}))]
+    (is (= "Hello" (oai/completion-text r)))
+    (is (pos? @reads))))
+
+(deftest injected-json-errors-are-this-namespaces-types
+  (let [{:keys [http]} (recording-http (fn [_] {:status 200 :headers {} :body "{\"output\":[]}"}))
+        thrown (fn [f] (try (f) nil (catch Exception e e)))
+        enc (thrown #(oai/responses-create (fake-client http :json throwing-codec) {"model" "m"}))
+        dec (thrown #(oai/responses-create (fake-client http :json (assoc throwing-codec :write oai/write-json))
+                                           {"model" "m"}))]
+    (is (= :tools.agents.openai/json-encode-error (:type (ex-data enc))))
+    (is (= "codec write boom" (ex-message (ex-cause enc))))
+    (is (= :tools.agents.openai/json-parse-error (:type (ex-data dec))))
+    (is (clojure.string/starts-with? (ex-message dec) "tools.agents.openai/read-json: "))
+    (is (= "codec read boom" (ex-message (ex-cause dec))))))
+
+(deftest invalid-json-option-is-rejected-at-construction
+  (doseq [bad [nil {} {:write oai/write-json} "jsonista"]]
+    (let [e (try (oai/client {:api-key "k" :json bad}) nil (catch Exception e e))]
+      (is (= :tools.agents.openai/invalid-options (:type (ex-data e))) (pr-str bad)))))
+
+#?(:bb
+   (deftest cheshire-codec-end-to-end
+     ;; bb bundles cheshire; the JVM classpath has no alternative codec.
+     (require 'cheshire.core)
+     (let [parse (resolve 'cheshire.core/parse-string)
+           gen   (resolve 'cheshire.core/generate-string)
+           {:keys [http calls]} (recording-http
+                                 (fn [req]
+                                   {:status 200 :headers {}
+                                    :body (if (= :stream (:as req))
+                                            (input-stream (slurp "test/resources/sse/openai-chat-text.sse"))
+                                            "{\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"hi\"}]}]}")}))
+           c (fake-client http :json {:read #(parse %) :write #(gen %)})]
+       (is (= "hi" (oai/output-text (oai/responses-create c {"model" "m" "input" [{"role" "user"}]}))))
+       (is (= {"model" "m" "input" [{"role" "user"}]} (oai/read-json (:body (first @calls)))))
+       (is (= "Hello" (oai/completion-text (oai/accumulate-chat-completion-stream
+                                            (oai/chat-completions-stream c {"model" "m" "messages" []})))))
+       (let [e (try (oai/responses-create (fake-client (constantly {:status 200 :headers {} :body "{bad"})
+                                                       :json {:read #(parse %) :write #(gen %)})
+                                          {"model" "m"})
+                    nil (catch Exception e e))]
+         (is (= :tools.agents.openai/json-parse-error (:type (ex-data e))))
+         (is (some? (ex-cause e)))))))

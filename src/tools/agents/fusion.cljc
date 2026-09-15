@@ -18,7 +18,8 @@
         opts (if (contains? spec :auth-token) (assoc opts :auth-token (:auth-token spec)) opts)
         opts (if (contains? spec :credential-source) (assoc opts :credential-source (:credential-source spec)) opts)
         opts (if (contains? spec :base-url) (assoc opts :base-url (:base-url spec)) opts)
-        opts (if (contains? spec :http) (assoc opts :http (:http spec)) opts)]
+        opts (if (contains? spec :http) (assoc opts :http (:http spec)) opts)
+        opts (if (contains? spec :json) (assoc opts :json (:json spec)) opts)]
     opts))
 
 (defn- prompt-with-system [spec prompt]

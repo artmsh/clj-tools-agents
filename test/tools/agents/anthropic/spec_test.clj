@@ -48,6 +48,11 @@
   (is (not (s/valid? ::spec/client-opts {:api-key 42})))
   (is (not (s/valid? ::spec/client-opts {:max-retries -1}))))
 
+(deftest client-opts-checks-injected-http-and-json
+  (is (s/valid? ::spec/client-opts {:http (fn [_] {:status 200}) :json {:read identity :write identity}}))
+  (is (not (s/valid? ::spec/client-opts {:http "not-a-fn"})))
+  (is (not (s/valid? ::spec/client-opts {:json {:read identity}}))))
+
 (deftest resolved-client-accepts-real-client-output
   (is (s/valid? ::spec/resolved-client (a/client {:api-key "k"})))
   (is (s/valid? ::spec/resolved-client (a/client {:auth-token "t"})))

@@ -80,7 +80,8 @@
      {:server srv
       :subscriptions (atom {})
       :write! write!
-      :send! (fn [msg] (write! (mcp/write-json msg)))})))
+      :send! (let [write (:write (mcp/codec-of srv))]
+               (fn [msg] (write! (write msg))))})))
 
 (defn notify!
   "Push a change notification to every open subscription that opted into its
@@ -135,7 +136,7 @@
    which a JSON-RPC error response may omit the id."
   [conn line]
   (let [parsed (try
-                 [::ok (mcp/read-json line)]
+                 [::ok ((:read (mcp/codec-of (:server conn))) line)]
                  (catch Exception e [::bad e]))]
     (if (= ::bad (first parsed))
       (do ((:send! conn) (mcp/error-response nil mcp/parse-error
@@ -213,7 +214,7 @@
    exactly as `handle-line!` would."
   [conn line]
   (let [srv (:server conn)
-        parsed (try [::ok (mcp/read-json line)] (catch Exception e [::bad e]))]
+        parsed (try [::ok ((:read (mcp/codec-of srv)) line)] (catch Exception e [::bad e]))]
     (cond
       (= ::bad (first parsed))
       (do ((:send! conn) (mcp/error-response nil mcp/parse-error
@@ -295,10 +296,17 @@
 
    The server's stderr is drained on its own thread into `:on-stderr`
    (default: discard). The spec says a client SHOULD NOT treat stderr output
-   as indicating an error."
+   as indicating an error.
+
+   `:json` is the codec {:read (fn [s]) :write (fn [v])} for the framed
+   messages; default the built-in codec. Its :write must never emit a raw
+   newline (the framing). A non-codec throws ::error/invalid-options."
   [command {:keys [on-notification on-stderr env]
-            :or {on-notification (fn [_])}}]
-  (let [pb (java.lang.ProcessBuilder. ^java.util.List (vec command))
+            :or {on-notification (fn [_])}
+            :as opts}]
+  (mcp/validate-json-option! "tools.agents.mcp.stdio/connect!" opts)
+  (let [codec (mcp/codec-of opts)
+        pb (java.lang.ProcessBuilder. ^java.util.List (vec command))
         _ (when (seq env)
             (let [m (.environment pb)]
               (doseq [[k v] env] (.put m (str (if (keyword? k) (name k) k)) (str v)))))
@@ -329,7 +337,7 @@
        ;; the response this would wait for, so drive one off :reader
        ;; directly rather than through :send!.
        (locking lock
-         (.write w (mcp/write-json msg))
+         (.write w ^String ((:write codec) msg))
          (.newLine w)
          (.flush w)
          (when (mcp/request? msg)
@@ -338,7 +346,7 @@
                (when (nil? line)
                  (throw (ex-info "tools.agents.mcp.stdio: server closed its output stream before responding"
                                  {:type :tools.agents.mcp.error/transport :request msg})))
-               (let [m (mcp/read-json line)]
+               (let [m ((:read codec) line)]
                  (if (and (map? m)
                           (= (get m "id") (get msg "id"))
                           (or (contains? m "result") (contains? m "error")))

@@ -11,7 +11,7 @@
             [tools.agents.mcp.client :as client]
             [tools.agents.mcp.http :as http]
             [tools.agents.mcp.server :as server]
-            [tools.agents.test-support :refer [start-server! start-abort-server!]]))
+            [tools.agents.test-support :refer [start-server! start-abort-server! recording-codec throwing-codec]]))
 
 (defn- free-port []
   (with-open [s (java.net.ServerSocket. 0)] (.getLocalPort s)))
@@ -262,3 +262,65 @@
 (deftest invalid-http-option-is-rejected
   (let [e (try (http/connect! "https://mcp.fake/mcp" {:http "nope"}) nil (catch Exception e e))]
     (is (= :tools.agents.mcp.error/invalid-options (:type (ex-data e))))))
+
+;; ---------------------------------------------------------------------------
+;; Injected :json (#10): server and client codecs over the in-process loopback
+;; ---------------------------------------------------------------------------
+
+(deftest injected-json-on-both-ends
+  (let [server-codec (recording-codec)
+        client-codec (recording-codec)
+        coded-srv (server/server {:name "wire" :json (:json server-codec)
+                                  :tools [{:name "echo" :handler (fn [_ctx args] (get args "m" "ok"))}]})
+        fake (fn [req]
+               (update (http/handle-http coded-srv {:request-method :post :headers (lower-keys (:headers req))
+                                                    :body (:body req)})
+                       :headers lower-keys))
+        t (http/connect! "https://mcp.fake/mcp" {:http fake :json (:json client-codec)})
+        c (a-client t)]
+    (is (= "hi" (mcp/output-text (client/call-tool! c "echo" {"m" "hi"}))))
+    (is (= [1 1] [@(:writes client-codec) @(:reads client-codec)]))
+    (is (= [1 1] [@(:writes server-codec) @(:reads server-codec)]))
+    (testing "an SSE answer: sse-event encodes with the server codec, connect! decodes with its own"
+      (let [notes (atom [])
+            sse-fake (fn [req]
+                       (let [id (get (mcp/read-json (:body req)) "id")]
+                         {:status 200 :headers sse-headers
+                          :body (str (http/sse-event coded-srv (mcp/notification "notifications/progress" {"progress" 1}))
+                                     (http/sse-event coded-srv (mcp/result-response id (mcp/tool-result [(mcp/text "done")]))))}))
+            t2 (http/connect! "https://mcp.fake/mcp" {:http sse-fake :json (:json client-codec)
+                                                      :on-notification #(swap! notes conj (get % "method"))})]
+        (is (= "done" (mcp/output-text (client/call-tool! (a-client t2) "noisy" {}))))
+        (is (= ["notifications/progress"] @notes))
+        (is (= 3 @(:reads client-codec)))
+        (is (= 3 @(:writes server-codec)))))
+    (testing "the server codec's read error is a -32700 parse error on the wire"
+      (let [bad-srv (server/server {:name "bad" :json (assoc throwing-codec :write mcp/write-json)})
+            r (http/handle-http bad-srv {:request-method :post :headers {} :body "{}"})
+            body (mcp/read-json (:body r))]
+        (is (= 400 (:status r)))
+        (is (= mcp/parse-error (get-in body ["error" "code"])))
+        (is (clojure.string/includes? (get-in body ["error" "message"]) "codec read boom"))))))
+
+(deftest injected-json-client-errors-are-mcp-types
+  (let [e (try ((:send! (http/connect! "https://mcp.fake/mcp"
+                                       {:http (fn [_] {:status 200 :headers {} :body ""}) :json throwing-codec}))
+                (mcp/request 1 "tools/list" {}))
+               nil (catch Exception e e))]
+    (is (= :tools.agents.mcp.error/json-encode (:type (ex-data e))))
+    (is (= "codec write boom" (ex-message (ex-cause e)))))
+  (doseq [f [#(http/connect! "https://mcp.fake/mcp" {:json "nope"})
+             #(server/server {:name "s" :json {:read identity}})]]
+    (is (= :tools.agents.mcp.error/invalid-options (:type (ex-data (try (f) nil (catch Exception e e))))))))
+
+#?(:bb nil ; serve! is JVM only
+   :clj
+   (deftest serve!-handler-threads-use-the-server-codec
+     (let [{:keys [json writes reads]} (recording-codec)
+           coded-srv (server/server {:name "wire" :json json
+                                     :tools [{:name "echo" :handler (fn [_ctx args] (get args "m"))}]})
+           {:keys [port stop!]} (http/serve! coded-srv {:port 0})]
+       (try
+         (is (= "hi" (mcp/output-text (client/call-tool! (a-client (http/connect! (url port))) "echo" {"m" "hi"}))))
+         (is (= [1 1] [@reads @writes]))
+         (finally (stop!))))))

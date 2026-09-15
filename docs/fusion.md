@@ -65,7 +65,8 @@ Useful keys:
 | `:auth-token` | Explicit bearer/OAuth token override (`:anthropic` only, forwarded to `tools.agents.anthropic/client`) |
 | `:credential-source` | A refreshable `tools.agents.token` source, forwarded to the provider's `client` (see README, Refreshable credentials) |
 | `:base-url` | Explicit endpoint override, useful for local tests |
-| `:http` | Request fn forwarded to the provider's `client` (see README, Bring your own HTTP client) |
+| `:http` | Request fn forwarded to the provider's `client` (see README, Bring your own HTTP client / JSON codec) |
+| `:json` | `{:read :write}` codec forwarded to the provider's `client` |
 | `:max-tokens` | Anthropic `max_tokens`, defaults to `1024` |
 | `:call` | Test/demo hook: `(fn [spec prompt] {:text ... :response ...})` |
 

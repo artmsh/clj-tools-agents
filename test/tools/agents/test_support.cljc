@@ -9,6 +9,7 @@
    Everything the suites assert above this leaf is identical handler logic
    and identical assertions on both runtimes."
   (:require [clojure.string :as str]
+            [tools.agents.json :as json]
             [tools.agents.token :as token]
             #?@(:bb [[org.httpkit.server :as hk]] :clj [])))
 
@@ -152,6 +153,23 @@
   (let [calls (atom [])]
     {:calls calls
      :http  (fn [req] (swap! calls conj req) (respond req))}))
+
+(defn recording-codec
+  "A caller-supplied `:json` codec that is NOT the built-in one: it delegates
+   to tools.agents.json but counts calls and prefixes every encoding with a
+   space (still valid JSON), so a test can see its output on the wire.
+   Returns {:json codec :reads atom :writes atom}."
+  []
+  (let [reads (atom 0) writes (atom 0)]
+    {:reads  reads
+     :writes writes
+     :json   {:read  (fn [s] (swap! reads inc) (json/read-json s))
+              :write (fn [v] (swap! writes inc) (str " " (json/write-json v)))}}))
+
+(def throwing-codec
+  "A `:json` codec whose fns throw untyped exceptions."
+  {:read  (fn [_] (throw (IllegalStateException. "codec read boom")))
+   :write (fn [_] (throw (IllegalStateException. "codec write boom")))})
 
 (defn input-stream
   "A UTF-8 ByteArrayInputStream over s: a streamed response body."

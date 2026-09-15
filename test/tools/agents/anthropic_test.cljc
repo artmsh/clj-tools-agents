@@ -7,7 +7,7 @@
             [tools.agents.anthropic.batches :as b]
             [tools.agents.stream :as stream]
             [tools.agents.token :as token]
-            [tools.agents.test-support :refer [recording-http input-stream]]))
+            [tools.agents.test-support :refer [recording-http input-stream recording-codec throwing-codec]]))
 
 ;; ---------------------------------------------------------------------------
 ;; JSON codec
@@ -892,3 +892,65 @@
     (let [e (try (a/client {:api-key "k" :http bad}) nil (catch Exception e e))]
       (is (= :tools.agents.anthropic.error/invalid-options (:type (ex-data e))) (pr-str bad))))
   (is (not (contains? (a/client {:api-key "k"}) :http)) "absent unless injected"))
+
+;; ---------------------------------------------------------------------------
+;; Injected :json (#10)
+;; ---------------------------------------------------------------------------
+
+(deftest injected-json-encodes-and-decodes-the-wire
+  (let [{:keys [json reads writes]} (recording-codec)
+        {:keys [http calls]} (recording-http (fn [_] {:status 200 :headers {} :body canned-message}))
+        c (a/client {:api-key "k" :http http :json json})]
+    (is (= "hi" (a/output-text (a/messages-create c {"model" "m" "max_tokens" 1 "messages" []}))))
+    (is (= 1 @writes))
+    (is (= 1 @reads))
+    (is (clojure.string/starts-with? (:body (first @calls)) " ") "the injected encoder's output is sent")))
+
+(deftest injected-json-decodes-stream-events-and-batch-results
+  (let [{:keys [json reads]} (recording-codec)
+        sse (str "event: message_start\n"
+                 "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"content\":[]}}\n\n"
+                 "event: message_stop\n"
+                 "data: {\"type\":\"message_stop\"}\n\n")
+        {:keys [http]} (recording-http (fn [req]
+                                         {:status 200 :headers {}
+                                          :body (if (= :stream (:as req))
+                                                  (input-stream sse)
+                                                  "{\"custom_id\":\"a\"}\n{\"custom_id\":\"b\"}\n")}))
+        c (a/client {:api-key "k" :http http :json json})]
+    (is (a/stream-complete? (a/accumulate-stream (a/messages-stream c {"model" "m" "max_tokens" 1 "messages" []}))))
+    (is (= 2 @reads))
+    (is (= ["a" "b"] (map #(get % "custom_id") (b/batches-results c "msgbatch_1"))))
+    (is (= 4 @reads))))
+
+(deftest injected-json-errors-are-this-namespaces-types
+  (let [{:keys [http]} (recording-http (fn [req]
+                                         {:status 200 :headers {}
+                                          :body (if (= :stream (:as req))
+                                                  (input-stream "data: {\"type\":\"ping\"}\n\n")
+                                                  canned-message)}))
+        read-only (assoc throwing-codec :write a/write-json)
+        thrown    (fn [f] (try (f) nil (catch Exception e e)))]
+    (testing "encode"
+      (let [e (thrown #(a/messages-create (a/client {:api-key "k" :http http :json throwing-codec})
+                                          {"model" "m" "max_tokens" 1 "messages" []}))]
+        (is (= :tools.agents.anthropic.error/json-encode (:type (ex-data e))))
+        (is (clojure.string/starts-with? (ex-message e) "tools.agents.anthropic/write-json: "))
+        (is (= "codec write boom" (ex-message (ex-cause e))))))
+    (testing "parse"
+      (let [e (thrown #(a/messages-create (a/client {:api-key "k" :http http :json read-only})
+                                          {"model" "m" "max_tokens" 1 "messages" []}))]
+        (is (= :tools.agents.anthropic.error/json-parse (:type (ex-data e))))
+        (is (= "codec read boom" (ex-message (ex-cause e))))))
+    (testing "parse, mid-stream"
+      (let [s (a/messages-stream (a/client {:api-key "k" :http http :json read-only})
+                                 {"model" "m" "max_tokens" 1 "messages" []})
+            e (thrown #(into [] s))]
+        (is (= :tools.agents.anthropic.error/json-parse (:type (ex-data e))))
+        (is (= "codec read boom" (ex-message (ex-cause e))))))))
+
+(deftest invalid-json-option-is-rejected-at-construction
+  (doseq [bad [nil {} {:read a/read-json} "cheshire"]]
+    (let [e (try (a/client {:api-key "k" :json bad}) nil (catch Exception e e))]
+      (is (= :tools.agents.anthropic.error/invalid-options (:type (ex-data e))) (pr-str bad))
+      (is (= :json (:option (ex-data e)))))))

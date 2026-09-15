@@ -45,6 +45,15 @@
     (is (= :tools.agents.openai/invalid-webhook-signature-error
            (err-type #(wh/verify-signature payload bad {:secret secret :now-s now}))))))
 
+(deftest unwrap-decodes-with-the-clients-json-codec
+  (let [{:keys [secret payload headers now]} sdk-vector
+        reads (atom 0)
+        c     (oai/client {:api-key "k" :json {:read (fn [s] (swap! reads inc) (oai/read-json s))
+                                               :write oai/write-json}})
+        evt   (wh/unwrap payload headers {:secret secret :now-s now :client c})]
+    (is (= "response.completed" (get evt "type")))
+    (is (= 1 @reads))))
+
 (deftest unwrap-verifies-then-parses
   (let [{:keys [secret payload headers now]} sdk-vector
         evt (wh/unwrap payload headers {:secret secret :now-s now})]

@@ -129,8 +129,10 @@
 (defn unwrap
   "Verify then parse — the analogue of `client.webhooks.unwrap(payload,
    headers, secret=)`. Same opts and errors as `verify-signature`; returns the
-   event decoded by `tools.agents.openai/read-json` (string keys)."
+   event decoded by `tools.agents.openai/read-json` (string keys), or by
+   :client's injected :json codec when opts carry one."
   ([payload headers] (unwrap payload headers {}))
   ([payload headers opts]
    (verify-signature payload headers opts)
-   (oai/read-json (if (string? payload) payload (String. ^bytes payload "UTF-8")))))
+   ((:read (oai/client-codec (:client opts)))
+    (if (string? payload) payload (String. ^bytes payload "UTF-8")))))

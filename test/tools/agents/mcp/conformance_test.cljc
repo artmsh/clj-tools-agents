@@ -429,6 +429,14 @@
                                                              "_meta" (meta*)}))
                           [:response "error" "code"])))))
 
+(deftest an-out-of-range-cursor-is-invalid-params
+  (let [paged (server/server {:name "paged" :page-size 2
+                              :tools [{:name "t" :handler (fn [_ _] "x")}]})]
+    (is (= -32602 (get-in (server/handle paged (mcp/request 1 "tools/list"
+                                                            {"cursor" "o99999999999999999999999"
+                                                             "_meta" (meta*)}))
+                          [:response "error" "code"])))))
+
 (deftest page-size-can-be-scoped-per-list-kind
   (let [s (server/server {:name "s"
                           :page-size {:resources 1}

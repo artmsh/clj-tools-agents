@@ -107,7 +107,17 @@ makes the pending `:send!` return nil.
 
 `(http/connect! url {:http f})` sends every POST through `f` instead of
 `tools.agents.http/request!` (same contract, called with `:as :stream`; a
-String body is accepted). See the README's "Bring your own HTTP client".
+String body is accepted). See the README's "Bring your own HTTP client / JSON
+codec".
+
+`:json` on `server/server` is the codec the server side encodes and decodes
+with: `handle-http` (and so `serve!`'s handler threads), `sse-event`'s
+2-arity `(sse-event srv message)` and `stdio/connection`. It travels on the
+server map, not a dynamic var. The client side takes its own `:json` on
+`http/connect!` and `stdio/connect!`. A codec exception surfaces as
+`::error/json-parse` / `::error/json-encode` with the original as cause; on
+the server a request body the codec cannot read is a -32700 response.
+`serve!`'s last-resort 500 body is always encoded with the built-in codec.
 
 ### Examples
 
@@ -346,7 +356,7 @@ and, where the schema fixes one, `:data`.
 | `::error/undeclared-input-request` / `::error/no-input-handler` | The server asked for a capability the client never declared, or one it declared without wiring a handler |
 | `::error/transport` | The transport failed underneath a request |
 | `::error/unsupported-runtime` | See Platform limitations |
-| `::error/invalid-options` | `http/connect!` got a non-fn `:http` |
+| `::error/invalid-options` | `http/connect!` got a non-fn `:http`; `server/server`, `http/connect!` or `stdio/connect!` got a `:json` that is not a `{:read :write}` codec map |
 
 `:type` values are flat keywords, not a `derive` hierarchy: flat keywords
 compare and pattern-match the same everywhere, and nothing here needs

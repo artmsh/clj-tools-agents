@@ -6,7 +6,7 @@
             [clojure.test :refer [deftest is testing]]
             [tools.agents.gemini :as g]
             [tools.agents.stream :as stream]
-            [tools.agents.test-support :refer [recording-http input-stream]]))
+            [tools.agents.test-support :refer [recording-http input-stream recording-codec throwing-codec]]))
 
 ;; ---------------------------------------------------------------------------
 ;; JSON codec
@@ -268,3 +268,36 @@
     (let [e (try (g/client {:api-key "k" :http bad}) nil (catch Exception e e))]
       (is (= :tools.agents.gemini/invalid-options (:type (ex-data e))) (pr-str bad))))
   (is (not (contains? (g/client {:api-key "k"}) :http)) "absent unless injected"))
+
+;; ---------------------------------------------------------------------------
+;; Injected :json (#10)
+;; ---------------------------------------------------------------------------
+
+(deftest injected-json-encodes-and-decodes-the-wire
+  (let [{:keys [json reads writes]} (recording-codec)
+        {:keys [http calls]} (recording-http
+                              (fn [req]
+                                {:status 200 :headers {}
+                                 :body (if (= :stream (:as req))
+                                         (input-stream (slurp "test/resources/sse/gemini-text.sse"))
+                                         "{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]}}]}")}))
+        c (fake-client http :json json)]
+    (is (= "hi" (g/output-text (g/generate-content c "m" {"contents" []}))))
+    (is (= [1 1] [@writes @reads]))
+    (is (str/starts-with? (:body (first @calls)) " "))
+    (is (g/stream-complete? (g/accumulate-stream (g/generate-content-stream c "m" {"contents" []}))))
+    (is (< 1 @reads) "stream chunks decode through the codec")))
+
+(deftest injected-json-errors-are-this-namespaces-types
+  (let [{:keys [http]} (recording-http (fn [_] {:status 200 :headers {} :body "{}"}))
+        thrown (fn [f] (try (f) nil (catch Exception e e)))
+        enc (thrown #(g/generate-content (fake-client http :json throwing-codec) "m" {}))
+        dec (thrown #(g/generate-content (fake-client http :json (assoc throwing-codec :write g/write-json)) "m" {}))]
+    (is (= :tools.agents.gemini/json-encode-error (:type (ex-data enc))))
+    (is (= "codec write boom" (ex-message (ex-cause enc))))
+    (is (= :tools.agents.gemini/json-parse-error (:type (ex-data dec))))
+    (is (= "codec read boom" (ex-message (ex-cause dec))))))
+
+(deftest invalid-json-option-is-rejected-at-construction
+  (let [e (try (g/client {:api-key "k" :json {:read g/read-json}}) nil (catch Exception e e))]
+    (is (= :tools.agents.gemini/invalid-options (:type (ex-data e))))))

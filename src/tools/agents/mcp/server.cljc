@@ -138,21 +138,30 @@
                     so paging a hundred resources need not also page a
                     dozen tools.
      :advertise-server-info?  default true
-     :experimental / :extensions  merged into the advertised capabilities"
+     :experimental / :extensions  merged into the advertised capabilities
+     :json          JSON codec {:read (fn [s]) :write (fn [v])} the
+                    transports (`http/handle-http`, `http/serve!`,
+                    `http/sse-event`, `stdio/connection`) use for this
+                    server's wire traffic; default the built-in codec.
+                    :read must yield string-keyed maps. A non-codec throws
+                    ::error/invalid-options."
   [{:keys [name version title description website-url icons instructions
            tools resources resource-templates prompts completions methods
            tools-list-changed? prompts-list-changed? resources-list-changed?
            resources-subscribe? logging? cache page-size
            advertise-server-info? experimental extensions]
-    :or {version "0.0.0" advertise-server-info? true}}]
+    :or {version "0.0.0" advertise-server-info? true}
+    :as opts}]
   (when-not (string? name)
     (throw (ex-info "tools.agents.mcp.server/server: :name is required and must be a string"
                     {:type :tools.agents.mcp.error/invalid-registration})))
+  (mcp/validate-json-option! "tools.agents.mcp.server/server" opts)
   (let [tools (mapv (comp (partial require-handler! "tool") (partial require-name! "tool")) tools)
         resources (mapv (comp (partial require-handler! "resource") (partial require-name! "resource")) resources)
         templates (mapv (comp (partial require-handler! "resource template") (partial require-name! "resource template")) resource-templates)
         prompts (mapv (comp (partial require-handler! "prompt") (partial require-name! "prompt")) prompts)]
-    {:info (into {} (remove (fn [[_ v]] (nil? v))
+    (cond->
+     {:info (into {} (remove (fn [[_ v]] (nil? v))
                             {"name" name "version" version "title" title
                              "description" description "websiteUrl" website-url
                              "icons" icons}))
@@ -175,7 +184,8 @@
      :page-size page-size
      :advertise-server-info? advertise-server-info?
      :experimental experimental
-     :extensions extensions}))
+     :extensions extensions}
+      (contains? opts :json) (assoc :json (:json opts)))))
 
 (defn capabilities
   "ServerCapabilities derived from what is actually registered — a server
@@ -216,7 +226,8 @@
                    (seq (subs cursor 1))
                    (every? #(contains? (set "0123456789") %) (subs cursor 1)))
       (mcp/invalid-params! (str "Invalid cursor: " (pr-str cursor))))
-    (mcp/read-json (subs cursor 1))))
+    (or (parse-long (subs cursor 1))
+        (mcp/invalid-params! (str "Invalid cursor: " (pr-str cursor))))))
 
 (defn- page-size-for
   "`:page-size` is either one number for every list, or a map keyed by list

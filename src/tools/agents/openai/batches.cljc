@@ -166,7 +166,8 @@
 (defn- file-lines
   "Download `file-id` and decode it as JSONL, fully realized."
   [client file-id]
-  (vec (oai/read-jsonl (String. ^bytes (files/files-content client file-id) "UTF-8"))))
+  (vec ((:read-jsonl (oai/client-codec client))
+        (String. ^bytes (files/files-content client file-id) "UTF-8"))))
 
 (defn- index-by-custom-id [fn-name acc lines]
   (reduce (fn [acc line]

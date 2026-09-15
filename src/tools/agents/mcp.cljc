@@ -120,10 +120,31 @@
 ;; JSON codec — tools.agents.json, bound to this namespace's error contract.
 ;; ---------------------------------------------------------------------------
 
-(def ^:private json-codec
-  (json/codec {:prefix      "tools.agents.mcp"
-               :encode-type :tools.agents.mcp.error/json-encode
-               :parse-type  :tools.agents.mcp.error/json-parse}))
+(def ^:private json-opts
+  {:prefix      "tools.agents.mcp"
+   :encode-type :tools.agents.mcp.error/json-encode
+   :parse-type  :tools.agents.mcp.error/json-parse})
+
+(def ^:private json-codec (json/codec json-opts))
+
+(defn codec-of
+  "The JSON codec for `m` — a server map, or a transport's opts map: its
+   :json {:read (fn [s]) :write (fn [v])} bound to this namespace's error
+   contract (tools.agents.json/wrap-codec), or the built-in codec when m has
+   none. A map {:read :write :read-jsonl :key->str}."
+  [m]
+  (if-let [j (:json m)]
+    (json/wrap-codec j json-opts)
+    json-codec))
+
+(defn validate-json-option!
+  "Throw ::error/invalid-options unless `opts` lacks :json or holds a codec
+   map. `caller` prefixes the message."
+  [caller opts]
+  (when (and (contains? opts :json) (not (json/codec-map? (:json opts))))
+    (throw (ex-info (str caller ": :json must be a map {:read (fn [s]) :write (fn [v])}, got: "
+                         (pr-str (:json opts)))
+                    {:type :tools.agents.mcp.error/invalid-options :option :json}))))
 
 (defn json-key->str
   "Coerce a map key (string/keyword/symbol) to its wire string form, verbatim
