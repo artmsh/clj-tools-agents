@@ -62,6 +62,21 @@ Files (`tools.agents.openai.files`, openai-python's `client.files.*`):
 (files/files-delete client (get f "id"))                                 ;; => {"id" ... "deleted" true}
 ```
 
+Images (`tools.agents.openai.images`, openai-python's `client.images.*`):
+
+```clojure
+(require '[tools.agents.openai.images :as images])
+
+(def r (images/images-generate client {"model" "gpt-image-1" "prompt" "a red fox" "size" "1024x1024"}))
+(images/image-bytes (first (get r "data")))                              ;; b64_json -> byte[]
+(images/images-edit client {"image"  [(java.io.File. "a.png") (java.io.File. "b.png")] ;; parts image[]
+                            "mask"   (java.io.File. "mask.png")
+                            "prompt" "put them together"})
+(images/images-create-variation client {"image" {:content png-bytes :filename "in.png"}
+                                        "model" "dall-e-2" "response_format" "url"})
+;; => {"data" [{"url" "https://..."}]}  — image-bytes returns nil; fetch the URL (valid 60 min)
+```
+
 `client` resolves credentials eagerly — explicit `:api-key` first, then
 `OPENAI_API_KEY`, else it throws a catchable `ex-info` **before any network
 request is attempted** (fail fast). Failed requests are retried per
@@ -156,8 +171,13 @@ header, no query string) plus Microsoft's documentation.
 | `client.files.list(after=, limit=, order=, purpose=)` / `.retrieve(file_id)` / `.delete(file_id)` | `(files-list client params)` / `(files-retrieve client id)` / `(files-delete client id)` | `GET /files` with `:query` (`types/file_list_params.py`) returns one cursor page (`"data"`, `"has_more"`, `"last_id"`; pass `"after"` for the next page). `GET`/`DELETE /files/{id}` with the id path-encoded. An empty id throws `:tools.agents.openai/invalid-request` before I/O (the SDK's `ValueError`). |
 | `client.files.content(file_id)` | `(files-content client id)` → `byte[]` | `GET /files/{id}/content` with `Accept: application/binary` and `:as :bytes`; byte-exact. The deprecated `retrieve_content` (the same GET decoded as `str`, `resources/files.py:331`) is not ported. |
 | `client.files.wait_for_processing(id, poll_interval=5.0, max_wait_seconds=1800)` | `(files-wait-for-processing client id {:poll-interval-ms :max-wait-ms :sleep-fn :now-fn})` | `lib/_files.py`: polls `retrieve` until `status` is `processed`, `error` or `deleted`. The SDK's `RuntimeError` on timeout is `:tools.agents.openai/wait-timeout`. |
+| `client.images.generate(prompt=, model=, n=, size=, quality=, ...)` | `(tools.agents.openai.images/images-generate client request)` | `POST /images/generations` JSON, request sent verbatim (`resources/images.py` `generate`, `types/image_generate_params.py`). A missing `prompt` throws `:tools.agents.openai/invalid-request` before I/O (the SDK's `required_args`). |
+| `client.images.edit(image=, prompt=, mask=, ...)` | `(images-edit client {"image" f-or-[f ...] "prompt" p "mask" m ...})` | `POST /images/edits` multipart. Scalar fields first, bracket-flattened (`_serialize_multipartform`), then image parts, then `mask`, per `extract_files(paths=[["image"], ["image", "<array>"], ["mask"]])`: a single file is part `image`, a sequence is one `image[]` part per entry (brackets `_array_suffix`). File forms as in `files-create`. The part Content-Type is `:content-type`, else guessed from the filename (png, jpg/jpeg, webp, gif), as httpx does (`mimetypes.guess_type`). **Deviation from `files-create`**, which defaults to `application/octet-stream`: GPT image edits are reported to fail with `unsupported mimetype ('application/octet-stream')` (not verified against the live API here). `edit-parts` returns the parts without I/O. |
+| `client.images.create_variation(image=, model=, n=, size=, response_format=)` | `(images-create-variation client {"image" f ...})` | `POST /images/variations` multipart with one `image` part. **`dall-e-2` only** (`resources/images.py`); `model` is sent verbatim, not validated. A sequence of images throws `:tools.agents.openai/invalid-request`. |
+| `stream=True` on `images.generate` / `images.edit` (`ImageGenStreamEvent` / `ImageEditStreamEvent`) | *(not implemented)* | `"stream" true` throws `:tools.agents.openai/streaming-unsupported` before I/O, on both the JSON and the multipart path. |
+| `ImagesResponse.data[i].b64_json` (base64 decode by caller) | `(image-bytes item)` → `byte[]` | Not an SDK method. Standard Base64 decode of one `data` item; `nil` for a `url` item (dall-e `response_format` `url`, the dall-e default), which the caller fetches. All images: `(keep image-bytes (get resp "data"))`. |
 | `client.uploads.*` (`/uploads`, multi-part, up to 8 GB) | *(not implemented)* | Out of scope: `/files` takes up to 512 MB in one request. The SDK's `upload_file_chunked` uses 64 MB parts (`resources/uploads/uploads.py`). |
-| `client.images.*` / `.batches.*` / `.fine_tuning.*` / Assistants / Realtime `connect` + `calls.*` | *(not implemented)* | Not yet ported. `request!` is the shared transport (any method, `:query`, JSON or multipart body, `:as :json`/`:string`/`:bytes`), so a new resource method is a single call. See Shared transport below. |
+| `client.batches.*` / `.fine_tuning.*` / Assistants / Realtime `connect` + `calls.*` | *(not implemented)* | Not yet ported. `request!` is the shared transport (any method, `:query`, JSON or multipart body, `:as :json`/`:string`/`:bytes`), so a new resource method is a single call. See Shared transport below. |
 | `admin_api_key` / `OPENAI_ADMIN_KEY`, Workload Identity Federation | *(not implemented)* | The credential chain here is explicit `:api-key` → `OPENAI_API_KEY` → throw. The SDK's fuller chain (admin keys, token-exchange workload identity) is out of scope. |
 | Azure OpenAI v1: `OpenAI(base_url="https://<resource>.openai.azure.com/openai/v1/", api_key=...)` | `(client {:base-url "https://<resource>.openai.azure.com/openai/v1" :api-key ...})` | Works through `:base-url`; no Azure-specific code. API key or a static Entra ID token, both as `Authorization: Bearer`. A refreshing Entra token provider needs callable `:api-key` (#37). Not verified against a live Azure resource. See Azure OpenAI (v1 API) above. |
 | `AzureOpenAI(azure_endpoint=, azure_deployment=, api_version=)` (legacy) | *(not supported)* | Deployment path rewriting, the required `api-version` query and `AZURE_OPENAI_*` / `OPENAI_API_VERSION` env vars are not ported. Use the v1 API. |
@@ -207,7 +227,7 @@ Non-status error types:
 | malformed request/response JSON | `:tools.agents.openai/json-encode-error` / `:tools.agents.openai/json-parse-error` |
 | missing credentials (client construction or a hand-built client map) | `:tools.agents.openai/missing-credentials` |
 | `:stream true` requested | `:tools.agents.openai/streaming-unsupported` |
-| request rejected before any I/O (bad `:as`; files: missing/unsupported `"file"`, empty file id — the SDK's `ValueError`) | `:tools.agents.openai/invalid-request` |
+| request rejected before any I/O (bad `:as`; files/images: missing/unsupported file or required field, empty file id — the SDK's `ValueError`) | `:tools.agents.openai/invalid-request` |
 | `files-wait-for-processing` gave up after `:max-wait-ms` (the SDK's `RuntimeError`; not an HTTP timeout; never retried) | `:tools.agents.openai/wait-timeout` |
 | response has no `"output"` / `"choices"` array, or an empty `"choices"` | `:tools.agents.openai/invalid-response` |
 | structurally wrong content (non-array `"content"`, non-string `"text"`, non-string non-null `"content"`) | `:tools.agents.openai/invalid-content-shape` |
@@ -482,7 +502,9 @@ tests, `19391` for the Azure v1 example, and `19400`–`19406` for the
 headers rebuilt per attempt), and `19280`–`19285` for the
 `tools.agents.openai.files` tests (multipart wire format, File streamed from
 disk, list query, retrieve/delete, 404 typing, binary content round-trip,
-wait-for-processing). Port `18999` is additionally used by the three tests that deliberately
+wait-for-processing), and `19300`–`19303` for the
+`tools.agents.openai.images` tests (generate JSON body, edit/variation multipart
+wire format, 4xx typing). Port `18999` is additionally used by the three tests that deliberately
 start *no* server (missing credentials and the two connection-failure tests,
 which actually dial it and so assume nothing else on the host has `18999`
 bound).
