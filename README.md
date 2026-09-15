@@ -291,7 +291,8 @@ loudly if either runtime is red for any suite. Hermetic — mock servers and
 in-process loopbacks only, no outbound network. See each doc's Testing
 section for what each suite covers; the core suite (`tools.agents.json`, the
 shared JSON codec, `tools.agents.http`, the shared request function,
-`tools.agents.sse`, the pure SSE parser, and `tools.agents.stream`, the
+`tools.agents.sse`, the pure SSE parser, `tools.agents.retry`, the retry loop
+every client runs its per-SDK policy through, and `tools.agents.stream`, the
 streaming transport — see docs/openai.md's "Streaming transport") is
 documented in those namespaces' docstrings.
 
