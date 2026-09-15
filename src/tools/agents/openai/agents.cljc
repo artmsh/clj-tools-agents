@@ -55,6 +55,8 @@
      - Reading saved work: list a session's items (saved messages and tool
        calls) and pull assistant text out of them; list or retrieve its
        turns, which carry each turn's status and error.
+     - Subagents: list or retrieve a session's subagents, and list their
+       items, turns (list, retrieve) and per-turn items.
      - OpenAI-hosted sandbox status: poll an environment's provisioning state.
      - Files: list and download (`byte[]`) a session's published artifacts,
        delete one; list a connected environment's files (token paging) and
@@ -498,6 +500,92 @@
                   turn
                   best))
               nil data))))
+
+;; ---------------------------------------------------------------------------
+;; Public API — subagents
+;;
+;; Source: https://developers.openai.com/api/reference/resources/beta/subresources/agents/subresources/sessions/subresources/subagents/methods/{retrieve,list}/index.md,
+;; .../subagents/subresources/items/methods/list/index.md,
+;; .../subagents/subresources/turns/methods/{retrieve,list}/index.md,
+;; .../subagents/subresources/turns/subresources/items/methods/list/index.md,
+;; and openai-python src/openai/resources/beta/agents/sessions/subagents/**.
+;; Every list here is CURSOR paged (`SyncCursorPage`): "after", "limit"
+;; (1-100, default 20), "order" ("asc"|"desc", default "desc"); page with
+;; "after" = the previous page's "last_id" while "has_more" is true.
+;; ---------------------------------------------------------------------------
+
+(defn- subagent-path [session-id subagent-id]
+  (str "/agents/sessions/" (path-segment session-id) "/subagents/" (path-segment subagent-id)))
+
+(defn sessions-subagents-list
+  "GET {base-url}/agents/sessions/{session-id}/subagents — the session's
+   subagents, including nested and closed ones, the analogue of
+   `client.beta.agents.sessions.subagents.list(session_id, **params)`.
+   `params`: \"after\", \"limit\", \"order\" (cursor paging, see above).
+
+   Each `Subagent` carries \"id\", \"object\" \"agent.session.subagent\",
+   \"session_id\", \"parent_agent_id\", \"name\" (runner-assigned, or nil),
+   \"status\" (\"active\", also while idle between turns, or \"closed\"),
+   \"opened_at\", \"closed_at\" (nil while active, including after a resume)
+   and \"instructions\" (content blocks, or nil). The harness creates
+   subagents when the session's agent sets \"multi_agent\" {\"enabled\" true}
+   (guide https://developers.openai.com/api/docs/guides/agents-api/multi-agent.md)."
+  ([client session-id] (sessions-subagents-list client session-id nil))
+  ([client session-id params]
+   (send-request! client "sessions-subagents-list" :get
+                  (str "/agents/sessions/" (path-segment session-id) "/subagents") nil {:query params})))
+
+(defn sessions-subagents-retrieve
+  "GET {base-url}/agents/sessions/{session-id}/subagents/{subagent-id} — one
+   `Subagent` (shape in `sessions-subagents-list`), the analogue of
+   `client.beta.agents.sessions.subagents.retrieve(subagent_id, session_id=)`."
+  [client session-id subagent-id]
+  (send-request! client "sessions-subagents-retrieve" :get (subagent-path session-id subagent-id) nil))
+
+(defn sessions-subagents-items-list
+  "GET {base-url}/agents/sessions/{session-id}/subagents/{subagent-id}/items
+   — the subagent's own items across all its turns, the analogue of
+   `client.beta.agents.sessions.subagents.items.list(subagent_id, session_id=, **params)`.
+   Same item shape as `sessions-items-list`, so `items-output-text` applies.
+   `params`: \"after\", \"limit\", \"order\" (cursor paging)."
+  ([client session-id subagent-id] (sessions-subagents-items-list client session-id subagent-id nil))
+  ([client session-id subagent-id params]
+   (send-request! client "sessions-subagents-items-list" :get
+                  (str (subagent-path session-id subagent-id) "/items") nil {:query params})))
+
+(defn sessions-subagents-turns-list
+  "GET {base-url}/agents/sessions/{session-id}/subagents/{subagent-id}/turns
+   — every turn of one subagent, including turns after a resume, the analogue
+   of `client.beta.agents.sessions.subagents.turns.list(subagent_id, session_id=, **params)`.
+   Same `Turn` shape as `sessions-turns-list`, with \"subagent_id\" set.
+   `sessions-turns-list` already returns every turn in the session, root and
+   subagent alike (hence `latest-root-turn`'s filter); this is the
+   per-subagent view. `params`: \"after\", \"limit\", \"order\" (cursor
+   paging)."
+  ([client session-id subagent-id] (sessions-subagents-turns-list client session-id subagent-id nil))
+  ([client session-id subagent-id params]
+   (send-request! client "sessions-subagents-turns-list" :get
+                  (str (subagent-path session-id subagent-id) "/turns") nil {:query params})))
+
+(defn sessions-subagents-turns-retrieve
+  "GET {base-url}/agents/sessions/{session-id}/subagents/{subagent-id}/turns/{turn-id}
+   — one subagent turn (\"status\", timestamps, \"usage\", \"error\"), the
+   analogue of `client.beta.agents.sessions.subagents.turns.retrieve(turn_id, session_id=, subagent_id=)`."
+  [client session-id subagent-id turn-id]
+  (send-request! client "sessions-subagents-turns-retrieve" :get
+                 (str (subagent-path session-id subagent-id) "/turns/" (path-segment turn-id)) nil))
+
+(defn sessions-subagents-turns-items-list
+  "GET {base-url}/agents/sessions/{session-id}/subagents/{subagent-id}/turns/{turn-id}/items
+   — the items of one subagent turn, the analogue of
+   `client.beta.agents.sessions.subagents.turns.items.list(turn_id, session_id=, subagent_id=, **params)`.
+   `params`: \"after\", \"limit\", \"order\" (cursor paging)."
+  ([client session-id subagent-id turn-id]
+   (sessions-subagents-turns-items-list client session-id subagent-id turn-id nil))
+  ([client session-id subagent-id turn-id params]
+   (send-request! client "sessions-subagents-turns-items-list" :get
+                  (str (subagent-path session-id subagent-id) "/turns/" (path-segment turn-id) "/items") nil
+                  {:query params})))
 
 ;; ---------------------------------------------------------------------------
 ;; Public API — event streaming

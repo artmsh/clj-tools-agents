@@ -1230,6 +1230,68 @@
   (str "{\"object\":\"list\",\"data\":[" (str/join "," item-jsons) "],"
        "\"first_id\":\"a\",\"last_id\":\"b\",\"has_more\":true}"))
 
+;; --- subagents ----------------------------------------------------------------
+
+(def ^:private canned-subagent
+  (str "{\"id\":\"subagent_1\",\"object\":\"agent.session.subagent\",\"session_id\":\"sess_1\","
+       "\"parent_agent_id\":\"agent_root\",\"name\":\"Hume\",\"status\":\"active\",\"opened_at\":0,"
+       "\"closed_at\":null,\"instructions\":[{\"type\":\"output_text\",\"text\":\"review A\"}]}"))
+
+(def ^:private canned-subagent-turn
+  (str "{\"id\":\"turn_7\",\"object\":\"agent.session.turn\",\"session_id\":\"sess_1\","
+       "\"agent_id\":\"agent_1\",\"subagent_id\":\"subagent_1\",\"status\":\"completed\",\"error\":null}"))
+
+(def ^:private canned-assistant-item
+  "{\"id\":\"item_1\",\"type\":\"message\",\"role\":\"assistant\",\"turn_id\":\"turn_7\",\"content\":[{\"type\":\"output_text\",\"text\":\"A adds date filters.\"}]}")
+
+(deftest sessions-subagents-methods-paths-queries-and-responses
+  (with-recording-server
+    (fn [{:keys [path]}]
+      {:status 200
+       :body (condp re-matches path
+               #".*/subagents"             (list-page canned-subagent)
+               #".*/subagents/[^/]+"       canned-subagent
+               #".*/items"                 (list-page canned-assistant-item)
+               #".*/turns"                 (list-page canned-subagent-turn)
+               #".*/turns/[^/]+"           canned-subagent-turn)})
+    (fn [client calls]
+      (let [page {"after" "x_0" "limit" 3 "order" "asc"}
+            q    {"after" "x_0" "limit" "3" "order" "asc"}]
+        (is (= "agent.session.subagent" (get-in (agents/sessions-subagents-list client "sess_1" page) ["data" 0 "object"])))
+        (agents/sessions-subagents-list client "sess_1")
+        (is (= "active" (get (agents/sessions-subagents-retrieve client "sess_1" "subagent_1") "status")))
+        (is (= "A adds date filters."
+               (agents/items-output-text (agents/sessions-subagents-items-list client "sess_1" "subagent_1" page))))
+        (agents/sessions-subagents-items-list client "sess_1" "subagent_1")
+        (is (= "subagent_1" (get-in (agents/sessions-subagents-turns-list client "sess_1" "subagent_1" page)
+                                    ["data" 0 "subagent_id"])))
+        (agents/sessions-subagents-turns-list client "sess_1" "subagent_1")
+        (is (agents/turn-finished? (agents/sessions-subagents-turns-retrieve client "sess_1" "subagent_1" "turn_7")))
+        (is (= "item_1" (get-in (agents/sessions-subagents-turns-items-list client "sess_1" "subagent_1" "turn_7" page)
+                                ["data" 0 "id"])))
+        (agents/sessions-subagents-turns-items-list client "sess_1" "subagent_1" "turn_7")
+        (is (= [["GET" "/v1/agents/sessions/sess_1/subagents" q nil]
+                ["GET" "/v1/agents/sessions/sess_1/subagents" nil nil]
+                ["GET" "/v1/agents/sessions/sess_1/subagents/subagent_1" nil nil]
+                ["GET" "/v1/agents/sessions/sess_1/subagents/subagent_1/items" q nil]
+                ["GET" "/v1/agents/sessions/sess_1/subagents/subagent_1/items" nil nil]
+                ["GET" "/v1/agents/sessions/sess_1/subagents/subagent_1/turns" q nil]
+                ["GET" "/v1/agents/sessions/sess_1/subagents/subagent_1/turns" nil nil]
+                ["GET" "/v1/agents/sessions/sess_1/subagents/subagent_1/turns/turn_7" nil nil]
+                ["GET" "/v1/agents/sessions/sess_1/subagents/subagent_1/turns/turn_7/items" q nil]
+                ["GET" "/v1/agents/sessions/sess_1/subagents/subagent_1/turns/turn_7/items" nil nil]]
+               (mapv wire @calls)))
+        (is (every? #(= "agents=v1" (get-in % [:headers "openai-beta"])) @calls))))))
+
+(deftest sessions-subagents-retrieve-404-maps-to-not-found
+  (with-recording-server
+    (constantly {:status 404 :body "{\"error\":{\"message\":\"No such subagent\"}}"})
+    (fn [client _]
+      (let [e (try (agents/sessions-subagents-retrieve client "sess_1" "subagent_missing") nil
+                   (catch Exception e e))]
+        (is (= :tools.agents.openai/not-found-error (:type (ex-data e))))
+        (is (str/includes? (ex-message e) "sessions-subagents-retrieve: HTTP 404 No such subagent"))))))
+
 ;; --- sessions-update ----------------------------------------------------------
 
 (deftest sessions-update-posts-metadata-to-the-session

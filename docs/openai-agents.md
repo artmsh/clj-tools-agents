@@ -68,6 +68,16 @@ the [files guide](https://developers.openai.com/api/docs/guides/agents-api/envir
 and openai-python's `sessions/artifacts.py` / `environments/files.py`.
 The reference has no environment-file retrieve, delete or content endpoint.
 
+Subagents are implemented from the reference pages
+([list](https://developers.openai.com/api/reference/resources/beta/subresources/agents/subresources/sessions/subresources/subagents/methods/list/index.md),
+[retrieve](https://developers.openai.com/api/reference/resources/beta/subresources/agents/subresources/sessions/subresources/subagents/methods/retrieve/index.md),
+[items list](https://developers.openai.com/api/reference/resources/beta/subresources/agents/subresources/sessions/subresources/subagents/subresources/items/methods/list/index.md),
+[turns list](https://developers.openai.com/api/reference/resources/beta/subresources/agents/subresources/sessions/subresources/subagents/subresources/turns/methods/list/index.md),
+[turns retrieve](https://developers.openai.com/api/reference/resources/beta/subresources/agents/subresources/sessions/subresources/subagents/subresources/turns/methods/retrieve/index.md),
+[turn items list](https://developers.openai.com/api/reference/resources/beta/subresources/agents/subresources/sessions/subresources/subagents/subresources/turns/subresources/items/methods/list/index.md)),
+the [multi-agent guide](https://developers.openai.com/api/docs/guides/agents-api/multi-agent.md)
+and openai-python's `sessions/subagents/**`. Not yet verified live.
+
 Session update is implemented from the
 [reference page](https://developers.openai.com/api/reference/resources/beta/subresources/agents/subresources/sessions/methods/update/index.md)
 and openai-python's `sessions/sessions.py`: metadata only. Not yet verified
@@ -237,6 +247,12 @@ test suite runs it instantly against a mock server) and
 | `GET /v1/agents/sessions/{id}/turns/{turn_id}` (API reference; verified live) | `(sessions-turns-retrieve client session-id turn-id)` | |
 | *(no SDK helper)* | `(latest-root-turn turns-response)` / `(turn-finished? turn)` | Pure: newest turn with `"subagent_id"` nil; terminal status check. See Streaming below. |
 | `item.content[…].text` traversal (no single SDK helper — see below) | `(items-output-text items-response)` | Concatenates every assistant `output_text` block, oldest-first when called with `{"order" "asc"}`. Deliberately more lenient than `tools.agents.openai/output-text` on a non-array `"content"`; see [divergences.md](divergences.md). |
+| `client.beta.agents.sessions.subagents.list(session_id, **params)` — `GET /v1/agents/sessions/{session_id}/subagents` | `(sessions-subagents-list client session-id params)` / `(sessions-subagents-list client session-id)` | Cursor paging (`after`/`limit`/`order`). Includes nested and closed subagents. `Subagent`: `status` `"active"`/`"closed"`, `parent_agent_id`, `name`, `opened_at`/`closed_at`, `instructions`. |
+| `client.beta.agents.sessions.subagents.retrieve(subagent_id, session_id=)` — `GET /v1/agents/sessions/{session_id}/subagents/{subagent_id}` | `(sessions-subagents-retrieve client session-id subagent-id)` | |
+| `client.beta.agents.sessions.subagents.items.list(subagent_id, session_id=, **params)` — `GET …/subagents/{subagent_id}/items` | `(sessions-subagents-items-list client session-id subagent-id params)` / 3-arity | The subagent's own items across its turns; cursor paging; same item shape, so `items-output-text` applies. |
+| `client.beta.agents.sessions.subagents.turns.list(subagent_id, session_id=, **params)` — `GET …/subagents/{subagent_id}/turns` | `(sessions-subagents-turns-list client session-id subagent-id params)` / 3-arity | Per-subagent view, including turns after a resume; `sessions-turns-list` already mixes root and subagent turns. Cursor paging. |
+| `client.beta.agents.sessions.subagents.turns.retrieve(turn_id, session_id=, subagent_id=)` — `GET …/subagents/{subagent_id}/turns/{turn_id}` | `(sessions-subagents-turns-retrieve client session-id subagent-id turn-id)` | `Turn` with `subagent_id` set; `turn-finished?` applies. |
+| `client.beta.agents.sessions.subagents.turns.items.list(turn_id, session_id=, subagent_id=, **params)` — `GET …/subagents/{subagent_id}/turns/{turn_id}/items` | `(sessions-subagents-turns-items-list client session-id subagent-id turn-id params)` / 4-arity | Items of one subagent turn; cursor paging. |
 | `GET /v1/agents/environments/{id}` (literal endpoint text, API reference) | `(environments-retrieve client environment-id)` | Poll a sandbox's `"status"`: `"pending"`, `"connected"`, `"disconnected"`, `"expired"` or `"failed"` (API reference). Also carries `"type"`, `"files"`, `"plugins"`, `"skills"`. |
 | `codex exec-server --remote ... --environment-id ...` (shell, not an SDK call) | `(self-hosted-executor-command session)` | Pure function from a created self-hosted session to the executor's argv — see Self-hosted sandboxes below for what this library does and does not do here. |
 | `client.beta.agents.sessions.artifacts.list(session_id, **params)` — `GET /v1/agents/sessions/{session_id}/artifacts` | `(sessions-artifacts-list client session-id params)` / `(sessions-artifacts-list client session-id)` | Cursor paging like `sessions-list`: `after`/`limit` (1-100)/`order` (default `desc`), plus `environment_id`. Only `openai_hosted`, only `/workspace/outputs`, only on turn completion. Match on `turn_id` + `path`. |
@@ -613,6 +629,12 @@ body sent as JSON null; and a 400 on credential create typed
 `vaults-crud-round-trip-against-the-real-api` (same gate; no inference, no
 credential) runs create → retrieve → list (polled) → empty credential list →
 delete → retrieve 404. It **has not been run yet**.
+
+Subagents (#49): method, path, beta header and cursor query for all six
+methods (with and without params), `items-output-text` over subagent items,
+`turn-finished?` over a subagent turn, and a 404 typed `not-found-error`. No
+live test: subagents exist only after a multi-agent turn, which costs
+inference.
 
 `sessions-update` (#49): POST to the session path with the metadata body,
 `nil` metadata sent as JSON null, `"stream" true` rejected before any
