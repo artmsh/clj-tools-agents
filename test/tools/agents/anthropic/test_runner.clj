@@ -5,6 +5,7 @@
             tools.agents.anthropic.batches-test
             tools.agents.anthropic.credentials-test
             tools.agents.anthropic.live-test
+            tools.agents.anthropic.profile-test
             tools.agents.anthropic.spec-test
             tools.agents.anthropic.stream-test
             tools.agents.anthropic.visualize-test))
@@ -14,6 +15,7 @@
    'tools.agents.anthropic.batches-test
    'tools.agents.anthropic.credentials-test
    'tools.agents.anthropic.live-test
+   'tools.agents.anthropic.profile-test
    'tools.agents.anthropic.spec-test
    'tools.agents.anthropic.stream-test
    'tools.agents.anthropic.visualize-test])

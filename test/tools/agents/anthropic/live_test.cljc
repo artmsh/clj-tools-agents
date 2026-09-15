@@ -191,7 +191,10 @@
   ;; No server started at this port at all — if a network call were ever
   ;; attempted, this would hang/error with a connection failure instead of
   ;; the expected missing-credentials error.
-  (let [e (try (a/client {:base-url "http://127.0.0.1:18999"}) nil (catch Exception e e))]
+  (let [home (str (java.nio.file.Files/createTempDirectory "anthropic-home" (make-array java.nio.file.attribute.FileAttribute 0)))
+        e    (try (with-redefs [a/user-home (constantly home)] ; never the real ~/.config/anthropic
+                    (a/client {:base-url "http://127.0.0.1:18999"}))
+                  nil (catch Exception e e))]
     (is (some? e))
     (is (= :tools.agents.anthropic.error/missing-credentials (:type (ex-data e))))))
 
