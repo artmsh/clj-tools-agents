@@ -240,9 +240,23 @@
      :webhook-secret  secret for tools.agents.openai.webhooks verification
                    (falls back to OPENAI_WEBHOOK_SECRET; key absent when
                    unset). An explicit `:secret` passed to verify-signature /
-                   unwrap still wins."
+                   unwrap still wins.
+     :http         request fn replacing tools.agents.http/request! for every
+                   exchange through this client (all resource namespaces and
+                   streaming). Same contract as request!: takes its request
+                   map, returns {:status :headers :body} for any status,
+                   throws only on transport failure; an :as :stream body
+                   should be an InputStream (a String or byte[] is accepted).
+                   A credential source built separately (e.g.
+                   tools.agents.openai.credentials/workload-identity-source)
+                   takes its own :http. Anything but a fn throws
+                   {:type :tools.agents.openai/invalid-options}."
   ([] (client {}))
   ([opts]
+   (when (and (contains? opts :http) (not (http/request-fn? (:http opts))))
+     (throw (ex-info (str "tools.agents.openai/client: :http must be a request fn with "
+                          "tools.agents.http/request!'s contract, got: " (pr-str (type (:http opts))))
+                     {:type :tools.agents.openai/invalid-options :option :http})))
    (let [creds (resolve-client-credentials opts getenv)
          org   (or (:organization opts) (getenv "OPENAI_ORG_ID"))
          proj  (or (:project opts) (getenv "OPENAI_PROJECT_ID"))
@@ -255,7 +269,8 @@
                      creds)
         (seq org)  (assoc :organization org)
         (seq proj)    (assoc :project proj)
-        (some? whsec) (assoc :webhook-secret whsec))))))
+        (some? whsec) (assoc :webhook-secret whsec)
+        (:http opts)  (assoc :http (:http opts)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Error typing
@@ -571,9 +586,11 @@
   "`:as :stream` only: a non-2xx response's InputStream body read to a String
    and closed, so the retry and error paths below see a String as for :string."
   [as {:keys [status body] :as resp}]
-  (if (and (= as :stream) (instance? java.io.InputStream body) (not (and status (<= 200 status 299))))
-    (assoc resp :body (with-open [^java.io.InputStream in body] (String. (.readAllBytes in) "UTF-8")))
-    resp))
+  (cond
+    (not= as :stream)            resp
+    (and status (<= 200 status 299)) (assoc resp :body (http/stream-body body))
+    :else (assoc resp :body (with-open [^java.io.InputStream in (http/stream-body body)]
+                              (String. (.readAllBytes in) "UTF-8")))))
 
 (defn- decode-success [as body]
   (case as
@@ -585,7 +602,8 @@
   "The one OpenAI transport every resource method uses: tools.agents.openai,
    tools.agents.openai.agents, .embeddings, .realtime and later resource
    namespaces. One call is one logical request: build the URL, encode the
-   JSON body ONCE, then loop attempts through tools.agents.http/request!,
+   JSON body ONCE, then loop attempts through the client's :http fn
+   (default tools.agents.http/request!),
    rebuilding headers before EVERY attempt. Transport failures and retryable
    statuses are retried per openai-python's policy (`should-retry?`,
    `retry-delay-ms`: `x-should-retry`, `retry-after-ms`, `retry-after`;
@@ -644,7 +662,7 @@
               auth-retried? false]
          (let [credential (attempt-credential label client)
                outcome    (try
-                            {:resp (slurp-error-stream as (http/request!
+                            {:resp (slurp-error-stream as ((or (:http client) http/request!)
                                     (cond-> {:method  method
                                              :url     url
                                              :query   query

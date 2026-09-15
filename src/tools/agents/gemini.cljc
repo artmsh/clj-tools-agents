@@ -214,17 +214,29 @@
      :api-version  URL version segment, default \"v1beta\" (python-genai's
                    own default for the Gemini Developer API)
      :max-retries  how many times to retry a failed request, default 4
-                   (`default-max-retries`). 0 disables retries."
+                   (`default-max-retries`). 0 disables retries.
+     :http         request fn replacing tools.agents.http/request! for every
+                   exchange, streaming included. Same contract as request!:
+                   takes its request map, returns {:status :headers :body}
+                   for any status, throws only on transport failure; an :as
+                   :stream body should be an InputStream (a String or byte[]
+                   is accepted). Anything but a fn throws
+                   {:type :tools.agents.gemini/invalid-options}."
   ([] (client {}))
   ([opts]
+   (when (and (contains? opts :http) (not (http/request-fn? (:http opts))))
+     (throw (ex-info (str "tools.agents.gemini/client: :http must be a request fn with "
+                          "tools.agents.http/request!'s contract, got: " (pr-str (type (:http opts))))
+                     {:type :tools.agents.gemini/invalid-options :option :http})))
    (let [creds (resolve-client-credentials opts getenv)]
      (map->GeminiClient
-      (merge {:base-url    (or (:base-url opts) (getenv "GOOGLE_GEMINI_BASE_URL") default-base-url)
-              :api-version (or (:api-version opts) default-api-version)
-              :max-retries (if (number? (:max-retries opts))
-                             (max 0 (long (:max-retries opts)))
-                             default-max-retries)}
-             creds)))))
+      (cond-> (merge {:base-url    (or (:base-url opts) (getenv "GOOGLE_GEMINI_BASE_URL") default-base-url)
+                      :api-version (or (:api-version opts) default-api-version)
+                      :max-retries (if (number? (:max-retries opts))
+                                     (max 0 (long (:max-retries opts)))
+                                     default-max-retries)}
+                     creds)
+        (:http opts) (assoc :http (:http opts)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Error typing
@@ -382,7 +394,7 @@
       ;; the try: a token fetch failure is not a connection failure.
       (let [[headers used-token] (request-headers fn-name client)
             outcome (try
-                      {:resp (http/request! {:method :post :url url
+                      {:resp ((or (:http client) http/request!) {:method :post :url url
                                              :headers headers
                                              :body body-str})}
                       (catch Exception e
@@ -547,7 +559,7 @@
                                 (:resp outcome)))))))]
     (stream/open-event-stream
      {:request       {:method :post :url url :body body-str}
-      :send!         (fn [req] (http/request! (assoc req :headers @headers)))
+      :send!         (fn [req] ((or (:http client) http/request!) (assoc req :headers @headers)))
       :open!         open!
       :on-error      (fn [{:keys [status body]}]
                        (throw (http-status-error fn-name status body @retries)))

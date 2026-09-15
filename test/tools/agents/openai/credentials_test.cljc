@@ -474,3 +474,36 @@
             (is (= ["ping"] (map #(get % "type") events)) path)
             (is (= [[path "Bearer tok-1"] [path "Bearer tok-2"]] @auths) path)
             (is (= 2 @n) path)))))))
+
+;; ---------------------------------------------------------------------------
+;; Injected :http (#10)
+;; ---------------------------------------------------------------------------
+
+(deftest injected-http-carries-exchange-and-metadata-providers
+  (let [calls (atom [])
+        http  (fn [req]
+                (swap! calls conj req)
+                (cond
+                  (str/includes? (:url req) "metadata") {:status 200 :headers {}
+                                                         :body "{\"access_token\":\"azure-jwt\"}"}
+                  (str/ends-with? (:url req) "/oauth/token") (exchange-ok "at-injected" 3600)
+                  :else {:status 200 :headers {} :body "{\"id\":\"resp_1\",\"output\":[]}"}))
+        src   (creds/workload-identity-source
+               {:identity-provider-id "idp_123"
+                :service-account-id   "sa_456"
+                :provider             (creds/azure-managed-identity-token-provider
+                                       {:url "http://metadata.fake/token" :http http})
+                :token-exchange-url   "https://auth.fake/oauth/token"
+                :http                 http})
+        c     (oai/client {:credential-source src :base-url "https://api.fake/v1" :http http})]
+    (oai/responses-create c {"model" "m"})
+    (let [[md ex api & more] @calls]
+      (is (empty? more))
+      (is (= :get (:method md)))
+      (is (= "azure-jwt" (get (oai/read-json (:body ex)) "subject_token")))
+      (is (= "https://api.fake/v1/responses" (:url api)))
+      (is (= "Bearer at-injected" (get (:headers api) "authorization")))))
+  (let [e (thrown #(creds/workload-identity-source
+                    {:identity-provider-id "i" :service-account-id "s"
+                     :provider {:token-type :jwt :get-token (constantly "t")} :http "nope"}))]
+    (is (= :tools.agents.openai/invalid-credentials (:type (ex-data e))))))

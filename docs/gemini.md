@@ -84,6 +84,7 @@ model id) is used verbatim.
 | `HttpOptions(base_url=..., api_version=...)` | `:base-url` (default `https://generativelanguage.googleapis.com`), `:api-version` (default `"v1beta"`) | Kept as two separate client fields, joined at request time, rather than one pre-concatenated base-url string — see `client`'s docstring. |
 | `client.models.generate_content_stream(model=model, contents=..., config=request)` | `(generate-content-stream client model request)` | Same `{model}:streamGenerateContent?alt=sse` path. Returns a single-use reducible of chunk maps instead of a generator; `accumulate-stream` joins them (python-genai has no joiner). See Streaming below. |
 | tenacity-backed automatic retries, `_RETRY_ATTEMPTS = 5` | `:max-retries` client opt, default 4 | Implemented — see Retries below. |
+| `HttpOptions(httpx_client=...)` | `:http` client opt | A request fn with `tools.agents.http/request!`'s contract, used for every exchange, streaming included. See README, Bring your own HTTP client. |
 | `client.chats.create(...)` (multi-turn chat session object) | *(not implemented)* | A stateful wrapper over `generate_content` with local history bookkeeping; `add-user-message`/`add-model-message` below give the same history-building ergonomics without the stateful object. |
 | `client.files.*` / `.caches.*` / `.tunings.*` / `.batches.*` / `.live.*` (Live API) / embeddings / image & video generation | *(not implemented)* | Only `generateContent`/`streamGenerateContent`/`countTokens` are in scope for this port. `post-json!` is the shared transport, so adding another POST resource is a small change. |
 | Vertex AI mode (`vertexai=True`, ADC/service-account credentials, `us-central1`-style locations) | *(not implemented)* | This library only targets the Gemini Developer API (API-key auth against `generativelanguage.googleapis.com`), not the separate Vertex AI code path python-genai also supports. |
@@ -140,6 +141,7 @@ Non-status error types:
 | malformed request/response JSON | `:tools.agents.gemini/json-encode-error` / `:tools.agents.gemini/json-parse-error` |
 | missing credentials (client construction or a hand-built client map) | `:tools.agents.gemini/missing-credentials` |
 | `:credential-source` not a `TokenSource`, or combined with `:api-key` | `:tools.agents.gemini/invalid-credentials` |
+| `:http` is not a fn (client construction; `:option` in `ex-data`) | `:tools.agents.gemini/invalid-options` |
 
 Unlike the two siblings, `output-text` never throws — see the next section.
 

@@ -4,7 +4,9 @@
    tools.agents.gemini.live-test."
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
-            [tools.agents.gemini :as g]))
+            [tools.agents.gemini :as g]
+            [tools.agents.stream :as stream]
+            [tools.agents.test-support :refer [recording-http input-stream]]))
 
 ;; ---------------------------------------------------------------------------
 ;; JSON codec
@@ -216,3 +218,53 @@
   (let [e (try (g/accumulate-chunk nil {"error" {"message" "no code"}}) nil (catch Exception e e))]
     (is (= :tools.agents.gemini/api-status-error (:type (ex-data e))))
     (is (nil? (:status (ex-data e))))))
+
+;; ---------------------------------------------------------------------------
+;; Injected :http (#10) — every exchange goes through the caller's fn
+;; ---------------------------------------------------------------------------
+
+(defn- fake-client [http & {:as extra}]
+  (g/client (merge {:api-key "k" :base-url "https://fake.example" :http http} extra)))
+
+(deftest injected-http-carries-generate-content
+  (let [{:keys [http calls]} (recording-http
+                              (fn [_] {:status 200 :headers {}
+                                       :body "{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]}}]}"}))
+        r (g/generate-content (fake-client http) "gemini-x" {"contents" []})]
+    (is (= "hi" (g/output-text r)))
+    (let [[req & more] @calls]
+      (is (empty? more))
+      (is (= :post (:method req)))
+      (is (= "https://fake.example/v1beta/models/gemini-x:generateContent" (:url req)))
+      (is (= "k" (get (:headers req) "x-goog-api-key")))
+      (is (= {"contents" []} (g/read-json (:body req)))))))
+
+(deftest injected-http-carries-a-stream
+  (let [sse (slurp "test/resources/sse/gemini-text.sse")]
+    (doseq [[label body-fn] [["InputStream body" input-stream] ["String body (lenient)" identity]]]
+      (testing label
+        (let [{:keys [http calls]} (recording-http (fn [_] {:status 200
+                                                            :headers {"content-type" "text/event-stream"}
+                                                            :body (body-fn sse)}))
+              s (g/generate-content-stream (fake-client http) "gemini-x" {"contents" []})
+              r (g/accumulate-stream s)]
+          (is (= "Once upon a time, in a town with a magic backpack..." (g/output-text r)))
+          (is (g/stream-complete? r))
+          (is (= :eof (stream/outcome s)))
+          (is (= :stream (:as (first @calls))))
+          (is (= "https://fake.example/v1beta/models/gemini-x:streamGenerateContent?alt=sse"
+                 (:url (first @calls)))))))))
+
+(deftest injected-http-transport-failure-is-retried-then-typed
+  (let [{:keys [http calls]} (recording-http (fn [_] (throw (java.io.IOException. "reset"))))
+        e (binding [g/*sleep-fn* (fn [_])]
+            (try (g/generate-content (fake-client http :max-retries 1) "m" {}) nil
+                 (catch Exception e e)))]
+    (is (= :tools.agents.gemini/api-connection-error (:type (ex-data e))))
+    (is (= 2 (count @calls)))))
+
+(deftest invalid-http-option-is-rejected-at-construction
+  (doseq [bad [nil "request!" {:method :get} :http]]
+    (let [e (try (g/client {:api-key "k" :http bad}) nil (catch Exception e e))]
+      (is (= :tools.agents.gemini/invalid-options (:type (ex-data e))) (pr-str bad))))
+  (is (not (contains? (g/client {:api-key "k"}) :http)) "absent unless injected"))

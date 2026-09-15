@@ -105,6 +105,10 @@ stream that ends or breaks before the response throws
 id, or `:close!` for every in-flight request — closes the connection and
 makes the pending `:send!` return nil.
 
+`(http/connect! url {:http f})` sends every POST through `f` instead of
+`tools.agents.http/request!` (same contract, called with `:as :stream`; a
+String body is accepted). See the README's "Bring your own HTTP client".
+
 ### Examples
 
 - `examples/mcp/weather.cljc` — a line-for-line port of the official [Build an
@@ -342,6 +346,7 @@ and, where the schema fixes one, `:data`.
 | `::error/undeclared-input-request` / `::error/no-input-handler` | The server asked for a capability the client never declared, or one it declared without wiring a handler |
 | `::error/transport` | The transport failed underneath a request |
 | `::error/unsupported-runtime` | See Platform limitations |
+| `::error/invalid-options` | `http/connect!` got a non-fn `:http` |
 
 `:type` values are flat keywords, not a `derive` hierarchy: flat keywords
 compare and pattern-match the same everywhere, and nothing here needs

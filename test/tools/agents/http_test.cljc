@@ -226,3 +226,23 @@
       (is (= "ok" (:body (http/request! {:method :get :url (url port "/c")
                                          :client (http/client {:connect-timeout-ms 1000})}))))
       (finally (stop!)))))
+
+;; ---------------------------------------------------------------------------
+;; Injection helpers (#10)
+;; ---------------------------------------------------------------------------
+
+(deftest stream-body-coerces-injected-bodies
+  (is (= "abc" (slurp (http/stream-body "abc"))))
+  (is (= "abc" (slurp (http/stream-body (.getBytes "abc" "UTF-8")))))
+  (is (= "" (slurp (http/stream-body nil))))
+  (let [in (java.io.ByteArrayInputStream. (byte-array 0))]
+    (is (identical? in (http/stream-body in))))
+  (is (= :tools.agents.http/invalid-response
+         (:type (ex-data (try (http/stream-body 42) nil (catch Exception e e)))))))
+
+(deftest request-fn?-accepts-fns-and-vars-only
+  (is (http/request-fn? http/request!))
+  (is (http/request-fn? #'http/request!))
+  (is (http/request-fn? (fn [_])))
+  (doseq [x [nil "s" :k 'sym {} [] #{}]]
+    (is (not (http/request-fn? x)) (pr-str x))))

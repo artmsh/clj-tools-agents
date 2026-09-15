@@ -4,7 +4,11 @@
    tools.agents.openai.live-test."
   (:require [clojure.test :refer [deftest is testing]]
             [tools.agents.openai :as oai]
-            [tools.agents.token :as token]))
+            [tools.agents.openai.embeddings :as embeddings]
+            [tools.agents.openai.files :as files]
+            [tools.agents.stream :as stream]
+            [tools.agents.token :as token]
+            [tools.agents.test-support :refer [recording-http input-stream]]))
 
 ;; ---------------------------------------------------------------------------
 ;; JSON codec
@@ -608,3 +612,70 @@
                  (chunk [(ch {"tool_calls" [{"id" "no-index"}]})])])
                nil (catch Exception e e))]
     (is (= :tools.agents.openai/invalid-response (:type (ex-data e))))))
+
+;; ---------------------------------------------------------------------------
+;; Injected :http (#10) — every exchange goes through the caller's fn
+;; ---------------------------------------------------------------------------
+
+(defn- fake-client [http & {:as extra}]
+  (oai/client (merge {:api-key "k" :base-url "https://fake.example/v1" :http http} extra)))
+
+(deftest injected-http-carries-responses-create
+  (let [{:keys [http calls]} (recording-http
+                              (fn [_] {:status 200 :headers {}
+                                       :body "{\"id\":\"resp_1\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"hi\"}]}]}"}))
+        r (oai/responses-create (fake-client http) {"model" "m" "input" "x"})]
+    (is (= "hi" (oai/output-text r)))
+    (let [[req & more] @calls]
+      (is (empty? more))
+      (is (= :post (:method req)))
+      (is (= "https://fake.example/v1/responses" (:url req)))
+      (is (= "Bearer k" (get (:headers req) "authorization")))
+      (is (= {"model" "m" "input" "x"} (oai/read-json (:body req)))))))
+
+(deftest injected-http-carries-resource-namespaces
+  (testing "embeddings (JSON)"
+    (let [{:keys [http calls]} (recording-http
+                                (fn [_] {:status 200 :headers {}
+                                         :body "{\"object\":\"list\",\"data\":[{\"object\":\"embedding\",\"index\":0,\"embedding\":[0.5]}]}"}))
+          r (embeddings/embeddings-create (fake-client http) {"model" "e" "input" "x" "encoding_format" "float"})]
+      (is (= [0.5] (get-in r ["data" 0 "embedding"])))
+      (is (= "https://fake.example/v1/embeddings" (:url (first @calls))))))
+  (testing "files-content (:as :bytes)"
+    (let [{:keys [http calls]} (recording-http (fn [_] {:status 200 :headers {} :body (.getBytes "raw" "UTF-8")}))
+          r (files/files-content (fake-client http) "file_1")]
+      (is (= "raw" (String. ^bytes r "UTF-8")))
+      (is (= :bytes (:as (first @calls)))))))
+
+(deftest injected-http-carries-a-stream
+  (let [sse (slurp "test/resources/sse/openai-chat-text.sse")]
+    (doseq [[label body-fn] [["InputStream body" input-stream] ["String body (lenient)" identity]]]
+      (testing label
+        (let [{:keys [http calls]} (recording-http (fn [_] {:status 200
+                                                            :headers {"content-type" "text/event-stream"}
+                                                            :body (body-fn sse)}))
+              s (oai/chat-completions-stream (fake-client http) {"model" "m" "messages" []})
+              r (oai/accumulate-chat-completion-stream s)]
+          (is (= "Hello" (oai/completion-text r)))
+          (is (= :done (stream/outcome s)))
+          (is (= :stream (:as (first @calls))))
+          (is (= "https://fake.example/v1/chat/completions" (:url (first @calls)))))))))
+
+(deftest injected-http-stream-error-status-is-typed
+  (let [{:keys [http]} (recording-http (fn [_] {:status 400 :headers {}
+                                                :body (input-stream "{\"error\":{\"message\":\"bad\"}}")}))
+        e (try (oai/responses-stream (fake-client http) {"model" "m"}) nil (catch Exception e e))]
+    (is (= :tools.agents.openai/bad-request-error (:type (ex-data e))))))
+
+(deftest injected-http-transport-failure-is-retried-then-typed
+  (let [{:keys [http calls]} (recording-http (fn [_] (throw (java.io.IOException. "reset"))))
+        e (try (oai/responses-create (fake-client http :max-retries 0) {"model" "m"}) nil
+               (catch Exception e e))]
+    (is (= :tools.agents.openai/api-connection-error (:type (ex-data e))))
+    (is (= 1 (count @calls)))))
+
+(deftest invalid-http-option-is-rejected-at-construction
+  (doseq [bad [nil "request!" {:method :get} :http]]
+    (let [e (try (oai/client {:api-key "k" :http bad}) nil (catch Exception e e))]
+      (is (= :tools.agents.openai/invalid-options (:type (ex-data e))) (pr-str bad))))
+  (is (not (contains? (oai/client {:api-key "k"}) :http)) "absent unless injected"))

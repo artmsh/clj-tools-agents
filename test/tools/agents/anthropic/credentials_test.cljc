@@ -429,3 +429,24 @@
              (:type (ex-data (thrown #(resolve {} {}))))))
       (is (= :tools.agents.anthropic.error/missing-credentials
              (:type (ex-data (thrown #(resolve {} (dissoc wif-env "ANTHROPIC_ORGANIZATION_ID"))))))))))
+
+;; ---------------------------------------------------------------------------
+;; Injected :http (#10): the env-discovered token exchange uses it too
+;; ---------------------------------------------------------------------------
+
+(deftest client-http-carries-the-wif-exchange
+  (let [calls (atom [])
+        http  (fn [req]
+                (swap! calls conj req)
+                (if (str/ends-with? (:url req) "/v1/oauth/token")
+                  (token-response "at-injected")
+                  {:status 200 :headers {} :body (canned-message)}))]
+    (with-redefs [a/getenv (env-fn (assoc wif-env "ANTHROPIC_BASE_URL" "https://fake.example"))
+                  a/user-home (constantly (empty-home))]
+      (let [c (a/client {:http http})]
+        (is (= "hi" (a/output-text (a/messages-create c {"model" "m" "max_tokens" 1 "messages" []}))))
+        (let [[ex m & more] @calls]
+          (is (empty? more))
+          (is (= "https://fake.example/v1/oauth/token" (:url ex)))
+          (is (= "https://fake.example/v1/messages" (:url m)))
+          (is (= "Bearer at-injected" (get (:headers m) "authorization"))))))))

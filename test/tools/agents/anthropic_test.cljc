@@ -4,7 +4,10 @@
    tools.agents.anthropic.live-test."
   (:require [clojure.test :refer [deftest is testing]]
             [tools.agents.anthropic :as a]
-            [tools.agents.token :as token]))
+            [tools.agents.anthropic.batches :as b]
+            [tools.agents.stream :as stream]
+            [tools.agents.token :as token]
+            [tools.agents.test-support :refer [recording-http input-stream]]))
 
 ;; ---------------------------------------------------------------------------
 ;; JSON codec
@@ -810,3 +813,82 @@
         (is (= kw (:type (ex-data e))) wire)
         (is (= wire (:error-type (ex-data e))))
         (is (nil? (:status (ex-data e))))))))
+
+;; ---------------------------------------------------------------------------
+;; Injected :http (#10) — every exchange goes through the caller's fn
+;; ---------------------------------------------------------------------------
+
+(def ^:private canned-message
+  "{\"id\":\"msg_1\",\"type\":\"message\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}")
+
+(deftest injected-http-carries-messages-create
+  (let [{:keys [http calls]} (recording-http (fn [_] {:status 200 :headers {"request-id" "req_1"}
+                                                      :body canned-message}))
+        c (a/client {:api-key "k" :base-url "https://fake.example" :http http})
+        m (a/messages-create c {"model" "m" "max_tokens" 1 "messages" []})]
+    (is (= "hi" (a/output-text m)))
+    (is (= "req_1" (a/request-id m)) "response headers from the fake reach the metadata")
+    (let [[req & more] @calls]
+      (is (empty? more))
+      (is (= :post (:method req)))
+      (is (= "https://fake.example/v1/messages" (:url req)))
+      (is (= "k" (get (:headers req) "x-api-key")))
+      (is (= {"model" "m" "max_tokens" 1 "messages" []} (a/read-json (:body req)))))))
+
+(deftest injected-http-carries-batches
+  (let [{:keys [http calls]} (recording-http
+                              (fn [req]
+                                {:status 200 :headers {}
+                                 :body (str "{\"custom_id\":\"a\"}\n{\"custom_id\":\"b\"}\n")}))
+        c (a/client {:api-key "k" :base-url "https://fake.example" :http http})]
+    (is (= ["a" "b"] (map #(get % "custom_id") (b/batches-results c "msgbatch_1"))))
+    (is (= "https://fake.example/v1/messages/batches/msgbatch_1/results" (:url (first @calls))))))
+
+(deftest injected-http-carries-a-stream
+  (let [events (str "event: message_start\n"
+                    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"m\",\"stop_reason\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n"
+                    "event: content_block_start\n"
+                    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n"
+                    "event: content_block_delta\n"
+                    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hel\"}}\n\n"
+                    "event: content_block_delta\n"
+                    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"lo\"}}\n\n"
+                    "event: content_block_stop\n"
+                    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n"
+                    "event: message_stop\n"
+                    "data: {\"type\":\"message_stop\"}\n\n")]
+    (doseq [[label body-fn] [["InputStream body" input-stream] ["String body (lenient)" identity]]]
+      (testing label
+        (let [{:keys [http calls]} (recording-http (fn [_] {:status 200
+                                                            :headers {"content-type" "text/event-stream"}
+                                                            :body (body-fn events)}))
+              c (a/client {:api-key "k" :base-url "https://fake.example" :http http})
+              s (a/messages-stream c {"model" "m" "max_tokens" 1 "messages" []})
+              m (a/accumulate-stream s)]
+          (is (= "Hello" (a/output-text m)))
+          (is (a/stream-complete? m))
+          (is (= :eof (stream/outcome s)))
+          (is (= :stream (:as (first @calls))))
+          (is (= true (get (a/read-json (:body (first @calls))) "stream"))))))))
+
+(deftest injected-http-transport-failure-is-api-connection
+  (let [{:keys [http calls]} (recording-http (fn [_] (throw (java.net.ConnectException. "refused"))))
+        c (a/client {:api-key "k" :max-retries 1 :http http})
+        e (binding [a/*sleep-fn* (fn [_])]
+            (try (a/messages-create c {"model" "m" "max_tokens" 1 "messages" []}) nil
+                 (catch Exception e e)))]
+    (is (= :tools.agents.anthropic.error/api-connection (:type (ex-data e))))
+    (is (= 2 (count @calls)) "the retry loop still runs around the injected fn")))
+
+(deftest injected-http-non-2xx-is-typed
+  (let [{:keys [http]} (recording-http (fn [_] {:status 404 :headers {}
+                                                :body "{\"error\":{\"message\":\"nope\"}}"}))
+        c (a/client {:api-key "k" :http http})
+        e (try (a/messages-create c {"model" "m" "max_tokens" 1 "messages" []}) nil (catch Exception e e))]
+    (is (= :tools.agents.anthropic.error/not-found (:type (ex-data e))))))
+
+(deftest invalid-http-option-is-rejected-at-construction
+  (doseq [bad [nil "request!" {:method :get} :http]]
+    (let [e (try (a/client {:api-key "k" :http bad}) nil (catch Exception e e))]
+      (is (= :tools.agents.anthropic.error/invalid-options (:type (ex-data e))) (pr-str bad))))
+  (is (not (contains? (a/client {:api-key "k"}) :http)) "absent unless injected"))

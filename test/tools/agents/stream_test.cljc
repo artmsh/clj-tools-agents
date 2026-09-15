@@ -253,3 +253,21 @@
           (is (= :client/connection (:type (ex-data e))))
           (is (instance? java.io.IOException (ex-cause e)))))
       (finally (stop!)))))
+
+(deftest injected-send-fn-may-return-a-string-body
+  (let [s (stream/open-event-stream
+           {:request {:method :post :url "https://fake.example/x"}
+            :send!   (fn [req]
+                       (is (= :stream (:as req)))
+                       {:status 200 :headers {} :body "data: {\"a\":1}\n\ndata: {\"a\":2}\n\n"})
+            :decode  json/read-json})]
+    (is (= [{"a" 1} {"a" 2}] (into [] (map :data) s)))
+    (is (= :eof (stream/outcome s))))
+  (testing "a non-2xx String body reaches :on-error as a String"
+    (let [seen (atom nil)]
+      (try (stream/open-event-stream
+            {:request  {:method :post :url "https://fake.example/x"}
+             :send!    (fn [_] {:status 500 :headers {} :body "boom"})
+             :on-error (fn [resp] (reset! seen (:body resp)))})
+           (catch Exception _ nil))
+      (is (= "boom" @seen)))))
