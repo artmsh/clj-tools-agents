@@ -34,7 +34,8 @@ is shaped the way it is — not something a reader here can check.
 ```
 
 `client` resolves credentials eagerly — explicit `:api-key`/`:auth-token` first,
-then `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN`, else it throws a catchable
+then `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN`, then Workload Identity
+Federation env vars (see Workload Identity Federation below), else it throws a catchable
 `ex-info` **before any network request is attempted** (fail fast, matching the
 original builtin's contract). `messages-create`'s `request` map is passed
 through to JSON almost verbatim — `model`, `max_tokens`, `messages`, `system`,
@@ -65,18 +66,34 @@ Programmatic Tool Calling below.
 | `client.messages.stream(...)` / `stream=True` | **rejected outright** | Not resolved — this is  an open TODO. |
 | `client.messages.count_tokens(...)` | `(count-tokens client request)` | **Resolved, implemented** — same request shape as `messages-create` minus `max_tokens`, same retry policy and error hierarchy, POSTs to `/v1/messages/count_tokens`. |
 | `client.messages.batches.create/retrieve/list/cancel/delete/results` | `tools.agents.anthropic.batches`: `batches-create`, `batches-retrieve`, `batches-list` (+ `next-page-params`, `batches-list-all`), `batches-cancel`, `batches-delete`, `batches-results` | **Resolved, implemented.** Same client, retries and error typing as `messages-create`. SDK deviations (no pre-flight `retrieve` in `results`, no `workspace_id`/`user_profile_id` kwargs, results buffered then decoded lazily) are listed in Message Batches below. |
-| Workload Identity Federation / `ant auth login` OAuth profile / `ANTHROPIC_PROFILE` | *(not implemented)* | The credential chain here is explicit `:credential-source` → explicit-arg → `ANTHROPIC_API_KEY` → `ANTHROPIC_AUTH_TOKEN` → throw. The Python SDK's fuller chain (OAuth profile, WIF env vars, default disk profile) is not ported; the refresh machinery it needs (token cache, per-attempt token, 401 invalidate-and-retry) is, as `:credential-source`. See README, Refreshable credentials. |
+| Workload Identity Federation: `WorkloadIdentityCredentials`, `ANTHROPIC_FEDERATION_RULE_ID` + `ANTHROPIC_ORGANIZATION_ID` + `ANTHROPIC_IDENTITY_TOKEN[_FILE]` | `tools.agents.anthropic.credentials`: `workload-identity-source`, `workload-identity-from-env`, `exchange-token!`; env discovery is step 4 of `client`'s chain | **Resolved, implemented** (#35). See Workload Identity Federation below. Verified against a fake token endpoint only. |
+| `ANTHROPIC_PROFILE` / `ANTHROPIC_CONFIG_DIR` / `profile=` / `config=` profiles (files written by `ant auth login`) | *(not implemented, #36)* | Chain steps 3 and 5. Hook points are marked in `resolve-client-credentials`. |
 | `tools=[...]` / manual `tool_use`/`tool_result` handling | `"tools"` passes straight through `messages-create`; `tool-use?`/`tool-calls`/`add-tool-results`/`add-tool-result` add the response-side/reply-side ergonomics | **New.** See Tool calling below. |
 | `client.beta.messages.create(..., betas=[...])` (Programmatic Tool Calling and other beta features) | `:betas` client opt → comma-joined `anthropic-beta` header | **New.** See Credential resolution below and Programmatic Tool Calling below. |
 | `message._request_id` | `(request-id response)` | **Resolved.** The Python SDK hangs this off a hidden attribute on the response object; `messages-create`/`count-tokens` return a plain map, verbatim, per the data-transparency contract above — so the `request-id` response header is carried as Clojure metadata on that same map instead (out of the way of equality, printing, and JSON re-encoding) and `request-id` reads it back. Returns `nil` for a hand-built map or a response genuinely missing the header. For most logging/correlation purposes the response body's own `"id"` field (`msg_...`) needs no accessor and works just as well. |
 
 ### Credential resolution & auth headers (confirmed from anthropic-sdk-python source)
 
-Precedence, first match wins: explicit `:api-key` → explicit `:auth-token` →
-`ANTHROPIC_API_KEY` env var → `ANTHROPIC_AUTH_TOKEN` env var → throw.
-An explicit `:credential-source` replaces this chain (combining it with
-`:api-key`/`:auth-token` throws `invalid-credentials`); `resolve-credentials`
-itself is unchanged.
+Precedence, first match wins (anthropic-sdk-python v1.5.0 @ `eb21a435`,
+`_client.py:186-208`, `lib/credentials/_chain.py:76-155`):
+
+| step | source | result | status |
+|---|---|---|---|
+| 1 | explicit `:credential-source`, else `:api-key` → `:auth-token` | as given; any explicit credential disables env lookup | implemented |
+| 2 | `ANTHROPIC_API_KEY` → `ANTHROPIC_AUTH_TOKEN` (empty = unset) | `x-api-key` / static Bearer | implemented |
+| 3 | explicit profile: `ANTHROPIC_PROFILE`, `ANTHROPIC_CONFIG_DIR` or an `active_config` pointer; errors propagate | profile credential | **not implemented (#36)** |
+| 4 | WIF env: `ANTHROPIC_FEDERATION_RULE_ID` + `ANTHROPIC_ORGANIZATION_ID` + `ANTHROPIC_IDENTITY_TOKEN_FILE` or `ANTHROPIC_IDENTITY_TOKEN` | refreshable `:credential-source` (jwt-bearer exchange) | implemented (#35) |
+| 5 | fallback on-disk profile (`configs/<active or default>.json`); errors swallowed | profile credential | **not implemented (#36)** |
+| — | nothing matched | throws `missing-credentials` | implemented |
+
+Combining `:credential-source` with `:api-key`/`:auth-token` throws
+`invalid-credentials`. Steps 1–2 are exactly the public
+`resolve-credentials`, unchanged; the chain lives in the private
+`resolve-client-credentials`, which `client` calls with its resolved base
+URL. Step 4 sits between 3 and 5 so a leftover default profile never beats
+WIF env vars. Unlike the SDK (`_auth.py`
+`warn_env_static_shadows_auto_discovery`), no warning is logged when a
+static env credential shadows configured WIF: this library has no logger.
 
 - `:api-key` / `ANTHROPIC_API_KEY` → sent as the `x-api-key` header (the
   standard API-key auth path).
@@ -111,6 +128,94 @@ itself is unchanged.
   is always false — this is now caught at `client` construction, matching
   what `spec.clj`'s own `::max-retries` spec already documented as the
   contract.) See Retries below.
+
+### Workload Identity Federation
+
+`tools.agents.anthropic.credentials` exchanges an external OIDC JWT (a
+Kubernetes projected service-account token, a CI OIDC token) for a
+short-lived Anthropic access token. Port of anthropic-sdk-python v1.5.0 @
+`eb21a435`, `src/anthropic/lib/credentials/`. A WIF token is sent like any
+`:credential-source` token (Bearer + `oauth-2025-04-20`); the federation
+routing flag never goes on API requests, and no `anthropic-workspace-id`
+header is added because the token is already workspace-scoped.
+
+```clojure
+(require '[tools.agents.anthropic :as anthropic]
+         '[tools.agents.anthropic.credentials :as credentials])
+
+;; Env: no code. With ANTHROPIC_API_KEY and ANTHROPIC_AUTH_TOKEN unset,
+;; ANTHROPIC_FEDERATION_RULE_ID, ANTHROPIC_ORGANIZATION_ID and
+;; ANTHROPIC_IDENTITY_TOKEN_FILE are enough:
+(anthropic/client)
+
+;; Explicit: give both the SAME base-url; a token is only valid on the
+;; deployment that minted it.
+(anthropic/client
+ {:credential-source (credentials/workload-identity-source
+                      {:federation-rule-id  "fdrl_..."
+                       :organization-id     "00000000-0000-0000-0000-000000000000"
+                       :identity-token-file "/var/run/secrets/anthropic/token"
+                       :service-account-id  "svac_..."})})
+```
+
+Exchange (`_workload.py:249-364`):
+
+- `POST {base-url}/v1/oauth/token` (`_constants.py:12`), JSON body:
+  `grant_type` = `urn:ietf:params:oauth:grant-type:jwt-bearer`
+  (`_constants.py:10`), `assertion`, `federation_rule_id`, `organization_id`,
+  plus `service_account_id` / `workspace_id` when set (`_workload.py:264-273`).
+  `scope` is accepted and **not sent** (`_workload.py:178-182`).
+- Headers: `anthropic-beta: oauth-2025-04-20,oidc-federation-2026-04-01`
+  and `content-type: application/json` only (`_workload.py:36,282-286`). The
+  `oidc-federation-2026-04-01` flag routes the POST to the jwt-bearer
+  handler; it must never go on a `refresh_token` grant, which takes
+  `oauth-2025-04-20` alone (`_constants.py:18-28`). No `user-agent`: the SDK
+  sends `anthropic-python/<ver>`, this library sends none anywhere.
+- One POST with a 30 s timeout (`_constants.py:16`), through
+  `tools.agents.http/request!`, not the messages retry loop. A 401 from the
+  endpoint is retried once, re-reading the identity token, as the SDK's
+  cache does (`_cache.py:88-103`).
+- Response: `access_token` and `expires_in` (seconds; a numeric string is
+  accepted, like Python's `int()`) are required; `token_type`, if present,
+  must be `bearer` in any case (`_workload.py:343-364`).
+- Limits: assertion ≤ 16 KiB, rejected before any request; response ≤ 1 MiB
+  (`_workload.py:49-50`).
+- `base-url` must be `https://`, or `http://localhost`, `http://127.0.0.1`
+  or `http://[::1]` (`_constants.py:116-132`); anything else throws
+  `invalid-credentials` at construction.
+
+Identity token: `:identity-token-file` is re-read and trimmed on **every**
+exchange (Kubernetes rotates it in place); a missing, unreadable, directory
+or empty file throws `identity-token` (`_providers.py:736-781`).
+`:identity-token-fn` is called on every exchange.
+
+Env discovery (`workload-identity-from-env`, `_chain.py:29-73`) returns nil
+unless `ANTHROPIC_FEDERATION_RULE_ID` and `ANTHROPIC_ORGANIZATION_ID` are
+non-empty and `ANTHROPIC_IDENTITY_TOKEN_FILE` is non-empty or
+`ANTHROPIC_IDENTITY_TOKEN` is set (even empty). The file wins over the
+literal; the literal is re-read from the env on every exchange.
+`ANTHROPIC_SERVICE_ACCOUNT_ID` is sent when set (even empty, as in the SDK);
+an empty `ANTHROPIC_WORKSPACE_ID` counts as unset; `ANTHROPIC_SCOPE` is
+ignored. `{:getenv f}` injects the env. Base URL: `:base-url` opt >
+`ANTHROPIC_BASE_URL` > default; `client` passes its own resolved base URL.
+
+Caching is `tools.agents.token/token-cache` with `:refresh-skew-ms` 120000,
+the SDK's advisory window (`_constants.py:31`). The SDK cache is two-tier: a
+refresh that fails between 120 s and 30 s before expiry serves the
+still-valid token and backs off 5 s (`_cache.py:118-129,158-166`).
+`token-cache` is single-tier, so that failure throws here. A 401 on an API
+request invalidates the token and re-exchanges once (README, Refreshable
+credentials).
+
+Errors never carry the assertion or an access token. `:body` keeps only
+`error`, `error_description` and `error_uri` from a JSON object, or the first
+256 chars of any other body (`_workload.py:58-73`); the assertion is also
+replaced wherever it appears (the SDK only truncates). A 401 message carries
+the SDK's federation-rule hint. The `request-id` response header is in
+`:request-id` and the message.
+
+Verified only against a fake token endpoint (`credentials_test.cljc`); no
+live WIF credentials were available.
 
 ### Retries
 
@@ -199,7 +304,9 @@ for those functions' own failures) and `ex-data` `{:type <keyword> :status
 | malformed request/response JSON | `:tools.agents.anthropic.error/json-encode` / `:tools.agents.anthropic.error/json-parse` |
 | empty or non-string message batch id (`tools.agents.anthropic.batches`, before any request) | `:tools.agents.anthropic.error/invalid-argument` |
 | missing credentials (client construction) | `:tools.agents.anthropic.error/missing-credentials` |
-| `:credential-source` not a `TokenSource`, or combined with `:api-key`/`:auth-token` | `:tools.agents.anthropic.error/invalid-credentials` |
+| `:credential-source` not a `TokenSource`, or combined with `:api-key`/`:auth-token`; bad `workload-identity-source` options, including a cleartext non-loopback base URL | `:tools.agents.anthropic.error/invalid-credentials` |
+| WIF token endpoint unreachable, non-2xx, or oversized/malformed response; assertion over 16 KiB. `ex-data` `{:type :status :body <redacted> :request-id}` | `:tools.agents.anthropic.error/token-exchange` |
+| WIF identity token file missing, unreadable, a directory or empty; `ANTHROPIC_IDENTITY_TOKEN` removed after discovery. `ex-data` `{:type :path}` | `:tools.agents.anthropic.error/identity-token` |
 | `:max-retries` is not a non-negative integer (client construction) | `:tools.agents.anthropic.error/invalid-max-retries` |
 | `:stream true` requested | `:tools.agents.anthropic.error/streaming-unsupported` |
 | response has no `"content"` array | `:tools.agents.anthropic.error/invalid-response` |
@@ -634,6 +741,15 @@ real-API create → retrieve → list → cancel → poll → results → delete
 skipped unless `ANTHROPIC_LIVE=1` and `ANTHROPIC_API_KEY` are both set (cost:
 at most one `max_tokens: 1` request at batch rates; delete is skipped, not
 failed, if the batch has not ended within ~60s).
+
+`test/tools/agents/anthropic/credentials_test.cljc` — Workload Identity
+Federation against a fake token endpoint on OS-assigned ports: exchange
+body, headers and exact beta value, `scope` never sent, env discovery through
+`client` end to end, refresh inside the 120 s window, identity token file
+and env literal re-read per exchange, a messages 401 re-exchanging once, the
+token endpoint's own 401 retried once, errors that never carry the
+assertion or access token, size limits, https enforcement, and chain
+precedence via an injected env map (the real env is never read).
 
 `test/tools/agents/anthropic/spec_test.clj` — asserts each spec both
 accepts a valid value and REJECTS a malformed one (including the exact

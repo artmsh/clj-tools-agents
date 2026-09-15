@@ -24,7 +24,8 @@
    `:uri` both exclude it), so a suite asserting `?limit=20`-style params
    needs this key rather than `path`. `body` is the request body decoded as
    UTF-8; `body-bytes` is the same body as raw bytes. Returns
-   {:port port :stop! (fn [])}.
+   {:port port :stop! (fn [])}; pass port 0 for an OS-assigned port, and
+   :port is the bound one.
 
    The response `:body` may be a String (sent as UTF-8), a byte[], or a
    STREAMING fn (fn [send!]): status and headers go out first, each
@@ -68,7 +69,7 @@
                                                   (finally (hk/close ch)))))}))
                           resp)))
                     {:port port :legacy-return-value? false})]
-       {:port port :stop! (fn [] (hk/server-stop! server))})
+       {:port (hk/server-port server) :stop! (fn [] (hk/server-stop! server))})
 
      :clj
      (let [server (com.sun.net.httpserver.HttpServer/create
@@ -102,7 +103,7 @@
                    (with-open [os (.getResponseBody exchange)] (.write os resp-bytes))))))))
        (.setExecutor server nil)
        (.start server)
-       {:port port :stop! (fn [] (.stop server 0))})))
+       {:port (.getPort (.getAddress server)) :stop! (fn [] (.stop server 0))})))
 
 (defn start-abort-server!
   "Raw-socket HTTP/1.1 server for a response that is cut off mid-stream,

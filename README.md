@@ -97,6 +97,12 @@ openai (and so openai.agents) and gemini clients:
   files and callable keys (#35–#38) are constructors returning a source,
   wired into each client's private `resolve-client-credentials`; the public
   `resolve-credentials` functions are unchanged.
+- **Anthropic Workload Identity Federation** (#35) is the first such source:
+  `tools.agents.anthropic.credentials/workload-identity-source`, discovered
+  automatically from `ANTHROPIC_FEDERATION_RULE_ID`,
+  `ANTHROPIC_ORGANIZATION_ID` and `ANTHROPIC_IDENTITY_TOKEN[_FILE]` when no
+  static Anthropic key or token is set. See
+  [docs/anthropic.md](docs/anthropic.md#workload-identity-federation).
 
 ## Usage
 
