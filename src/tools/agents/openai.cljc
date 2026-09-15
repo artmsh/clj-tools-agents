@@ -88,6 +88,15 @@
   [s]
   ((:read json-codec) s))
 
+(defn read-jsonl
+  "Decode JSON Lines from a String or java.io.Reader into a LAZY seq of
+   values (tools.agents.json/read-jsonl). Blank lines are skipped. A
+   malformed line throws, when realized, ex-info
+   {:type :tools.agents.openai/json-parse-error :line n} with message prefix
+   `tools.agents.openai/read-jsonl: line n: `."
+  [src]
+  ((:read-jsonl json-codec) src))
+
 ;; ---------------------------------------------------------------------------
 ;; Process boundary — `getenv`, `sleep!` and `now-ms` are testability seams.
 ;; Network I/O is tools.agents.http/request!, called from request! below.

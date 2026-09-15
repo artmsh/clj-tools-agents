@@ -8,6 +8,7 @@
             tools.agents.openai.embeddings-test
             tools.agents.openai.files-test
             tools.agents.openai.images-test
+            tools.agents.openai.batches-test
             tools.agents.openai.webhooks-test
             tools.agents.openai.realtime-test))
 
@@ -19,6 +20,7 @@
    'tools.agents.openai.embeddings-test
    'tools.agents.openai.files-test
    'tools.agents.openai.images-test
+   'tools.agents.openai.batches-test
    'tools.agents.openai.webhooks-test
    'tools.agents.openai.realtime-test])
 

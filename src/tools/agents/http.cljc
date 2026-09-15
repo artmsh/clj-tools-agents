@@ -37,6 +37,30 @@
   [v]
   (java.net.URLEncoder/encode (if (or (keyword? v) (symbol? v)) (name v) (str v)) "UTF-8"))
 
+(def ^:private path-safe
+  "RFC 3986 §3.3 pchar minus pct-encoded: unreserved, sub-delims, `:`, `@`."
+  (set (str "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+            "!$&'()*+,;=:@")))
+
+(defn encode-path-segment
+  "Percent-encode one URL path segment exactly as openai-python's
+   `_quote_path_segment_part` (`_utils/_path.py`: `quote(value,
+   safe=\"!$&'()*+,;=:@\")`): RFC 3986 pchar characters stay literal, every
+   other UTF-8 byte becomes `%XX` (upper-case hex). Unlike `url-encode`
+   (form encoding) a space is `%20`, not `+`, and `:` stays literal, so
+   `ft:gpt-4o-mini:org::ckpt-step-1` is sent verbatim while `/`, `?`, `#`
+   and `%` cannot reroute the request. Keywords encode via `name`."
+  [v]
+  (let [s  (if (or (keyword? v) (symbol? v)) (name v) (str v))
+        sb (StringBuilder.)]
+    (doseq [b (.getBytes ^String s "UTF-8")]
+      (let [u (bit-and (int b) 0xff)
+            c (char u)]
+        (if (and (< u 128) (contains? path-safe c))
+          (.append sb c)
+          (.append sb (str "%" (str/upper-case (format "%02x" u)))))))
+    (str sb)))
+
 (defn- param-name [k]
   (if (or (keyword? k) (symbol? k)) (name k) (str k)))
 
