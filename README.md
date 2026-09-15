@@ -18,7 +18,7 @@ one `tools.agents.*` namespace root instead of two `corevector.*` ones.
 |---|---|---|
 | Anthropic Messages API | `tools.agents.anthropic` (+ `.batches`, `.visualize`, `.spec`) | [docs/anthropic.md](docs/anthropic.md) |
 | OpenAI Responses & Chat Completions APIs | `tools.agents.openai` | [docs/openai.md](docs/openai.md) |
-| OpenAI Agents API (beta) — managed sessions, turns, OpenAI-hosted & self-hosted sandboxes | `tools.agents.openai.agents` | [docs/openai-agents.md](docs/openai-agents.md) |
+| OpenAI Agents API (beta) — managed sessions, turns, subagents, OpenAI-hosted & self-hosted sandboxes, environment templates, vaults & credentials | `tools.agents.openai.agents` | [docs/openai-agents.md](docs/openai-agents.md) |
 | Gemini Developer API | `tools.agents.gemini` | [docs/gemini.md](docs/gemini.md) |
 | Model Context Protocol, revision 2026-07-28 — server, client, stdio & Streamable HTTP | `tools.agents.mcp` (+ `.server`, `.client`, `.stdio`, `.http`) | [docs/mcp.md](docs/mcp.md) |
 | Multi-provider orchestration — call providers concurrently, fuse successful texts | `tools.agents.fusion` | [docs/fusion.md](docs/fusion.md) |
