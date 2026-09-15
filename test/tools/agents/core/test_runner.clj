@@ -1,12 +1,15 @@
 (ns tools.agents.core.test-runner
   "Entry point for `clojure -M:test-core` and `bb test-core`: tests for the
-   provider-agnostic core namespaces (tools.agents.json, tools.agents.sse, ...)."
+   provider-agnostic core namespaces (tools.agents.json, tools.agents.sse,
+   tools.agents.http, ...)."
   (:require [clojure.test :as t]
+            tools.agents.http-test
             tools.agents.json-test
             tools.agents.sse-test))
 
 (def suites
-  ['tools.agents.json-test
+  ['tools.agents.http-test
+   'tools.agents.json-test
    'tools.agents.sse-test])
 
 (defn -main [& _]

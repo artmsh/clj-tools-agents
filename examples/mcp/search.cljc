@@ -28,8 +28,8 @@
    outright unless `NODE_EXTRA_CA_CERTS` is *also* set (see this project's
    `feedback_searxng_mcp` memory). `http-get!` below does plain, verified
    TLS on every runtime; there is no insecure-mode escape hatch to port,
-   since neither this library's own leaves (`tools.agents.anthropic`'s
-   `http-post!`, `tools.agents.openai`'s) nor `:bb`/`:clj` expose one. Both
+   since neither this library's own `tools.agents.http/request!` nor
+   `:bb`/`:clj` expose one. Both
    go through the JVM trust store, so if sear.xng's CA is not already in the
    runtime JVM's `cacerts`, it must be imported there; not exercised by the
    test suite below, which injects `fetch` and never touches the network.
@@ -55,8 +55,8 @@
 
 (defn http-get!
   "GET url. Returns {:status int :body string} on ANY HTTP response (2xx or
-   not) — same contract as this repo's own `http-post!` leaves in
-   tools.agents.anthropic/tools.agents.openai: callers classify status
+   not) — same contract as this repo's own `tools.agents.http/request!`:
+   callers classify status
    themselves. Throws only on a genuine transport failure (DNS, connection
    refused, TLS handshake failure — no response at all), which `search!`
    below catches exactly where the TS original's try/catch did."

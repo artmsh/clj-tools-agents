@@ -33,6 +33,12 @@
   (is (= "?order=desc" (#'agents/query-string {"order" :desc})))
   (is (= "?limit=20" (#'agents/query-string {"limit" 20}))))
 
+(deftest query-string-drops-nil-and-empty-values
+  ;; openai-python semantics via tools.agents.http/encode-params: a nil or ""
+  ;; value is omitted, not sent as `k=`; nothing left means no `?` at all.
+  (is (= "?limit=20" (#'agents/query-string (array-map "after" nil "limit" 20 "order" ""))))
+  (is (nil? (#'agents/query-string {"after" nil}))))
+
 ;; ---------------------------------------------------------------------------
 ;; items-output-text
 ;; ---------------------------------------------------------------------------

@@ -514,14 +514,14 @@ fixed ports, and the only subprocess is this repo's own weather server.
   Not covered: `http/serve!` and `http/connect!`, the two adapters that put
   this logic on a real socket. Both are thin — `serve!` binds
   `com.sun.net.httpserver` and delegates every request to `handle-http`;
-  `connect!` is the private `http-post!` leaf (`java.net.http.HttpClient` on
-  JVM, `babashka.http-client` on bb) plus `parse-sse` — and testing either
+  `connect!` is a `tools.agents.http/request!` call (covered by the core
+  suite) plus `parse-sse` — and testing either
   means binding a fixed port, which is a host-state assumption the
   anthropic/openai/gemini suites accept and this one chose not to take on.
   The logic underneath both
-  is tested; the socket wiring is not. A change to either leaf therefore has
-  to be checked out of band, and the anthropic and openai suites — which do
-  exercise their own identical leaf — are the tripwire that catches it.
+  is tested; the socket wiring is not. A change to `serve!` therefore has
+  to be checked out of band; the shared request function under `connect!`
+  is exercised by the core suite and by every provider suite.
 - **`stdio_test.cljc`** — framing (one message per line; tool output that
   contains newlines cannot break it), `-32700` with a null id, notification
   ordering, listen/notify/cancel/close, `log!` writing nothing to stdout, and

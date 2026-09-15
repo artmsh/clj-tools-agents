@@ -18,9 +18,8 @@
    is a small hand-rolled ANSI tree+panel renderer — same zero-dependency,
    data-transparency spirit as tools.agents.anthropic's own JSON codec.
 
-   NO RUNTIME-SPECIFIC LEAF AT ALL: rendering text to a string and
-   `println`-ing it needs no HTTP client, so unlike tools.agents.anthropic
-   (whose `http-post!` is a reader conditional) this file has none.
+   NO RUNTIME-SPECIFIC CODE AT ALL: rendering text to a string and
+   `println`-ing it needs no HTTP client and no reader conditional.
 
    PLAIN ASCII (`+`, `-`, `|`, backtick) for all structural drawing —
    classic `tree`-CLI style, not Rich's rounded Unicode boxes. Every

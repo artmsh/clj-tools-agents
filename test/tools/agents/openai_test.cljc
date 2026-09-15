@@ -210,7 +210,7 @@
   (is (= 3000 (oai/parse-retry-after-ms {"retry-after" " 3 "} t0))))
 
 (deftest parse-retry-after-ms-is-case-insensitive-and-shape-tolerant
-  ;; A server may send any casing, java.net.http/babashka lower-case theirs,
+  ;; A server may send any casing (tools.agents.http lower-cases names),
   ;; and a multi-value header can arrive as a vector.
   (is (= 3000 (oai/parse-retry-after-ms {"Retry-After" "3"} t0)))
   (is (= 3000 (oai/parse-retry-after-ms {"RETRY-AFTER" "3"} t0)))

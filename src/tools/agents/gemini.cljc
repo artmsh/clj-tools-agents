@@ -15,10 +15,10 @@
    `GeminiClient` record built by `client`; it retains Clojure's map-style
    keyword lookup and immutable update semantics on both runtimes.
 
-   PORTABILITY: exactly one function does real network I/O — the private leaf
-   `http-post!` below, isolated with a #?(:bb ... :clj ...) reader conditional,
-   same pattern as tools.agents.anthropic/tools.agents.openai's own leaf I/O.
-   Everything above it — URL/header building, the hand-rolled JSON codec,
+   PORTABILITY: all network I/O goes through `tools.agents.http/request!`,
+   the shared HTTP request function tools.agents.anthropic and
+   tools.agents.openai use too, which needs no reader conditional.
+   Everything else — URL/header building, the hand-rolled JSON codec,
    error typing, credential resolution, the retry policy, output-text
    extraction — is plain, portable clojure.core exercised identically by both
    test runners. `getenv` (env-var access) and `sleep!` (retry backoff) touch
@@ -72,8 +72,8 @@
    here, only an absent function. See docs/gemini.md 'Streaming is not
    supported'."
   (:require [clojure.string :as str]
-            [tools.agents.json :as json]
-            #?@(:bb [[babashka.http-client :as http]] :clj [])))
+            [tools.agents.http :as http]
+            [tools.agents.json :as json]))
 
 ;; python-genai's HttpOptions defaults (Gemini Developer API, not Vertex):
 ;; base_url = 'https://generativelanguage.googleapis.com/', api_version =
@@ -118,10 +118,8 @@
   ((:read json-codec) s))
 
 ;; ---------------------------------------------------------------------------
-;; I/O leaves — `http-post!` is the only runtime-specific function in this
-;; file; `getenv`, `sleep!` and `now-ms` are here beside it because they are
-;; the other side of the process boundary, not because they need a reader
-;; conditional.
+;; Process boundary — `getenv`, `sleep!` and `now-ms` are testability seams.
+;; Network I/O is tools.agents.http/request!, called from post-json! below.
 ;; ---------------------------------------------------------------------------
 
 (defn- getenv [name]
@@ -139,43 +137,6 @@
 ;; *sleep-fn*: tests bind this to a no-op so the retry-loop tests below run in
 ;; milliseconds rather than paying the real (>= 1s) backoff delay.
 (def ^:dynamic *sleep-fn* sleep!)
-
-;; One HTTP client per process, built lazily — same rationale as
-;; tools.agents.openai's own bb-http-client/jvm-http-client: avoids allocating
-;; a fresh selector thread per retry.
-#?(:bb  (def ^:private bb-http-client
-          (delay (http/client (assoc http/default-client-opts :version :http1.1))))
-   :clj (def ^:private jvm-http-client
-          (delay (-> (java.net.http.HttpClient/newBuilder)
-                     (.version java.net.http.HttpClient$Version/HTTP_1_1)
-                     (.build)))))
-
-(defn- http-post!
-  "POST body to url with headers. Returns {:status int :headers map :body
-   string} on ANY HTTP response (2xx or not) — callers classify status
-   themselves. Throws only on a genuine transport failure (DNS, connection
-   refused, TLS handshake failure, timeout — no response at all)."
-  [url headers body]
-  #?(:bb
-     (let [resp (http/post url {:client @bb-http-client :headers headers :body body :throw false})]
-       {:status (:status resp) :headers (:headers resp) :body (:body resp)})
-
-     :clj
-     (let [builder  (reduce (fn [b [k v]] (.header ^java.net.http.HttpRequest$Builder b (str k) (str v)))
-                             (java.net.http.HttpRequest/newBuilder (java.net.URI/create url))
-                             headers)
-           req      (-> builder
-                        ;; HTTP/1.1 explicitly — same rationale as
-                        ;; tools.agents.openai's :clj leaf (a plain HTTP/1.1
-                        ;; reverse proxy in front of a custom :base-url
-                        ;; gateway 502s on Java's default HTTP/2 preface).
-                        (.version java.net.http.HttpClient$Version/HTTP_1_1)
-                        (.POST (java.net.http.HttpRequest$BodyPublishers/ofString body))
-                        (.build))
-           resp     (.send @jvm-http-client req (java.net.http.HttpResponse$BodyHandlers/ofString))]
-       {:status  (.statusCode resp)
-        :headers (into {} (map (fn [[k vs]] [k (first vs)]) (.map (.headers resp))))
-        :body    (.body resp)})))
 
 ;; ---------------------------------------------------------------------------
 ;; Credentials / client construction
@@ -355,12 +316,16 @@
    2xx is NOT retried."
   [client fn-name model method request]
   (let [url         (endpoint-url client model method)
-        headers     (request-headers fn-name client)
         body-str    (write-json request)
         max-retries (resolve-max-retries client)]
     (loop [retries-taken 0]
+      ;; Headers are rebuilt on every attempt, so credentials that change
+      ;; between attempts (a refreshed token) land on the retry. The typed
+      ;; :missing-credentials throw passes through own-error?.
       (let [outcome (try
-                      {:resp (http-post! url headers body-str)}
+                      {:resp (http/request! {:method :post :url url
+                                             :headers (request-headers fn-name client)
+                                             :body body-str})}
                       (catch Exception e
                         (if (own-error? e) (throw e) {:error e})))]
         (if (:error outcome)

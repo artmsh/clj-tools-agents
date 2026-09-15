@@ -233,11 +233,10 @@ wrappers throw this namespace's own `:tools.agents.gemini/json-encode-error`
 
 ### Isolating runtime-specific I/O
 
-Exactly one function in `tools/agents/gemini.cljc` is runtime-specific:
-`http-post!`, behind a `#?(:bb ... :clj ...)` reader conditional, identical in
-shape and rationale to `tools.agents.openai`'s own leaf (see docs/openai.md's
-"Isolating runtime-specific I/O" and "Why HTTP/1.1 is pinned" sections — both
-apply here verbatim, including the HTTP/1.1 pin).
+`tools/agents/gemini.cljc` has no runtime-specific code. Its requests go
+through the shared `tools.agents.http/request!`, the same function
+`tools.agents.openai` uses (see docs/openai.md's "Isolating runtime-specific
+I/O" and "Why HTTP/1.1 is pinned" sections — both apply here verbatim).
 
 ## Testing
 

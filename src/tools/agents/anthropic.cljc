@@ -7,9 +7,9 @@
    `AnthropicClient` record built by `client`; it retains Clojure's map-style
    keyword lookup and immutable update semantics on both runtimes.
 
-   PORTABILITY: exactly one function does real network I/O — the private leaf
-   `http-post!` below, isolated with a #?(:bb ... :clj ...) reader conditional.
-   Everything above it — URL/header building, the hand-rolled JSON codec,
+   PORTABILITY: all network I/O goes through `tools.agents.http/request!`,
+   the shared HTTP request function, which needs no reader
+   conditional. Everything else — URL/header building, the hand-rolled JSON codec,
    error typing, credential resolution, output-text extraction — is plain,
    portable clojure.core exercised identically by both test runners.
 
@@ -25,8 +25,8 @@
    STREAMING: not implemented. :stream true is rejected with a clear error
    rather than silently ignored. See README's platform-limitations section."
   (:require [clojure.string :as str]
-            [tools.agents.json :as json]
-            #?@(:bb [[babashka.http-client :as http]] :clj [])))
+            [tools.agents.http :as http]
+            [tools.agents.json :as json]))
 
 (def default-base-url "https://api.anthropic.com")
 (def ^:private anthropic-version "2023-06-01")
@@ -77,66 +77,12 @@
   ((:read json-codec) s))
 
 ;; ---------------------------------------------------------------------------
-;; I/O leaves — `http-post!` is the only runtime-specific function in this
-;; file; `getenv` is here beside it because it is the other side of the
-;; process boundary, not because it needs a reader conditional.
+;; Process boundary — `getenv` is the env-var seam. Network I/O is
+;; tools.agents.http/request!, called from post-json! below.
 ;; ---------------------------------------------------------------------------
 
 (defn- getenv [name]
   (System/getenv name))
-
-;; One HTTP client per process, built lazily — anthropic-sdk-python likewise
-;; reuses a single httpx.Client across attempts. Building one per call would
-;; allocate a fresh selector thread for every retry (java.net.http.HttpClient
-;; had no close() before Java 21). Both are pinned to HTTP/1.1 for the reason
-;; spelled out in http-post!'s :clj branch below.
-#?(:bb  (def ^:private bb-http-client
-          (delay (http/client (assoc http/default-client-opts :version :http1.1))))
-   :clj (def ^:private jvm-http-client
-          (delay (-> (java.net.http.HttpClient/newBuilder)
-                     (.version java.net.http.HttpClient$Version/HTTP_1_1)
-                     (.build)))))
-
-(defn- http-post!
-  "POST body to url with headers. Returns {:status int :headers map :body
-   string} on ANY HTTP response (2xx or not) — callers classify status
-   themselves. Throws only on a genuine transport failure (DNS, connection
-   refused, TLS handshake failure, timeout — no response at all)."
-  [url headers body]
-  #?(:bb
-     ;; :version :http1.1 for the same reason as the :clj leaf below —
-     ;; babashka.http-client wraps java.net.http and inherits its HTTP_2
-     ;; default, which breaks against a plain HTTP/1.1 proxy over cleartext.
-     (let [resp (http/post url {:client @bb-http-client :headers headers :body body :throw false})]
-       {:status (:status resp) :headers (:headers resp) :body (:body resp)})
-
-     :clj
-     (let [builder  (reduce (fn [b [k v]] (.header ^java.net.http.HttpRequest$Builder b (str k) (str v)))
-                             (java.net.http.HttpRequest/newBuilder (java.net.URI/create url))
-                             headers)
-           req      (-> builder
-                        ;; Pin HTTP/1.1 explicitly, don't let HttpClient's
-                        ;; default (HTTP_2, upgraded-to opportunistically)
-                        ;; apply here. Verified empirically against a real
-                        ;; plaintext-http gateway (Caddy in front of a
-                        ;; homelab LLM router): the unpinned default sends a
-                        ;; cleartext HTTP/2 upgrade attempt that gateway
-                        ;; doesn't handle, and EVERY request comes back `502`
-                        ;; with an empty body — while curl (HTTP/1.1 by
-                        ;; default for http://) and this same request with
-                        ;; `.version(HTTP_1_1)` pinned both succeed in ~3s.
-                        ;; api.anthropic.com itself is unaffected either way
-                        ;; (HTTPS negotiates via ALPN), but a custom
-                        ;; `:base-url` gateway on plain http:// — exactly
-                        ;; examples/custom_gateway.clj's own scenario — can
-                        ;; silently 502 on every single request otherwise.
-                        (.version java.net.http.HttpClient$Version/HTTP_1_1)
-                        (.POST (java.net.http.HttpRequest$BodyPublishers/ofString body))
-                        (.build))
-           resp     (.send @jvm-http-client req (java.net.http.HttpResponse$BodyHandlers/ofString))]
-       {:status  (.statusCode resp)
-        :headers (into {} (map (fn [[k vs]] [k (first vs)]) (.map (.headers resp))))
-        :body    (.body resp)})))
 
 ;; ---------------------------------------------------------------------------
 ;; Credentials / client construction
@@ -286,9 +232,9 @@
    loop or force an unbounded sleep.
 
    A header value may also be a VECTOR of strings, not a bare string:
-   Babashka's http-post! leaf (babashka.http-client) returns a header's
-   value as a vector whenever that header name appears more than once in
-   the response — verified empirically, `retry-after` sent twice yields
+   tools.agents.http/request! returns a header's value as a vector
+   whenever that header name appears more than once in the response, on
+   both runtimes — `retry-after` sent twice yields
    [\"30\" \"60\"] — a real occurrence when a proxy/gateway/load-balancer in
    front of a custom :base-url duplicates or folds a singleton header,
    exactly the adversarial-gateway class this function already defends
@@ -410,16 +356,16 @@
                      {:type :tools.agents.anthropic.error/missing-credentials}))))
 
 (defn- post-json!
-  "POST body-str to url with headers via http-post!, classifying a genuine
-   transport failure (DNS/refused/TLS/timeout — no response at all) as
-   :tools.agents.anthropic.error/api-connection. caller-name (e.g.
-   \"tools.agents.anthropic/messages-create\") prefixes that error's message.
-   An already-typed tools.agents.anthropic.error/* ex-info thrown by
-   http-post! itself surfaces verbatim instead — those are permanent, not
-   connection failures."
+  "POST body-str to url with headers via tools.agents.http/request!,
+   classifying a genuine transport failure (DNS/refused/TLS/timeout — no
+   response at all) as :tools.agents.anthropic.error/api-connection.
+   caller-name (e.g. \"tools.agents.anthropic/messages-create\") prefixes
+   that error's message. An already-typed tools.agents.anthropic.error/*
+   ex-info surfaces verbatim instead — those are permanent, not connection
+   failures."
   [caller-name url headers body-str]
   (try
-    (http-post! url headers body-str)
+    (http/request! {:method :post :url url :headers headers :body body-str})
     (catch Exception e
       (let [data (ex-data e)]
         (if (and data (keyword? (:type data)) (= "tools.agents.anthropic.error" (namespace (:type data))))
@@ -443,26 +389,29 @@
                          {:type (status->type status) :status status :body resp-body :headers (:headers resp)}))))))
 
 (defn- attempt-request!
-  "One HTTP round trip: POST body-str to url with headers, decode-or-throw!
-   the response. Shared by messages-create/count-tokens; url/headers/
+  "One HTTP round trip: build headers, POST body-str to url, decode-or-throw!
+   the response. Shared by messages-create/count-tokens.
+
+   headers-fn is called at the start of EVERY attempt, so credentials that
+   change between attempts (a refreshed token) land on the retry. url and
    body-str are computed ONCE by the caller before entering
-   request-with-retries!, not recomputed per attempt — an earlier version
-   rebuilt them (including re-serializing the whole request via write-json)
-   on every retry, pure wasted CPU/latency on top of the backoff sleep for
-   work that's provably identical across attempts."
-  [caller-name url headers body-str]
-  (decode-or-throw! caller-name (post-json! caller-name url headers body-str)))
+   request-with-retries! — re-serializing the whole request via write-json
+   on every retry would be wasted work identical across attempts."
+  [caller-name url headers-fn body-str]
+  (let [headers (headers-fn)]
+    (decode-or-throw! caller-name (post-json! caller-name url headers body-str))))
 
 (defn- post-request!
-  "Shared body of every resource method: build URL + headers, encode the
-   request, POST it under the client's retry policy. caller-name prefixes
-   any error message; path is appended to the client's base-url."
+  "Shared body of every resource method: build the URL, encode the request,
+   POST it under the client's retry policy with headers rebuilt per attempt.
+   caller-name prefixes any error message; path is appended to the client's
+   base-url."
   [client caller-name path request]
-  (let [url      (api-url (:base-url client) path)
-        headers  (auth-headers client)
-        body-str (write-json request)]
+  (let [url        (api-url (:base-url client) path)
+        headers-fn #(auth-headers client)
+        body-str   (write-json request)]
     (request-with-retries! (or (:max-retries client) default-max-retries)
-                           #(attempt-request! caller-name url headers body-str))))
+                           #(attempt-request! caller-name url headers-fn body-str))))
 
 (defn messages-create
   "POST request (a plain map, passed through to JSON almost verbatim — model,
