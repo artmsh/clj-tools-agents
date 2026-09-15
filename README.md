@@ -9,8 +9,8 @@ error hierarchy matching its exception classes) and runs unmodified on **JVM
 Clojure** and **Babashka**.
 
 Merged from the formerly separate `corevector-anthropic` and
-`corevector-openai` repos — same architecture in both (single leaf for
-network I/O, hand-rolled portable JSON codec, `ex-info`-with-`:type` error
+`corevector-openai` repos — same architecture in both (one shared
+function for network I/O, `tools.agents.http/request!`; hand-rolled portable JSON codec, `ex-info`-with-`:type` error
 hierarchy, two-runtime test matrix), now sharing one repo, one CI run, and
 one `tools.agents.*` namespace root instead of two `corevector.*` ones.
 

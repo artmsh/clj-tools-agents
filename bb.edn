@@ -11,7 +11,7 @@
                     m (shell {:continue true} "bb" "test-mcp")
                     f (shell {:continue true} "bb" "test-fusion")]
                 (System/exit (if (every? zero? [(:exit c) (:exit a) (:exit o) (:exit g) (:exit m) (:exit f)]) 0 1)))}
-  test-core      {:doc  "Run the core suite (sse, ...) on Babashka"
+  test-core      {:doc  "Run the core suite (http, sse, ...) on Babashka"
                   :task (exec 'tools.agents.core.test-runner/-main)}
   test-anthropic {:doc  "Run the anthropic suite on Babashka"
                   :task (exec 'tools.agents.anthropic.test-runner/-main)}

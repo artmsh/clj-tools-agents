@@ -357,7 +357,7 @@
       (is (= [7.0] @slept)))))
 
 (deftest honors-retry-after-header-when-its-value-is-a-vector
-  ;; Regression guard: Babashka's http-post! leaf (babashka.http-client)
+  ;; Regression guard: tools.agents.http/request! (on both runtimes)
   ;; returns a header's value as a VECTOR of strings, not a bare string,
   ;; whenever that header name appears more than once in the response --
   ;; a real occurrence when a proxy/gateway in front of a custom :base-url

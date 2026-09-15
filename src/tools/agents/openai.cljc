@@ -14,9 +14,9 @@
    `OpenAIClient` record built by `client`; it retains Clojure's map-style
    keyword lookup and immutable update semantics on both runtimes.
 
-   PORTABILITY: exactly one function does real network I/O — the private leaf
-   `http-post!` below, isolated with a #?(:bb ... :clj ...) reader conditional.
-   Everything above it — URL/header building, the hand-rolled JSON codec,
+   PORTABILITY: all network I/O goes through `tools.agents.http/request!`,
+   the shared HTTP request function, which needs no reader
+   conditional. Everything else — URL/header building, the hand-rolled JSON codec,
    error typing, credential resolution, the retry policy, output-text
    extraction — is plain, portable clojure.core exercised identically by both
    test runners. `getenv` (env-var access) and `sleep!` (retry backoff) touch
@@ -44,8 +44,8 @@
    rather than silently ignored. See docs/openai.md 'Streaming is not
    supported'."
   (:require [clojure.string :as str]
-            [tools.agents.json :as json]
-            #?@(:bb [[babashka.http-client :as http]] :clj [])))
+            [tools.agents.http :as http]
+            [tools.agents.json :as json]))
 
 ;; openai-python's default base_url INCLUDES the /v1 path segment (unlike
 ;; anthropic-sdk-python's host-only base_url) — endpoints are appended to it
@@ -88,10 +88,8 @@
   ((:read json-codec) s))
 
 ;; ---------------------------------------------------------------------------
-;; I/O leaves — `http-post!` is the only runtime-specific function in this
-;; file; `getenv`, `sleep!` and `now-ms` are here beside it because they are
-;; the other side of the process boundary, not because they need a reader
-;; conditional.
+;; Process boundary — `getenv`, `sleep!` and `now-ms` are testability seams.
+;; Network I/O is tools.agents.http/request!, called from post-json! below.
 ;; ---------------------------------------------------------------------------
 
 (defn- getenv [name]
@@ -104,58 +102,6 @@
       nil)))
 
 (defn- now-ms [] (System/currentTimeMillis))
-
-;; One HTTP client per process, built lazily — openai-python likewise reuses a
-;; single httpx.Client across attempts. Building one per call would allocate a
-;; fresh selector thread for every retry (java.net.http.HttpClient had no
-;; close() before Java 21).
-;;
-;; PUBLIC (not ^:private) so tools.agents.openai.agents' own http-request!
-;; leaf can share the SAME underlying client rather than opening a second one
-;; — that namespace's docs recommend building one tools.agents.openai/client
-;; and using it with both namespaces, which only avoids doubling the
-;; connection pool if the delay itself is shared too.
-#?(:bb  (def bb-http-client
-          (delay (http/client (assoc http/default-client-opts :version :http1.1))))
-   :clj (def jvm-http-client
-          (delay (-> (java.net.http.HttpClient/newBuilder)
-                     (.version java.net.http.HttpClient$Version/HTTP_1_1)
-                     (.build)))))
-
-(defn- http-post!
-  "POST body to url with headers. Returns {:status int :headers map :body
-   string} on ANY HTTP response (2xx or not) — callers classify status
-   themselves. Throws only on a genuine transport failure (DNS, connection
-   refused, TLS handshake failure, timeout — no response at all)."
-  [url headers body]
-  #?(:bb
-     ;; :version :http1.1 for the same reason as the :clj leaf below —
-     ;; babashka.http-client wraps java.net.http and inherits its HTTP_2
-     ;; default, which breaks against a plain HTTP/1.1 proxy over cleartext.
-     (let [resp (http/post url {:client @bb-http-client :headers headers :body body :throw false})]
-       {:status (:status resp) :headers (:headers resp) :body (:body resp)})
-
-     :clj
-     (let [builder  (reduce (fn [b [k v]] (.header ^java.net.http.HttpRequest$Builder b (str k) (str v)))
-                             (java.net.http.HttpRequest/newBuilder (java.net.URI/create url))
-                             headers)
-           req      (-> builder
-                        (.POST (java.net.http.HttpRequest$BodyPublishers/ofString body))
-                        (.build))
-           ;; HTTP/1.1 explicitly. HttpClient/newHttpClient defaults to
-           ;; HTTP_2, and for a cleartext http:// URL Java sends the HTTP/2
-           ;; preface with no h2c upgrade negotiation — a plain HTTP/1.1
-           ;; reverse proxy in front of an OpenAI-compatible gateway answers
-           ;; that with 502, so the same :base-url that works on Babashka would
-           ;; fail only on JVM Clojure (observed against a live Caddy-fronted
-           ;; gateway). Over https:// ALPN would have negotiated safely, but
-           ;; pinning 1.1 keeps both runtimes on the same wire protocol, and
-           ;; this client issues one request at a time, so HTTP/2 buys it
-           ;; nothing.
-           resp     (.send @jvm-http-client req (java.net.http.HttpResponse$BodyHandlers/ofString))]
-       {:status  (.statusCode resp)
-        :headers (into {} (map (fn [[k vs]] [k (first vs)]) (.map (.headers resp))))
-        :body    (.body resp)})))
 
 ;; ---------------------------------------------------------------------------
 ;; Credentials / client construction
@@ -257,10 +203,10 @@
 (def ^:private max-retry-after-delay-ms (* 2 60 1000))  ;; MAX_RETRY_AFTER_DELAY = 2 * 60
 
 (defn header-value
-  "Case-insensitive header lookup. Response header maps differ per runtime —
-   java.net.http and babashka.http-client lower-case theirs, and keys may be
-   strings or keywords. A multi-value header arrives as a vector; take the
-   first, as every HTTP client here does. Public (not ^:private) so
+  "Case-insensitive header lookup. tools.agents.http/request! lower-cases
+   response header names, but hand-built and inbound maps may use any case,
+   and keys may be strings or keywords. A multi-value header arrives as a
+   vector; take the first. Public (not ^:private) so
    tools.agents.openai.webhooks looks up inbound webhook headers the same way."
   [headers k]
   (when (map? headers)
@@ -489,12 +435,16 @@
   [client fn-name path request]
   (reject-streaming! fn-name request)
   (let [url         (endpoint-url (:base-url client) path)
-        headers     (request-headers fn-name client)
         body-str    (write-json request)
         max-retries (resolve-max-retries client)]
     (loop [retries-taken 0]
+      ;; Headers are rebuilt on every attempt, so credentials that change
+      ;; between attempts (a refreshed token) land on the retry. The typed
+      ;; :missing-credentials throw passes through own-error?.
       (let [outcome (try
-                      {:resp (http-post! url headers body-str)}
+                      {:resp (http/request! {:method :post :url url
+                                             :headers (request-headers fn-name client)
+                                             :body body-str})}
                       (catch Exception e
                         (if (own-error? e) (throw e) {:error e})))]
         (if (:error outcome)

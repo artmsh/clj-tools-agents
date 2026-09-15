@@ -295,11 +295,35 @@ message prefixes.
 
 ### Isolating runtime-specific I/O
 
-Exactly one function in `tools/agents/openai.cljc` is runtime-specific:
-`http-post!`, the actual network POST, behind a `#?(:bb ... :clj ...)` reader
-conditional. Babashka uses `babashka.http-client` (bundled by default); JVM
-Clojure uses `java.net.http.HttpClient` (built into the JDK since 11 — zero
-added dependency). Both leaves pin **HTTP/1.1** — see below.
+Every network request in this repo goes through one function,
+`tools.agents.http/request!`. It performs a single HTTP exchange and returns
+`{:status :headers :body}` for any response, 2xx or not; it throws only when
+no response arrives (the transport exception propagates unwrapped). Retries,
+status classification and body decoding stay in each client.
+
+It is plain `java.net.http.HttpClient` interop (built into the JDK since 11,
+zero added dependency) with no reader conditional: Babashka exposes the same
+classes, so both runtimes send identical bytes. The request map:
+
+| key | meaning |
+|---|---|
+| `:method`, `:url` | required; `:get`/`:post`/`:put`/`:patch`/`:delete` |
+| `:query` | params map, bracket-encoded as openai-python does (`metadata[k]=v`, `image[]=a`) by `encode-params` |
+| `:headers` | name → value map; a vector value sends the header once per element |
+| `:body` | `nil`, String, `byte[]`, `File`, `Path` or `InputStream` |
+| `:multipart` | `[{:name :content :filename :content-type}]` instead of `:body`; File/Path parts stream from disk and the body keeps a Content-Length; names are sent verbatim, so `image[]` twice is two parts |
+| `:as` | `:string` (default), `:bytes` (raw `byte[]`), `:stream` (`InputStream`) |
+| `:timeout-ms` | request timeout; none by default |
+| `:client` | an `HttpClient`; defaults to one shared, lazily built client (`tools.agents.http/client` builds another, e.g. with `:connect-timeout-ms`) |
+
+Response headers have lower-case names on both runtimes; a header sent once
+is a String and a header sent more than once is a vector. With `:as :stream`
+the caller owns the body and must close it on every path, non-2xx included,
+e.g. with `with-open`.
+
+Clients build request headers inside each retry attempt, so credentials that
+change between attempts reach the retry; the request body is encoded once.
+The shared function pins **HTTP/1.1** — see below.
 
 Everything else — URL/header building, the JSON codec, credential resolution,
 error typing, the whole retry policy, `output-text`/`completion-text`
@@ -316,8 +340,8 @@ everywhere else fails on JVM Clojure and Babashka, which both sit on
 `java.net.http`. Observed against a live Caddy-fronted gateway, not
 theorized.
 
-Both JVM-backed leaves therefore pin HTTP/1.1 explicitly
-(`HttpClient$Version/HTTP_1_1`; `:version :http1.1` for babashka.http-client).
+`tools.agents.http` therefore pins HTTP/1.1 explicitly
+(`HttpClient$Version/HTTP_1_1`) on its client and on every request.
 Over `https://` ALPN would have negotiated safely either way, and this client
 issues one request at a time, so HTTP/2 bought it nothing — pinning keeps
 both runtimes on the same wire protocol.
@@ -350,8 +374,8 @@ retried then typed — all with `retry-after-ms: 1` so they cost no measurable
 wall-clock), and all four `examples/openai/*.clj` Responses/Chat ports run
 end-to-end against the mock server.
 
-The mock server is `tools.agents.test-support/start-server!`, shared by all three provider suites — two tiny leaves, same shape as
-`http-post!`. Babashka uses `org.httpkit.server`
+The mock server is `tools.agents.test-support/start-server!`, shared by the provider and core suites — two tiny runtime branches that
+also serve byte[] and streaming (chunked) response bodies. Babashka uses `org.httpkit.server`
 (`com.sun.net.httpserver.HttpServer` is not resolvable under bb's native
 image). JVM Clojure uses `com.sun.net.httpserver.HttpServer` (built into the
 JDK, zero deps). Mock

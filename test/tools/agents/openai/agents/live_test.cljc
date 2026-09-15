@@ -18,7 +18,7 @@
 
 (defn- parse-query
   "Raw \"k=v&k2=v2\" query string -> {k v} map, order-independent — both
-   babashka.http-client and this repo's own query-string builder iterate a
+   this repo's own query-string builder (`tools.agents.http/encode-params`) iterate a
    Clojure map in unspecified order, so tests compare parsed params rather
    than an exact query string."
   [query]

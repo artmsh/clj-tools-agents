@@ -71,66 +71,22 @@
    See docs/openai-agents.md's \"Streaming is not supported — poll instead\"
    section and `examples/openai/agents_sandbox_task.clj`.
 
-   PORTABILITY: exactly one function does real network I/O — the private leaf
-   `http-request!` below, isolated with a #?(:bb ... :clj ...) reader
-   conditional, generalizing tools.agents.openai's `http-post!` to GET/POST/
-   DELETE (sessions and items need GET, session deletion needs DELETE).
-   Everything above it is plain, portable clojure.core, exercised identically
-   by both test runners.
+   PORTABILITY: all network I/O goes through `tools.agents.http/request!`,
+   the shared HTTP request function (GET/POST/DELETE here: sessions
+   and items need GET, session deletion needs DELETE), which needs no reader
+   conditional. Everything else is plain, portable clojure.core, exercised
+   identically by both test runners.
 
    Runs unmodified on JVM Clojure and Babashka."
   (:require [clojure.string :as str]
-            [tools.agents.openai :as oai]
-            #?@(:bb [[babashka.http-client :as http]] :clj [])))
+            [tools.agents.http :as http]
+            [tools.agents.openai :as oai]))
 
 ;; The one header this API adds on top of everything tools.agents.openai/client
 ;; already resolves (api-key, organization, project, base-url, max-retries).
 ;; Required on every request; the OpenAI SDKs add it automatically, quote from
 ;; the quickstart: "include it explicitly when using cURL."
 (def ^:private beta-header "agents=v1")
-
-;; ---------------------------------------------------------------------------
-;; I/O leaf — `http-request!` is the only runtime-specific function in this
-;; file. Same shape as tools.agents.openai's `http-post!`, generalized to a
-;; `method` argument since this API's resource tree needs GET and DELETE too.
-;;
-;; Deliberately reuses tools.agents.openai's OWN bb-http-client/jvm-http-client
-;; delays rather than opening a second HTTP client — those are public
-;; (not ^:private) specifically so the two namespaces share one connection
-;; pool when a caller follows this doc's advice to build one client and use
-;; it with both.
-;; ---------------------------------------------------------------------------
-
-(defn- http-request!
-  "Perform an HTTP request. `method` is one of :get :post :delete; `body` is
-   a JSON string or nil (GET/DELETE send no body). Returns {:status :headers
-   :body} on ANY HTTP response (2xx or not) — callers classify status
-   themselves. Throws only on a genuine transport failure (DNS, connection
-   refused, TLS handshake failure, timeout — no response at all). Pins
-   HTTP/1.1 for the same reason tools.agents.openai's leaf does — a plain
-   HTTP/1.1 reverse proxy in front of an OpenAI-compatible gateway 502s on
-   java.net.http's unnegotiated HTTP/2 cleartext preface."
-  [method url headers body]
-  #?(:bb
-     (let [resp (http/request (cond-> {:method method :uri url :client @oai/bb-http-client
-                                        :headers headers :throw false}
-                                 body (assoc :body body)))]
-       {:status (:status resp) :headers (:headers resp) :body (:body resp)})
-
-     :clj
-     (let [builder0 (reduce (fn [b [k v]] (.header ^java.net.http.HttpRequest$Builder b (str k) (str v)))
-                             (java.net.http.HttpRequest/newBuilder (java.net.URI/create url))
-                             headers)
-           builder  (case method
-                      :get    (.GET ^java.net.http.HttpRequest$Builder builder0)
-                      :delete (.DELETE ^java.net.http.HttpRequest$Builder builder0)
-                      :post   (.POST ^java.net.http.HttpRequest$Builder builder0
-                                     (java.net.http.HttpRequest$BodyPublishers/ofString (or body ""))))
-           req      (.build ^java.net.http.HttpRequest$Builder builder)
-           resp     (.send @oai/jvm-http-client req (java.net.http.HttpResponse$BodyHandlers/ofString))]
-       {:status  (.statusCode resp)
-        :headers (into {} (map (fn [[k vs]] [k (first vs)]) (.map (.headers resp))))
-        :body    (.body resp)})))
 
 (defn- sleep! [millis] (let [ms (long millis)] (when (pos? ms) (Thread/sleep ms) nil)))
 (defn- now-ms [] (System/currentTimeMillis))
@@ -139,24 +95,14 @@
 ;; Request plumbing — URL/header building, error typing, the shared transport.
 ;; ---------------------------------------------------------------------------
 
-(defn- url-encode-component
-  "URL-encode a single path segment or query value. Strings/numbers encode
-   via `str`; keywords/symbols via `name` (verbatim, no case conversion) —
-   matching this whole codebase's key/value passthrough idiom, so
-   `{\"order\" :desc}` encodes as `order=desc`, not the keyword's own
-   `:desc` print-form (which would send a literal leading colon)."
-  [v]
-  (java.net.URLEncoder/encode (if (or (keyword? v) (symbol? v)) (name v) (str v)) "UTF-8"))
-
 (defn- query-string
-  "Turn a plain map of query params into \"?k=v&k2=v2\", URL-encoded, or nil
-   when `params` is empty/nil. Map keys AND values may be strings or
-   keywords."
+  "Turn a map of query params into \"?k=v&k2=v2\", or nil when nothing
+   remains to encode. Encoding is tools.agents.http/encode-params: keys and
+   values may be strings or keywords (`{\"order\" :desc}` -> `order=desc`),
+   nested maps and vectors use bracket syntax, nil values are dropped."
   [params]
-  (when (seq params)
-    (str "?" (str/join "&"
-               (map (fn [[k v]] (str (url-encode-component k) "=" (url-encode-component v)))
-                    params)))))
+  (when-let [qs (http/encode-params params)]
+    (str "?" qs)))
 
 (defn- path-segment
   "URL-encode a caller-supplied path segment (a session or environment id)
@@ -164,7 +110,7 @@
    (corrupted, or echoed from an untrusted source) must not silently reroute
    the request to a different path or endpoint."
   [id]
-  (url-encode-component id))
+  (http/url-encode id))
 
 (defn- request-headers [fn-name client]
   (when-not (:api-key client)
@@ -224,12 +170,15 @@
   [client fn-name method path body-value]
   (when (map? body-value) (reject-streaming! fn-name body-value))
   (let [url         (oai/endpoint-url (:base-url client) path)
-        headers     (request-headers fn-name client)
         body-str    (when body-value (oai/write-json body-value))
         max-retries (resolve-max-retries client)]
     (loop [retries-taken 0]
+      ;; Headers are rebuilt on every attempt, so credentials that change
+      ;; between attempts land on the retry; see tools.agents.openai/post-json!.
       (let [outcome (try
-                      {:resp (http-request! method url headers body-str)}
+                      {:resp (http/request! {:method method :url url
+                                             :headers (request-headers fn-name client)
+                                             :body body-str})}
                       (catch Exception e
                         (if (own-error? e) (throw e) {:error e})))]
         (if (:error outcome)

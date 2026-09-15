@@ -128,8 +128,8 @@ clamped to `[0, 60]` seconds — a negative value no longer crashes the whole
 retry loop with an unrelated `IllegalArgumentException`/`Thread.sleep`
 error (masking the real rate-limit/5xx error), and an absurdly large value
 can no longer be honored verbatim. A header value may also arrive as a
-VECTOR of strings rather than a bare string — Babashka's `http-post!` leaf
-returns it that way whenever the header name appears more than once in the
+VECTOR of strings rather than a bare string — `tools.agents.http/request!`
+returns it that way on both runtimes whenever the header name appears more than once in the
 response (a real occurrence behind a proxy/gateway that duplicates or folds
 a singleton header) — the first element is used in that case, rather than
 silently failing to parse and falling back to the shorter computed backoff.
@@ -412,10 +412,9 @@ unrecognized type as a raw-JSON fallback).
 | tty / `NO_COLOR` auto-detection | explicit `{:color? true}` opt, no auto-detection | Simplicity: no new runtime-specific leaf added just for this — see below. |
 | `isinstance(dict)` / `hasattr(SDK object)` / `str` 3-way branch in `parse_content_block` | one `cond` branch | tools.agents.anthropic's `messages-create` always returns a plain decoded (string-keyed) map — there's no second, SDK-object-typed representation to bridge here, unlike the Python SDK's own `Message`/`ContentBlock` classes. |
 
-**No runtime-specific leaf at all:** this file needs no `#?(:bb ... :clj
-...)` reader conditional anywhere. `tools.agents.anthropic` itself isolates
-exactly one (`http-post!`); rendering text to a string and `println`-ing it
-needs no HTTP client.
+**No runtime-specific code at all:** this file needs no `#?(:bb ... :clj
+...)` reader conditional anywhere; rendering text to a string and
+`println`-ing it needs no HTTP client.
 
 **Plain ASCII** (`+`, `-`, `|`, `` ` ``) for all structural drawing —
 classic `tree`-CLI style rather than Rich's rounded Unicode boxes. Every
@@ -555,8 +554,8 @@ returned/atom state, not by capturing stdout — `visualize-message` just
 `println`s `render-message`'s return value, so there's nothing that needs
 `with-out-str`).
 
-The mock server is `tools.agents.test-support/start-server!`, shared by all three provider suites — two tiny leaves, same shape as
-`http-post!`. Babashka uses `org.httpkit.server` — verified empirically that
+The mock server is `tools.agents.test-support/start-server!`, shared by the provider and core suites — two tiny runtime branches that
+also serve byte[] and streaming (chunked) response bodies. Babashka uses `org.httpkit.server` — verified empirically that
 `com.sun.net.httpserver.HttpServer` is not resolvable under bb's native
 image, so this is a deliberate fallback, not a default choice. JVM Clojure
 uses `com.sun.net.httpserver.HttpServer` (built into the JDK, zero deps).

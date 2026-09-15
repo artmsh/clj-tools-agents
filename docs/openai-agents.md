@@ -263,14 +263,13 @@ after `agent.session.environment.failed`).
 
 All inherited, unmodified, from `tools.agents.openai` — see that doc's
 "JSON: a small hand-rolled codec", "Retries", and "Isolating runtime-specific
-I/O" sections. This namespace's own `http-request!` leaf is the same
-`#?(:bb ... :clj ...)` shape as `tools.agents.openai/http-post!`, generalized
-to a `method` argument (`:get`/`:post`/`:delete`) since sessions/items need
-GET and session deletion needs DELETE, alongside the POST both APIs share —
-and it dereferences `tools.agents.openai/bb-http-client`/`jvm-http-client`
-directly rather than building a second `HttpClient`, so a process using both
-namespaces (this doc's own recommended usage) still opens exactly one
-connection pool. `endpoint-url`, `status->type` and `extract-error-message`
+I/O" sections. Requests go through the same shared
+`tools.agents.http/request!`, with `:method` `:get`/`:post`/`:delete` since
+sessions/items need GET and session deletion needs DELETE; it uses one
+process-wide `HttpClient`, so a process using both namespaces still opens
+one connection pool. Query strings are built by
+`tools.agents.http/encode-params` (nil values are dropped; nested maps and
+vectors use bracket syntax). `endpoint-url`, `status->type` and `extract-error-message`
 are likewise called directly rather than duplicated — those four are public
 (not `^:private`) in `tools.agents.openai` specifically so this namespace
 never carries a second, driftable copy of any of them.

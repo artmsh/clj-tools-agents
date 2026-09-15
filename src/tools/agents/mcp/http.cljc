@@ -21,8 +21,8 @@
    Babashka, host `handle-http` in whatever server you already have; that is
    the whole integration.
 
-   THE CLIENT SIDE runs on both runtimes, behind the same single-leaf
-   `http-post!` pattern tools.agents.anthropic uses.
+   THE CLIENT SIDE runs on both runtimes through `tools.agents.http/request!`,
+   the shared request function the provider clients use.
 
    HEADER MIRRORING (SEP-2243) is the fiddly part and it is all here:
    `MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name` and `Mcp-Param-{Name}`
@@ -35,8 +35,8 @@
    from the JDK."
   (:require [clojure.string :as str]
             [tools.agents.mcp :as mcp]
-            [tools.agents.mcp.server :as server]
-            #?@(:bb [[babashka.http-client :as bb-http]] :clj [])))
+            [tools.agents.http :as http]
+            [tools.agents.mcp.server :as server]))
 
 ;; ---------------------------------------------------------------------------
 ;; UTF-8 + Base64, hand-rolled for portability
@@ -461,47 +461,6 @@
                        (error-http id mcp/internal-error
                                    (str "Internal error: " (or (ex-message e) (str e))) nil))))))))))))) 
 
-;; ---------------------------------------------------------------------------
-;; Leaf I/O — the only runtime-specific function in this file.
-;; ---------------------------------------------------------------------------
-
-;; One HTTP client per process, built lazily, so a retry does not allocate a
-;; fresh selector thread (java.net.http.HttpClient had no close() before Java
-;; 21). Both are pinned to HTTP/1.1 — see http-post!'s :clj branch below.
-#?(:bb  (def ^:private bb-http-client
-          (delay (bb-http/client (assoc bb-http/default-client-opts :version :http1.1))))
-   :clj (def ^:private jvm-http-client
-          (delay (-> (java.net.http.HttpClient/newBuilder)
-                     (.version java.net.http.HttpClient$Version/HTTP_1_1)
-                     (.build)))))
-
-(defn- http-post!
-  "POST body to url with headers. Returns {:status int :headers map :body
-   string} on ANY HTTP response. Throws only on a genuine transport failure.
-   Same shape as tools.agents.anthropic's own leaf."
-  [url headers body]
-  #?(:bb
-     ;; :version :http1.1 for the same reason as the :clj leaf below.
-     (let [resp (bb-http/post url {:client @bb-http-client :headers headers :body body :throw false})]
-       {:status (:status resp) :headers (:headers resp) :body (:body resp)})
-
-     :clj
-     (let [builder (reduce (fn [b [k v]] (.header ^java.net.http.HttpRequest$Builder b (str k) (str v)))
-                           (java.net.http.HttpRequest/newBuilder (java.net.URI/create url))
-                           headers)
-           req (-> builder
-                   ;; Pin HTTP/1.1: the JDK default opportunistically attempts
-                   ;; a cleartext HTTP/2 upgrade that some plain-http gateways
-                   ;; answer with an empty 502 on every request.
-                   (.version java.net.http.HttpClient$Version/HTTP_1_1)
-                   (.POST (java.net.http.HttpRequest$BodyPublishers/ofString body))
-                   (.build))
-           resp (.send @jvm-http-client req
-                       (java.net.http.HttpResponse$BodyHandlers/ofString))]
-       {:status (.statusCode resp)
-        :headers (into {} (map (fn [[k vs]] [k (first vs)]) (.map (.headers resp))))
-        :body (.body resp)})))
-
 (defn parse-sse
   "Extract the JSON payloads from an SSE body. A line beginning with a colon
    is a comment (servers emit them as keep-alives on long-lived streams) and
@@ -542,7 +501,8 @@
     (fn [msg]
       (let [tool (get tools-by-name (get-in msg ["params" "name"]))
             req-headers (merge (request-headers msg tool) headers)
-            resp (http-post! url req-headers (mcp/write-json msg))
+            resp (http/request! {:method :post :url url :headers req-headers
+                                 :body (mcp/write-json msg)})
             resp-headers (:headers resp)
             resp-body (:body resp)
             ctype (str (or (get resp-headers "content-type")
