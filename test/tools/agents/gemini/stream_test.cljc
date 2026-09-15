@@ -33,6 +33,16 @@
 
 (defn- sse [json] (str "data: " json "\r\n\r\n"))
 
+(defn- until-gone!
+  "Streaming-body helper: SSE comments every 10 ms until the client
+   disconnects, then deliver `gone` true (false after ~5 s)."
+  [send! gone]
+  (loop [i 0]
+    (cond
+      (not (send! ": ping\r\n\r\n")) (deliver gone true)
+      (> i 500)                      (deliver gone false)
+      :else                          (do (Thread/sleep 10) (recur (inc i))))))
+
 (defn- with-server [handler f]
   (let [{:keys [port stop!]} (start-server! 0 model-path handler)]
     (try (f (g/client {:api-key "test-key" :base-url (base-url port)}))
@@ -161,22 +171,29 @@
 
 (deftest error-chunk-mid-stream-throws-typed-after-earlier-chunks
   (let [hits (atom 0)
+        gone (promise)
         err  "{\"error\":{\"code\":503,\"message\":\"The model is overloaded.\",\"status\":\"UNAVAILABLE\"}}"]
     (with-server
       (fn [_] (swap! hits inc)
         {:status 200 :headers sse-headers
-         :body (fn [send!] (send! (sse (chunk-json "partial"))) (send! (sse err)))})
+         :body (fn [send!]
+                 (send! (sse (chunk-json "partial")))
+                 (send! (str (sse err) (sse (chunk-json "never"))))
+                 (until-gone! send! gone))})
       (fn [client]
         (binding [g/*sleep-fn* (fn [_] nil)]
           (let [s    (g/generate-content-stream client "gemini-2.5-flash" {})
                 seen (atom [])
                 e    (try (run! #(swap! seen conj (g/output-text %)) s) nil (catch Exception e e))]
-            (is (= ["partial"] @seen))
+            (is (= ["partial"] @seen) "chunks before the error are delivered, none after")
             (is (= :tools.agents.gemini/internal-server-error (:type (ex-data e))))
             (is (= 503 (:status (ex-data e))))
+            (is (= "UNAVAILABLE" (get-in (ex-data e) [:error "status"])))
+            (is (= "The model is overloaded." (get-in (ex-data e) [:event "error" "message"])))
             (is (= err (:body (ex-data e))))
             (is (str/includes? (ex-message e) "The model is overloaded."))
             (is (= :failed (stream/outcome s)))
+            (is (true? (deref gone 5000 :timeout)) "the server observed the disconnect")
             (is (= 1 @hits) "nothing is retried once the stream has started")))))))
 
 (deftest transport-failure-mid-stream-is-a-connection-error

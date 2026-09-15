@@ -527,7 +527,13 @@
                                 {:type :tools.agents.openai/api-connection-error :status nil :body nil}
                                 e))
       :done?         #(str/starts-with? (str (:data %)) "[DONE]")
-      :decode        (partial decode-event-data codec)
+      ;; An error event throws here, before the reducer sees it: openai-python
+      ;; streams these endpoints through the generic Stream, whose __stream__
+      ;; raises APIError on any data with a truthy top-level "error".
+      :decode        (fn [data]
+                       (let [ev (decode-event-data codec data)]
+                         (when-let [e (oai/stream-event-error label ev data)] (throw e))
+                         ev))
       :xform         event-xform})))
 
 (defn sessions-events-stream
@@ -543,8 +549,16 @@
    SINGLE-USE reducible (tools.agents.stream) of events: each the decoded
    JSON map exactly as sent (string keys; dispatch on \"type\" — 30 documented
    types, unknown ones pass through), with the SSE frame's name and id as
-   metadata `:tools.agents.sse/event` / `:tools.agents.sse/id`. `error`
-   events pass through as events too; `await-root-turn` is what raises.
+   metadata `:tools.agents.sse/event` / `:tools.agents.sse/id`.
+
+   An `error` event (any event with a truthy top-level \"error\", as
+   openai-python's Stream raises APIError for) is NOT delivered: the reduce
+   throws `:tools.agents.openai/stream-error` (ex-data :status nil, :body the
+   raw data, :error the error object, :event the decoded event) and closes
+   the connection; events before it have reached the reducer. A failed turn
+   was observed live sending both `error` and `agent.session.turn.failed`;
+   whichever comes first is what `await-root-turn` throws, so read the turn
+   (`sessions-turns-list`) for its status.
 
      (let [s (sessions-events-stream client sid)]   ; subscribe first,
        (send-message client sid \"Summarize the repo\") ; then send work
@@ -607,16 +621,15 @@
   [event]
   (let [t     (get event "type")
         label "tools.agents.openai.agents/await-root-turn"
+        ;; the same predicate and ex-data the stream throws with
+        err   (oai/stream-event-error label event nil)
         fail  (fn [kw msg extra]
                 (ex-info (str label ": " msg)
                          (merge {:type kw :status nil :body nil :event event} extra)))]
     (cond
       (not (map? event)) nil
 
-      (= "error" t)
-      (fail :tools.agents.openai/stream-error
-            (str "error event: " (get-in event ["error" "message"]))
-            {:error (get event "error")})
+      err err
 
       (= "agent.session.failed" t)
       (fail :tools.agents.openai/session-failed
@@ -659,8 +672,12 @@
      ended                               (:outcome = the stream's outcome —
                                          :eof, :cancelled — or nil for a coll)
 
-   opts: :on-event (fn [event]) called for every event first, including the
-   one that ends or fails the wait (e.g. to print deltas).
+   Over a stream, the `error` row is thrown by the stream itself (message
+   prefix the stream fn's, same :type/:error/:event) before the event
+   reaches :on-event; the row applies as written to a plain collection.
+
+   opts: :on-event (fn [event]) called for every delivered event first,
+   including the one that ends or fails the wait (e.g. to print deltas).
 
    `agent.session.requires_action` does not end the wait: a caller with
    function tools must answer it (`send-tool-result`) from :on-event, or the

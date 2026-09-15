@@ -285,10 +285,16 @@ Contract, shared by both:
   `data: [DONE]` sentinel (not documented for this API) ends the stream.
 - **Errors while reading.** A connection failure mid-stream throws
   `:tools.agents.openai/api-connection-error` (the IOException as cause). An
-  `error` event is an event, not an exception: the raw stream passes it
-  through (the guide's handler receives it) and `await-root-turn` raises.
-  Divergence: openai-python's `Stream` raises `APIError` on any data carrying
-  an `"error"` map.
+  `error` event, or any event with a truthy top-level `"error"`, is not
+  delivered: the reduce throws `:tools.agents.openai/stream-error` (`:status`
+  nil, `:body` the raw data, `:error` the `SessionError`, `:event` the decoded
+  event) after every earlier event has reached the reducer, and closes the
+  connection. This is openai-python's behaviour: both streaming resources use
+  the generic `Stream`, whose `__stream__` raises `APIError` on such data, so
+  the SDK's `AgentSessionStream` never sees the event either. Events guide
+  code that dispatches on `"type" "error"` in its handler maps to a `catch`
+  here. The rule is shared by every client's stream, see
+  [divergences.md](divergences.md#in-stream-error-events).
 - **Truncation is not an error on the raw stream.** A body that simply ends
   (the server closed, a proxy cut it) reduces like a complete one;
   `(tools.agents.stream/outcome s)` is then `:eof`, versus `:reduced` when
@@ -310,7 +316,7 @@ turn events, returns the root `agent.session.turn.completed` event (its
 | root `agent.session.turn.failed` | `:tools.agents.openai/turn-failed` | `:turn`, `:error` (turn.error) |
 | root `agent.session.turn.cancelled` | `:tools.agents.openai/turn-cancelled` | `:turn` |
 | `agent.session.failed`, `agent.session.environment.failed` | `:tools.agents.openai/session-failed` | `:error` |
-| `error` | `:tools.agents.openai/stream-error` | `:error` |
+| `error` (any truthy top-level `"error"`) | `:tools.agents.openai/stream-error` | `:error`; over a stream the stream itself throws it, before `:on-event`, with its own message prefix |
 | end of events first | `:tools.agents.openai/stream-truncated` | `:outcome` |
 
 **Subscribe before sending work.** Open `sessions-events-stream`, then

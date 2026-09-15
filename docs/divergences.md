@@ -38,7 +38,60 @@ openai" in its column means the same code path, not a copy.
 | backoff curve | `0.5s × 2^n`, cap 8s, `× (1 − 0.25·rand)`, float seconds | same curve in integer ms | as openai | `min(60s, 1s × 2^n + U[0, 1s))`, integer ms |
 | server retry headers | `retry-after` as seconds only (no `-ms`, no HTTP-date), clamped to `[0, 60]`s, wins outright; `retry-after: 0` retries immediately | `retry-after-ms` > `retry-after` seconds > `retry-after` HTTP-date; honored within `(0, 120]`s, a value `≤ 0` falls back to computed backoff, **> 120s vetoes the retry**; `x-should-retry: true`/`false` overrides the status | as openai | **none**: python-genai's retry predicate inspects no headers |
 | retry-policy visibility | decision functions private; `request-with-retries!` and `*sleep-fn*` public | `should-retry?`, `retryable-status?`, `retry-delay-ms`, `parse-retry-after-ms` public and pure; the loop itself is public as `request!`; no `*sleep-fn*` | none of its own; every request goes through openai's `request!`; no `*sleep-fn*` | `retryable-status?`, `retry-delay-ms` and `*sleep-fn*` public; no `should-retry?` |
-| streaming | **`messages-stream`** POSTs `/v1/messages` with `"stream": true` and returns a single-use reducible of event maps; `accumulate-stream` rebuilds the Message as the SDK's `accumulate_event`. **Terminal event** `message_stop`, but `stream/outcome` is still `:eof` for complete and truncated streams: `stream-complete?` is true iff `message_stop` was seen; truncation never throws. An in-stream `error` event throws, typed from `error.type` (streaming-only `:overloaded`). `:stream true` on `messages-create` still throws `:tools.agents.anthropic.error/streaming-unsupported`; see [anthropic.md](anthropic.md#streaming) | **`responses-stream`** returns a single-use reducible of decoded event maps, opened and retried at call time through `request!`; `accumulate-response-stream` returns the terminal event's Response (`failed`/`incomplete` returned, not thrown) or one assembled from deltas; `stream/outcome` is `:eof` either way, so check `stream-complete?`; **`chat-completions-stream`** ends at `data: [DONE]` (`stream/outcome` `:done`) and `accumulate-chat-completion-stream` returns a ChatCompletion-shaped map (`completion-text` works; `stream-complete?` = `[DONE]` seen, when given the stream); `error` events / error chunks throw `:tools.agents.openai/stream-error`; `:stream true` on `responses-create` / `chat-completions-create` still throws `:tools.agents.openai/streaming-unsupported`; see [openai.md](openai.md#streaming) | `sessions-events-stream` (GET `.../events?stream=true`) and `sessions-create-stream` return a single-use reducible of decoded event maps, opened and retried at call time; `await-root-turn` raises on root turn failure and on truncation (`:tools.agents.openai/stream-truncated`); a `stream` true body on any other method still throws `:tools.agents.openai/streaming-unsupported` | no flag to refuse: **`generate-content-stream`** hits the separate `:streamGenerateContent?alt=sse` endpoint and returns a single-use reducible of chunk maps; `accumulate-stream` joins them. **No terminal event**: `stream/outcome` is `:eof` for complete and truncated streams alike, so check `stream-complete?` (`finishReason`/`blockReason`); see [gemini.md](gemini.md#streaming) |
+| streaming | **`messages-stream`** POSTs `/v1/messages` with `"stream": true` and returns a single-use reducible of event maps; `accumulate-stream` rebuilds the Message as the SDK's `accumulate_event`. **Terminal event** `message_stop`, but `stream/outcome` is still `:eof` for complete and truncated streams: `stream-complete?` is true iff `message_stop` was seen; truncation never throws. An in-stream `error` event throws, typed from `error.type` (streaming-only `:overloaded`; see [In-stream error events](#in-stream-error-events)). `:stream true` on `messages-create` still throws `:tools.agents.anthropic.error/streaming-unsupported`; see [anthropic.md](anthropic.md#streaming) | **`responses-stream`** returns a single-use reducible of decoded event maps, opened and retried at call time through `request!`; `accumulate-response-stream` returns the terminal event's Response (`failed`/`incomplete` returned, not thrown) or one assembled from deltas; `stream/outcome` is `:eof` either way, so check `stream-complete?`; **`chat-completions-stream`** ends at `data: [DONE]` (`stream/outcome` `:done`) and `accumulate-chat-completion-stream` returns a ChatCompletion-shaped map (`completion-text` works; `stream-complete?` = `[DONE]` seen, when given the stream); `error` events / error chunks throw `:tools.agents.openai/stream-error` ([In-stream error events](#in-stream-error-events)); `:stream true` on `responses-create` / `chat-completions-create` still throws `:tools.agents.openai/streaming-unsupported`; see [openai.md](openai.md#streaming) | `sessions-events-stream` (GET `.../events?stream=true`) and `sessions-create-stream` return a single-use reducible of decoded event maps, opened and retried at call time; an `error` event throws `:tools.agents.openai/stream-error` from the reduce, as on openai; `await-root-turn` also raises on root turn failure and on truncation (`:tools.agents.openai/stream-truncated`); a `stream` true body on any other method still throws `:tools.agents.openai/streaming-unsupported` | no flag to refuse: **`generate-content-stream`** hits the separate `:streamGenerateContent?alt=sse` endpoint and returns a single-use reducible of chunk maps; `accumulate-stream` joins them; an error chunk throws, typed from `error.code` ([In-stream error events](#in-stream-error-events)). **No terminal event**: `stream/outcome` is `:eof` for complete and truncated streams alike, so check `stream-complete?` (`finishReason`/`blockReason`); see [gemini.md](gemini.md#streaming) |
+
+## In-stream error events
+
+One rule covers every `*-stream` function (`anthropic/messages-stream`,
+`openai/responses-stream`, `openai/chat-completions-stream`,
+`openai.agents/sessions-events-stream` and `sessions-create-stream`,
+`gemini/generate-content-stream`): an error event is never handed to the
+reducer. It throws a typed `ex-info` from the reduce at the point the event
+is decoded, so every event before it has already reached the reducer and
+nothing after it does; the reduce's `finally` closes the connection,
+`(tools.agents.stream/outcome s)` is `:failed`, and nothing is retried. The
+ex-data always carries `:status` (nil, except gemini, below), `:body` (the raw
+`data:` string), `:error` (the wire error object) and `:event` (the decoded
+event, nil only for anthropic's non-JSON error data). Each pure accumulator
+that can be fed a plain collection (`anthropic/accumulate-event`,
+`openai/accumulate-response-event`, `openai/accumulate-chat-completion-chunk`,
+`gemini/accumulate-chunk`, `openai.agents/await-root-turn`) throws the same
+`:type` for the same event, with `:body` nil, so a fixture reduced without
+the transport fails identically. Over a stream, `await-root-turn`'s
+`:on-event` never sees the error event, because the stream throws first.
+
+The rule is what all three SDKs do, read at their `main` heads:
+
+- anthropic-sdk-python `src/anthropic/_streaming.py` (@ 7e5ca5c)
+  `Stream.__stream__` raises `_make_status_error(...)` on `sse.event ==
+  "error"`, falling back to the raw `sse.data` as body when it is not JSON.
+- openai-python `src/openai/_streaming.py` (@ d421d7a) `Stream.__stream__`
+  raises `APIError` on any decoded data whose top-level `"error"` is truthy
+  (outside Assistants `thread.*` frames). The agents resources stream through
+  that same generic class (`resources/beta/agents/sessions/events.py` and
+  `sessions.py`, `stream_cls=Stream[AgentSessionEvent]`), and the agents
+  `error` event (`types/beta/agent_session_error_event.py`) carries a required
+  top-level `error: SessionError`, so the SDK raises there too; its
+  `lib/streaming/agents` `AgentSessionStream` iterates that `Stream` and
+  never sees the event.
+- python-genai `google/genai/_api_client.py` (@ b88fded)
+  `BaseApiClient.request_streamed` raises `APIError.raise_error(code, ...)` on
+  a chunk whose JSON starts with `{"error":`.
+
+MCP Streamable HTTP (`tools.agents.mcp.http`) is outside this rule: its SSE
+stream carries JSON-RPC messages, and an error there is the `"error"` member
+of the response to one request, surfaced by that request's call, not a
+stream-level event.
+
+What still differs per client is typing, each following its SDK or the
+provider's documented error table:
+
+| | anthropic | openai / openai.agents | gemini |
+|---|---|---|---|
+| detected on | SSE event name `error`, or data `"type": "error"` (the SDK checks the name only) | a truthy top-level `"error"`; plus the Responses `error` event `{"type" "error" "code" "message" "param"}`, which has no `"error"` key: openai-python **yields** it as `ResponseErrorEvent`, this client throws it so the rule holds (`:error` is then its `code`/`message`/`param`) | a top-level `"error"` map anywhere in the chunk (the SDK needs it first in the serialized JSON) |
+| `:type` | from `error.type` (`overloaded_error` → `:overloaded`, ...); the SDK's status-only dispatch sees 200 and raises a plain `APIStatusError` | always `:tools.agents.openai/stream-error` (`APIError`) | `error.code` taken as the status (`APIError.raise_error(code)`), which also fills `:status` |
+| extra ex-data | `:headers` (the 2xx response's), `:error-type` | none | `:retries-taken` |
+| message | `<fn>: stream error <error.type> <message>` | `<fn>: stream error: <message>` | `<fn>: stream error <code> <message>` |
 
 Shared by all four: the default JSON codec, `tools.agents.json` (verbatim
 string/keyword map keys, no case conversion; only the error `:type` keywords

@@ -1024,6 +1024,75 @@
         (is (instance? java.io.IOException (ex-cause e))))
       (finally (stop!)))))
 
+(def ^:private error-event
+  {"type" "error" "event_id" "evt_e" "session_id" "sess_1"
+   "error" {"code" "credit_balance_exhausted" "message" "You have no credits remaining."
+            "param" nil "type" "insufficient_quota"}})
+
+(deftest sessions-events-stream-error-event-throws-after-earlier-events-and-closes
+  ;; openai-python streams this endpoint through the generic Stream, whose
+  ;; __stream__ raises APIError on data with a truthy top-level "error".
+  (let [hits   (atom 0)
+        gone   (promise)
+        frames (fixture-frames)
+        {:keys [port stop!]}
+        (start-server! 0 "/v1/agents/sessions/sess_1/events"
+          (fn [_] (swap! hits inc)
+            {:status 200 :headers sse-headers
+             :body (fn [send!]
+                     (doseq [f (take 2 frames)] (send! f))
+                     (send! (str "event: error\ndata: " (oai/write-json error-event) "\n\n"))
+                     (doseq [f (drop 2 frames)] (send! f))
+                     (until-gone! send! gone))}))]
+    (try
+      (let [client (oai/client {:api-key "k" :base-url (base-url port)})
+            s      (agents/sessions-events-stream client "sess_1")
+            seen   (atom [])
+            e      (try (run! #(swap! seen conj (get % "type")) s) nil (catch Exception e e))
+            data   (ex-data e)]
+        (is (= ["agent.session.in_progress" "agent.session.turn.created"] @seen)
+            "events before the error are delivered, none after")
+        (is (= :tools.agents.openai/stream-error (:type data)))
+        (is (nil? (:status data)))
+        (is (= (get error-event "error") (:error data)))
+        (is (= error-event (:event data)))
+        (is (= (oai/write-json error-event) (:body data)))
+        (is (= "tools.agents.openai.agents/sessions-events-stream: stream error: You have no credits remaining."
+               (ex-message e)))
+        (is (= :failed (stream/outcome s)))
+        (is (true? (deref gone 5000 :timeout)) "the server observed the disconnect")
+        (is (= 1 @hits) "nothing is retried once the stream has started"))
+      (finally (stop!)))))
+
+(deftest await-root-turn-over-sessions-create-stream-error-event-throws-stream-error
+  (let [gone   (promise)
+        frames (fixture-frames)
+        {:keys [port stop!]}
+        (start-server! 0 "/v1/agents/sessions"
+          (fn [_]
+            {:status 200 :headers sse-headers
+             :body (fn [send!]
+                     (doseq [f (take 6 frames)] (send! f))
+                     (send! (str "data: " (oai/write-json error-event) "\n\n"))
+                     (doseq [f (drop 6 frames)] (send! f))
+                     (until-gone! send! gone))}))]
+    (try
+      (let [client (oai/client {:api-key "k" :base-url (base-url port)})
+            s      (agents/sessions-create-stream client {"input" "hi"})
+            deltas (atom [])
+            seen   (atom 0)
+            e      (try (agents/await-root-turn s {:on-event (fn [ev]
+                                                               (swap! seen inc)
+                                                               (some->> (get ev "delta") (swap! deltas conj)))})
+                        nil (catch Exception e e))]
+        (is (= :tools.agents.openai/stream-error (:type (ex-data e))))
+        (is (= error-event (:event (ex-data e))))
+        (is (= 6 @seen) ":on-event saw the events before the error, not the error")
+        (is (= ["Acme competes"] @deltas))
+        (is (= :failed (stream/outcome s)))
+        (is (true? (deref gone 5000 :timeout)) "the server observed the disconnect"))
+      (finally (stop!)))))
+
 (deftest sessions-create-stream-posts-stream-true-and-awaits-the-root-turn
   (let [captured (atom nil)
         gone     (promise)
@@ -1123,7 +1192,14 @@
       (let [data (thrown [{"type" "error" "event_id" "evt_e" "session_id" "sess_1"
                            "error" {"code" nil "message" "internal" "param" nil "type" "server_error"}}])]
         (is (= :tools.agents.openai/stream-error (:type data)))
-        (is (= "internal" (get-in data [:error "message"])))))))
+        (is (= "internal" (get-in data [:error "message"])))
+        (is (= "evt_e" (get-in data [:event "event_id"])))))
+    (testing "any event with a truthy top-level error, as the stream decides"
+      (is (= :tools.agents.openai/stream-error
+             (:type (thrown [{"type" "agent.session.new_type" "error" {"message" "x"}}]))))
+      (is (= "completed" (get-in (agents/await-root-turn (into [{"type" "x" "error" nil}] events))
+                                 ["turn" "status"]))
+          "a null top-level error is not an error"))))
 
 ;; ---------------------------------------------------------------------------
 ;; REAL-API saved-agent CRUD round trip — the one test in this file that

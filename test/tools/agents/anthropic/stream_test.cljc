@@ -61,6 +61,16 @@
 
 (defn- caught [thunk] (try (thunk) nil (catch Exception e e)))
 
+(defn- until-gone!
+  "Streaming-body helper: SSE comments every 10 ms until the client
+   disconnects, then deliver `gone` true (false after ~5 s)."
+  [send! gone]
+  (loop [i 0]
+    (cond
+      (not (send! ": ping\n\n")) (deliver gone true)
+      (> i 500)                  (deliver gone false)
+      :else                      (do (Thread/sleep 10) (recur (inc i))))))
+
 (deftest request-line-headers-and-body
   (testing "api key + betas: stream true in the body, anthropic-version, anthropic-beta"
     (let [captured (atom nil)]
@@ -146,6 +156,7 @@
 
 (deftest error-event-mid-stream-is-typed-and-not-retried
   (let [hits (atom 0)
+        gone (promise)
         err  "{\"type\": \"error\", \"error\": {\"type\": \"overloaded_error\", \"message\": \"Overloaded\"}}"]
     (with-server
       (fn [_] (swap! hits inc)
@@ -154,7 +165,8 @@
                  (send! (str (head-events) (sse "content_block_delta" (text-delta-json "partial"))
                              (sse "error" err)
                              (sse "content_block_delta" (text-delta-json "never"))
-                             (tail-events 2))))})
+                             (tail-events 2)))
+                 (until-gone! send! gone))})
       (fn [client]
         (binding [a/*sleep-fn* (fn [_] nil)]
           (let [s    (a/messages-stream client request)
@@ -165,12 +177,24 @@
                 "nothing after the error event is delivered")
             (is (= :tools.agents.anthropic.error/overloaded (:type data)))
             (is (= "overloaded_error" (:error-type data)))
+            (is (= {"type" "overloaded_error" "message" "Overloaded"} (:error data)))
+            (is (= "error" (get (:event data) "type")))
             (is (nil? (:status data)))
             (is (= err (:body data)))
             (is (= "req_err" (get (:headers data) "request-id")))
             (is (str/starts-with? (ex-message e) "tools.agents.anthropic/messages-stream: stream error overloaded_error Overloaded"))
             (is (= :failed (stream/outcome s)))
+            (is (true? (deref gone 5000 :timeout)) "the server observed the disconnect")
             (is (= 1 @hits) "nothing is retried once the stream has started"))))))
+  (testing "a non-JSON error event still throws, :body the raw data (SDK falls back to sse.data)"
+    (with-server
+      (fn [_] {:status 200 :headers sse-headers
+               :body (fn [send!] (send! (str (head-events) (sse "error" "upstream exploded"))))})
+      (fn [client]
+        (let [e (caught #(into [] (a/messages-stream client request)))]
+          (is (= :tools.agents.anthropic.error/api-status (:type (ex-data e))))
+          (is (= "upstream exploded" (:body (ex-data e))))
+          (is (nil? (:event (ex-data e))))))))
   (testing "matched by the SSE event name even when data carries no type (SDK Stream.__stream__)"
     (with-server
       (fn [_] {:status 200 :headers sse-headers

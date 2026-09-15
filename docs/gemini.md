@@ -269,7 +269,7 @@ retried once a 2xx body is being read.
 |---|---|---|
 | non-2xx after retries | from `generate-content-stream` | the status table above, same `:status`/`:body`/`:retries-taken` |
 | no connection after retries | from `generate-content-stream` | `api-connection-error` |
-| error chunk `{"error": {"code": c, ...}}` | from the reduce, after earlier chunks were delivered | `c` treated as a status (python-genai `request_streamed` → `APIError.raise_error(code, ...)`), e.g. 503 → `internal-server-error`; `:body` is the raw `data:` string |
+| error chunk `{"error": {"code": c, ...}}` | from the reduce, after earlier chunks were delivered | `c` treated as a status (python-genai `request_streamed` → `APIError.raise_error(code, ...)`), e.g. 503 → `internal-server-error`; `:body` is the raw `data:` string, `:error` the error object, `:event` the decoded chunk; nothing after it is delivered and the connection is closed ([rule](divergences.md#in-stream-error-events)) |
 | connection lost mid-stream | from the reduce | `api-connection-error`, cause the `IOException` |
 | undecodable chunk | from the reduce | `json-parse-error` |
 
