@@ -48,7 +48,8 @@
    SCOPE — what this namespace covers:
      - Saved (reusable) agents: create, retrieve, update, list (paginated),
        delete.
-     - Session lifecycle: create, retrieve, list (paginated), delete.
+     - Session lifecycle: create, retrieve, update (metadata), list
+       (paginated), delete.
      - Turn input: send a message, steer or cancel the active turn, return a
        pending function-tool result.
      - Reading saved work: list a session's items (saved messages and tool
@@ -247,7 +248,12 @@
                     config (or use \"agent_id\" to reuse a saved agent)
      \"agent_id\"    reuse a saved agent's configuration for this session
                     (an \"id\" from `agents-create` / `agents-list`)
-     \"environment\" {\"type\" \"none\"|\"openai_hosted\"|\"self_hosted\" ...}
+     \"environment\" {\"type\" \"none\"|\"openai_hosted\"|\"self_hosted\" ...};
+                    \"openai_hosted\" accepts \"environment_template_id\"
+                    (see `environments-templates-create`)
+     \"vault_ids\"   vaults whose credentials MCP tools may use
+                    (see `vaults-create`)
+     \"metadata\"    string pairs; change later with `sessions-update`
      \"input\"       a bare string, or an array of
                     {\"role\" \"user\" \"content\" [{\"type\" \"input_text\"
                     \"text\" ...}]} messages
@@ -294,6 +300,20 @@
    KEEPING the session and its history, use `cancel-turn` instead."
   [client session-id]
   (send-request! client "sessions-delete" :delete (str "/agents/sessions/" (path-segment session-id)) nil))
+
+(defn sessions-update
+  "POST {base-url}/agents/sessions/{session-id} — update session metadata,
+   the analogue of `client.beta.agents.sessions.update(session_id, metadata=)`.
+   Source: https://developers.openai.com/api/reference/resources/beta/subresources/agents/subresources/sessions/methods/update/index.md
+   and openai-python src/openai/resources/beta/agents/sessions/sessions.py.
+
+   `request` is {\"metadata\" {...}}, passed through verbatim — metadata is
+   the only updatable field. It REPLACES all metadata: omit it to leave it
+   unchanged, or send nil or {} to clear it (up to 16 string pairs, keys
+   <= 64, values <= 512 chars). Returns the updated session, the same
+   `AgentSession` shape as `sessions-retrieve`."
+  [client session-id request]
+  (send-request! client "sessions-update" :post (str "/agents/sessions/" (path-segment session-id)) request))
 
 ;; ---------------------------------------------------------------------------
 ;; Public API — turn input (events)
