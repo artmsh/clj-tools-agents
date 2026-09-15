@@ -662,11 +662,16 @@
   (let [n (:max-retries client)]
     (if (number? n) (max 0 (long n)) default-max-retries)))
 
-(defn- post-json!
+(defn post-json!
   "Shared transport for every resource method: build URL + headers, encode the
    request map, POST it, classify the status, decode the body — retrying
    transport failures and retryable statuses per openai-python's policy (see
    `should-retry?` / `retry-delay-ms`; :max-retries on the client, default 2).
+
+   Public (not ^:private) so sibling resource namespaces
+   (tools.agents.openai.embeddings, tools.agents.openai.realtime) POST through
+   this exact retry loop and error typing instead of a copy of it. fn-name
+   prefixes error messages; path is appended to the client's base-url.
 
    Non-retryable failures, and retryable ones once the budget is spent, throw
    with :retries-taken in ex-data. A malformed body on an otherwise-successful

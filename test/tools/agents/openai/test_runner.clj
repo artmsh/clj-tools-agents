@@ -4,13 +4,15 @@
             tools.agents.openai-test
             tools.agents.openai.live-test
             tools.agents.openai.agents-test
-            tools.agents.openai.agents.live-test))
+            tools.agents.openai.agents.live-test
+            tools.agents.openai.embeddings-test))
 
 (def suites
   ['tools.agents.openai-test
    'tools.agents.openai.live-test
    'tools.agents.openai.agents-test
-   'tools.agents.openai.agents.live-test])
+   'tools.agents.openai.agents.live-test
+   'tools.agents.openai.embeddings-test])
 
 (defn -main [& _]
   (let [{:keys [fail error]} (apply t/run-tests suites)]
