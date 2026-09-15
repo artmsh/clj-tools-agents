@@ -40,9 +40,9 @@
    ships the same paths.
    Every path and JSON shape below is one shown verbatim in a `curl` example
    or literal endpoint text on those pages. Saved/reusable agent CRUD
-   (`agents-create` etc.) is sourced from the reference pages. The
-   session/environment Artifacts and Files APIs are still not implemented
-   here; they are additive.
+   (`agents-create` etc.), session artifacts and environment files are
+   sourced from the reference pages; artifact content transport (inline
+   bytes vs. redirect) is not yet verified live.
 
    SCOPE — what this namespace covers:
      - Saved (reusable) agents: create, retrieve, update, list (paginated),
@@ -54,6 +54,9 @@
        calls) and pull assistant text out of them; list or retrieve its
        turns, which carry each turn's status and error.
      - OpenAI-hosted sandbox status: poll an environment's provisioning state.
+     - Files: list and download (`byte[]`) a session's published artifacts,
+       delete one; list a connected environment's files (token paging) and
+       copy a file into it (inline base64 or a Files API id).
      - Self-hosted sandboxes: `sessions-create` passes `environment.type`
        \"self_hosted\" straight through like any other field, and
        `self-hosted-executor-command` turns a created session into the
@@ -131,16 +134,24 @@
 (defn- send-request!
   "Every resource method below calls this: `tools.agents.openai/request!`
    with the `OpenAI-Beta: agents=v1` header and messages labelled
-   \"tools.agents.openai.agents/<fn-name>: \". `path` already carries its
-   query string, if any (see `query-string`). `body-value` is the JSON request
-   map, or nil for GET/DELETE. A 2xx with an empty body returns nil."
-  [client fn-name method path body-value]
-  (when (map? body-value) (reject-streaming! fn-name body-value))
-  (oai/request! client (str "tools.agents.openai.agents/" fn-name)
-                {:method  method
-                 :path    path
-                 :body    body-value
-                 :headers {"openai-beta" beta-header}}))
+   \"tools.agents.openai.agents/<fn-name>: \". `path` may already carry its
+   query string (see `query-string`); newer methods pass `:query` in `opts`
+   instead. `body-value` is the JSON request map, or nil for GET/DELETE. A 2xx
+   with an empty body returns nil.
+
+   opts (optional): :query (params map), :as (`request!`'s :json/:string/
+   :bytes), :headers (merged over the beta header)."
+  ([client fn-name method path body-value]
+   (send-request! client fn-name method path body-value nil))
+  ([client fn-name method path body-value {:keys [query as headers]}]
+   (when (map? body-value) (reject-streaming! fn-name body-value))
+   (oai/request! client (str "tools.agents.openai.agents/" fn-name)
+                 (cond-> {:method  method
+                          :path    path
+                          :body    body-value
+                          :headers (merge {"openai-beta" beta-header} headers)}
+                   query (assoc :query query)
+                   as    (assoc :as as)))))
 
 ;; ---------------------------------------------------------------------------
 ;; Public API — saved (reusable) agents
@@ -477,6 +488,159 @@
    `environment.error` off the `agent.session.environment.failed` event."
   [client environment-id]
   (send-request! client "environments-retrieve" :get (str "/agents/environments/" (path-segment environment-id)) nil))
+
+;; ---------------------------------------------------------------------------
+;; Public API — session artifacts
+;;
+;; Source: https://developers.openai.com/api/reference/resources/beta/subresources/agents/subresources/sessions/subresources/artifacts/methods/{list,retrieve,content,delete}/index.md,
+;; guide https://developers.openai.com/api/docs/guides/agents-api/environments/files.md
+;; ("From an OpenAI-hosted environment"), and openai-python
+;; src/openai/resources/beta/agents/sessions/artifacts.py.
+;; ---------------------------------------------------------------------------
+
+(defn- artifacts-path [session-id]
+  (str "/agents/sessions/" (path-segment session-id) "/artifacts"))
+
+(defn sessions-artifacts-list
+  "GET {base-url}/agents/sessions/{session-id}/artifacts — the immutable
+   artifacts published by the session's completed turns, the analogue of
+   `client.beta.agents.sessions.artifacts.list(session_id, **params)`.
+   `params`, if given, is a plain map of query parameters: \"after\",
+   \"limit\" (1-100), \"order\" (\"asc\"|\"desc\", default \"desc\"),
+   \"environment_id\". Page with `\"after\"` set to the previous page's
+   `\"last_id\"` while `\"has_more\"` is true, keeping \"order\" and filters
+   fixed — the same cursor paging as `sessions-list`.
+
+   Each `SessionArtifact` carries \"id\", \"created_at\", \"environment_id\",
+   \"path\", \"session_id\", \"size_bytes\" and \"turn_id\". Only
+   `openai_hosted` environments publish artifacts, only files under
+   `/workspace/outputs`, and only when a turn completes. A new version of a
+   path is a new artifact: match on both \"turn_id\" and \"path\"."
+  ([client session-id] (sessions-artifacts-list client session-id nil))
+  ([client session-id params]
+   (send-request! client "sessions-artifacts-list" :get (artifacts-path session-id) nil
+                  {:query params})))
+
+(defn sessions-artifacts-retrieve
+  "GET {base-url}/agents/sessions/{session-id}/artifacts/{artifact-id} — one
+   artifact's metadata (the `SessionArtifact` shape `sessions-artifacts-list`
+   documents), the analogue of
+   `client.beta.agents.sessions.artifacts.retrieve(artifact_id, session_id=...)`."
+  [client session-id artifact-id]
+  (send-request! client "sessions-artifacts-retrieve" :get
+                 (str (artifacts-path session-id) "/" (path-segment artifact-id)) nil))
+
+(defn sessions-artifacts-content
+  "GET {base-url}/agents/sessions/{session-id}/artifacts/{artifact-id}/content
+   — the artifact's raw bytes as a `byte[]`, undecoded, the analogue of
+   `client.beta.agents.sessions.artifacts.content(artifact_id, session_id=...)`.
+   Works after the environment expires. Sends `Accept:
+   application/octet-stream`, as the SDK does. Write it out with
+   `(clojure.java.io/copy bytes (clojure.java.io/file dest))`.
+
+   Held fully in memory: an artifact is capped at 200 MiB (guide, \"File
+   limits\"). There is no streaming variant yet.
+
+   A non-2xx throws like every other method here; its body is decoded as
+   UTF-8 for the message (an unknown id is
+   `:tools.agents.openai/not-found-error`).
+
+   REDIRECTS ARE NOT FOLLOWED. The reference documents no redirect for this
+   endpoint (its page shows only a `curl` without `-L`). openai-python's httpx
+   client follows redirects by default, but this library's shared
+   `java.net.http.HttpClient` (`tools.agents.http/client`, used on both JVM
+   Clojure and Babashka) keeps the JDK default `Redirect.NEVER`. If the API
+   ever answers with a 3xx to a signed URL, this throws
+   `:tools.agents.openai/api-status-error` with that `:status`. Not yet
+   verified against the live API."
+  [client session-id artifact-id]
+  (send-request! client "sessions-artifacts-content" :get
+                 (str (artifacts-path session-id) "/" (path-segment artifact-id) "/content") nil
+                 {:as :bytes :headers {"accept" "application/octet-stream"}}))
+
+(defn sessions-artifacts-delete
+  "DELETE {base-url}/agents/sessions/{session-id}/artifacts/{artifact-id} —
+   deletes the published copy only (the live environment file and any Files
+   API object stay), the analogue of
+   `client.beta.agents.sessions.artifacts.delete(artifact_id, session_id=...)`.
+   Returns {\"id\" ... \"deleted\" true \"object\"
+   \"agent.session.artifact.deleted\"}."
+  [client session-id artifact-id]
+  (send-request! client "sessions-artifacts-delete" :delete
+                 (str (artifacts-path session-id) "/" (path-segment artifact-id)) nil))
+
+;; ---------------------------------------------------------------------------
+;; Public API — environment files
+;;
+;; Source: https://developers.openai.com/api/reference/resources/beta/subresources/agents/subresources/environments/subresources/files/methods/{list,create}/index.md
+;; and openai-python src/openai/resources/beta/agents/environments/files.py.
+;; The API has no retrieve, delete or content endpoint for environment files.
+;; ---------------------------------------------------------------------------
+
+(defn- environment-files-path [environment-id]
+  (str "/agents/environments/" (path-segment environment-id) "/files"))
+
+(defn environments-files-list
+  "GET {base-url}/agents/environments/{environment-id}/files — live files on
+   a connected environment, the analogue of
+   `client.beta.agents.environments.files.list(environment_id, **params)`.
+   `params`, if given, is a plain map of query parameters: \"limit\"
+   (1-100), \"order\" (\"asc\"|\"desc\", default \"desc\", by case-sensitive
+   path components), \"path\" (an absolute workspace directory filter),
+   \"page\".
+
+   TOKEN PAGING, NOT the `\"after\"` cursor the other list methods use. The
+   response is {\"object\" \"page\" \"data\" [EnvironmentFile ...] \"has_more\"
+   bool \"next\" token-or-nil}. While \"has_more\" is true, pass \"page\" =
+   the previous response's \"next\", keeping \"path\", \"order\" and \"limit\"
+   unchanged. Each `EnvironmentFile` carries \"environment_id\", \"path\" and
+   \"size_bytes\"."
+  ([client environment-id] (environments-files-list client environment-id nil))
+  ([client environment-id params]
+   (send-request! client "environments-files-list" :get (environment-files-path environment-id) nil
+                  {:query params})))
+
+(defn- base64-data
+  "An inline file's \"data\": a String passes through as already
+   standard-base64; a byte[], java.io.File or java.nio.file.Path is read and
+   encoded with java.util.Base64's standard encoder."
+  [data]
+  (let [encode (fn [^bytes bs] (.encodeToString (java.util.Base64/getEncoder) bs))]
+    (cond
+      (string? data)                       data
+      (bytes? data)                        (encode data)
+      (instance? java.io.File data)        (encode (java.nio.file.Files/readAllBytes (.toPath ^java.io.File data)))
+      (instance? java.nio.file.Path data)  (encode (java.nio.file.Files/readAllBytes data))
+      :else
+      (throw (ex-info (str "tools.agents.openai.agents/environments-files-create: \"data\" must be a "
+                           "base64 String, byte[], java.io.File or java.nio.file.Path, got "
+                           (some-> data class .getName))
+                      {:type :tools.agents.openai/invalid-request :status nil :body nil})))))
+
+(defn environments-files-create
+  "POST {base-url}/agents/environments/{environment-id}/files — copy a file
+   into a CONNECTED environment, the analogue of
+   `client.beta.agents.environments.files.create(environment_id, **params)`.
+   The body is JSON, not multipart. `request` is one of:
+
+     {\"type\" \"inline\"  \"path\" \"/workspace/in.txt\" \"data\" data}
+     {\"type\" \"file_id\" \"path\" \"/workspace/in.pdf\" \"file_id\" \"file-...\"}
+
+   \"path\" is the absolute destination inside `/workspace`. \"data\" is
+   either a ready standard-base64 String (sent verbatim) or raw content — a
+   `byte[]`, `java.io.File` or `java.nio.file.Path` — that this function reads
+   and base64-encodes before sending. Any other \"data\" throws
+   `:tools.agents.openai/invalid-request` before any network I/O. Every
+   other field passes through verbatim.
+
+   Limits (guide, \"File limits\"; enforced by the API, not here): inline
+   5 MiB per file before encoding, a Files API copy 50 MiB. Returns the
+   `EnvironmentFile`: \"environment_id\", \"object\"
+   \"agent.environment.file\", \"path\", \"size_bytes\"."
+  [client environment-id request]
+  (send-request! client "environments-files-create" :post (environment-files-path environment-id)
+                 (cond-> request
+                   (contains? request "data") (update "data" base64-data))))
 
 ;; ---------------------------------------------------------------------------
 ;; Public API — self-hosted sandboxes

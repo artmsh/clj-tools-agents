@@ -4,7 +4,7 @@
 
    Port range 19100-19139 — clear of the provider suites' ranges
    (anthropic 18930-18975, openai 18950-18971, gemini 18980-18997,
-   openai.agents 19000-19039)."
+   openai.agents 19000-19079)."
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.string :as str]
             [tools.agents.http :as http]
