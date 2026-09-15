@@ -1420,12 +1420,14 @@
 
 (deftest vaults-credentials-crud-paths-bodies-and-responses
   (with-recording-server
-    (fn [{:keys [method]}]
+    (fn [{:keys [method path]}]
       {:status 200
-       :body (case method
-               "DELETE" "{\"id\":\"cred_1\",\"deleted\":true,\"object\":\"vault.credential.deleted\"}"
-               "GET"    canned-credential
-               canned-credential)})
+       :body (cond
+               (= "DELETE" method)
+               "{\"id\":\"cred_1\",\"deleted\":true,\"object\":\"vault.credential.deleted\"}"
+               (and (= "GET" method) (str/ends-with? path "/credentials"))
+               (list-page canned-credential)
+               :else canned-credential)})
     (fn [client calls]
       (let [create-auth {"type" "mcp_oauth" "mcp_server_url" "https://mcp.example.com/mcp"
                          "access_token" "placeholder-access"
@@ -1440,8 +1442,10 @@
         (is (= "gh" (get (agents/vaults-credentials-retrieve client "vault_1" "cred_1") "name")))
         (is (= "cred_1" (get (agents/vaults-credentials-update client "vault_1" "cred_1"
                                {"auth" rotate-auth}) "id")))
-        (is (= "gh" (get (agents/vaults-credentials-list client "vault_1" {"limit" 1}) "name"))
-            "list returns the decoded body as-is")
+        (let [page (agents/vaults-credentials-list client "vault_1" {"limit" 1})]
+          (is (= "gh" (get-in page ["data" 0 "name"])))
+          (is (= "b" (get page "last_id")))
+          (is (true? (get page "has_more"))))
         (agents/vaults-credentials-list client "vault_1")
         (is (true? (get (agents/vaults-credentials-delete client "vault_1" "cred_1") "deleted")))
         (is (= [["POST" "/v1/vaults/vault_1/credentials" nil {"name" "gh" "auth" create-auth}]
