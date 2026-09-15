@@ -31,6 +31,17 @@ each follows its own vendor SDK rather than the others. docs/mcp.md's
 "The everything server, row by row" does the same for the MCP library
 against the reference `everything` server.
 
+## Requirements
+
+- **JVM Clojure** 1.12 (`deps.edn`); no other dependencies.
+- **Babashka ≥ 1.12.206**, declared as `:min-bb-version` in `bb.edn`. The
+  oldest release all six suites pass on, bisected over release binaries.
+  Below it: 1.12.193–1.12.196 reject `.getCause` on
+  `java.nio.channels.ClosedChannelException`, so a refused connection
+  surfaces as `:sci/error` instead of the typed connection error. Up to
+  1.12.205 the bundled httpkit server never sees a client disconnect, which
+  fails the suites' stream-close tests. The library's own close works there.
+
 ## JSON: one shared hand-rolled codec
 
 No JSON library is available on both runtimes without adding a dependency
