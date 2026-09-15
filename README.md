@@ -288,7 +288,11 @@ Runs all six suites (core + anthropic + openai + gemini + mcp + fusion) on JVM
 Clojure (`clojure -M:test-core` / `-M:test-anthropic` / `-M:test-openai` / `-M:test-gemini` /
 `-M:test-mcp` / `-M:test-fusion`) and Babashka (`bb test`), and fails
 loudly if either runtime is red for any suite. Hermetic — mock servers and
-in-process loopbacks only, no outbound network. See each doc's Testing
+in-process loopbacks only, no outbound network. Independent of the shell's
+environment: tests that exercise env fallback inject the lookup, so an
+exported `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`,
+`*_BASE_URL` etc. changes no outcome. Live tests run only under an explicit
+`ANTHROPIC_LIVE=1` / `OPENAI_AGENTS_LIVE=1`, never because a key is present. See each doc's Testing
 section for what each suite covers; the core suite (`tools.agents.json`, the
 shared JSON codec, `tools.agents.http`, the shared request function,
 `tools.agents.sse`, the pure SSE parser, `tools.agents.retry`, the retry loop

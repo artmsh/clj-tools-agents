@@ -275,7 +275,9 @@
   (is (= "explicit" (:api-key (a/client {:api-key "explicit" :base-url "http://x"})))))
 
 (deftest client-default-base-url
-  (is (= a/default-base-url (:base-url (a/client {:api-key "k"})))))
+  ;; Empty injected env: an exported ANTHROPIC_BASE_URL must not leak in.
+  (with-redefs [a/getenv (constantly nil)]
+    (is (= a/default-base-url (:base-url (a/client {:api-key "k"}))))))
 
 (deftest client-custom-base-url
   (is (= "http://127.0.0.1:9" (:base-url (a/client {:api-key "k" :base-url "http://127.0.0.1:9"})))))

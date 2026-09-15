@@ -66,7 +66,8 @@
         {:keys [port stop!]} (start-server! 18951 "/v1/responses"
                                 (fn [req] (reset! captured req) {:status 200 :body (canned-response)}))]
     (try
-      (let [client (oai/client {:api-key "k" :base-url (base-url port)})]
+      (let [client (with-redefs [oai/getenv (constantly nil)] ; unset means unset in the shell too
+                     (oai/client {:api-key "k" :base-url (base-url port)}))]
         (oai/responses-create client {"model" "m" "input" "hi"})
         (is (nil? (get (:headers @captured) "openai-organization")))
         (is (nil? (get (:headers @captured) "openai-project"))))
@@ -359,9 +360,11 @@
 (deftest missing-api-key-throws-before-any-network-activity
   ;; No server started at this port at all — if a network call were ever
   ;; attempted, this would hang/error with a connection failure instead of
-  ;; the expected missing-credentials error. (Assumes OPENAI_API_KEY is unset
-  ;; in the test environment — see README's testing section.)
-  (let [e (try (oai/client {:base-url "http://127.0.0.1:18999/v1"}) nil (catch Exception e e))]
+  ;; the expected missing-credentials error. The env is injected empty, so an
+  ;; exported OPENAI_API_KEY cannot change the outcome.
+  (let [e (try (with-redefs [oai/getenv (constantly nil)]
+                 (oai/client {:base-url "http://127.0.0.1:18999/v1"}))
+               nil (catch Exception e e))]
     (is (some? e))
     (is (= :tools.agents.openai/missing-credentials (:type (ex-data e))))))
 
