@@ -45,6 +45,23 @@ built here as-is.
     (oai/completion-text))
 ```
 
+Files (`tools.agents.openai.files`, openai-python's `client.files.*`):
+
+```clojure
+(require '[tools.agents.openai.files :as files])
+
+(def f (files/files-create client {"file" (java.io.File. "batch.jsonl")   ;; streamed from disk
+                                   "purpose" "batch"
+                                   "expires_after" {"anchor" "created_at" "seconds" 86400}}))
+(files/files-create client {"file" {:content png-bytes :filename "cat.png"} "purpose" "vision"})
+(files/files-list client {"purpose" "batch" "limit" 20 "order" "desc"})  ;; => {"data" [...] "has_more" ...}
+(files/files-wait-for-processing client (get f "id"))
+(let [^bytes out (files/files-content client (get f "id"))]              ;; raw byte[]
+  (java.nio.file.Files/write (.toPath (java.io.File. "out.jsonl")) out
+                             (make-array java.nio.file.OpenOption 0)))
+(files/files-delete client (get f "id"))                                 ;; => {"id" ... "deleted" true}
+```
+
 `client` resolves credentials eagerly — explicit `:api-key` first, then
 `OPENAI_API_KEY`, else it throws a catchable `ex-info` **before any network
 request is attempted** (fail fast). Failed requests are retried per
@@ -135,7 +152,12 @@ header, no query string) plus Microsoft's documentation.
 | `client.embeddings.create(**params)` | `(tools.agents.openai.embeddings/embeddings-create client params)` | `POST /embeddings` (`resources/embeddings.py`). Omitted `encoding_format` → sent as `"base64"` and each string `data[].embedding` decoded as little-endian float32 into doubles (`lib/_parsing/_embeddings.py`); an explicit `"float"`/`"base64"` is returned untouched. Empty `data` with the implicit format → `:tools.agents.openai/invalid-response`. Helper: `decode-embedding-base64`. |
 | `client.webhooks.verify_signature(payload, headers, secret=, tolerance=300)` / `client.webhooks.unwrap(payload, headers, secret=)` | `(tools.agents.openai.webhooks/verify-signature payload headers {:secret :tolerance :now-s})` / `(tools.agents.openai.webhooks/unwrap payload headers opts)` | Pure, no HTTP (`lib/_webhooks.py`). Standard Webhooks HMAC-SHA256 over `{webhook-id}.{webhook-timestamp}.{body}`; `payload` must be the raw body (String or `byte[]`). Two-sided 300 s window, `whsec_` secrets base64-decoded (others used as raw bytes), space-separated `v1,<b64>` or bare signatures, constant-time compare. Secret: `:secret` → `(:webhook-secret client)` (pass `{:client c}` in opts; `client` resolves `:webhook-secret` → `OPENAI_WEBHOOK_SECRET`, as `_client.py` does for `webhook_secret`) → `OPENAI_WEBHOOK_SECRET`. `unwrap` returns the event parsed by `read-json`. |
 | `client.realtime.client_secrets.create(**params)` | `(tools.agents.openai.realtime/realtime-client-secrets-create client params)` | `POST /realtime/client_secrets` (`resources/realtime/client_secrets.py`); `expires_after` / `session` pass through verbatim. |
-| `client.images.*` / `.files.*` / `.batches.*` / `.fine_tuning.*` / Assistants / Realtime `connect` + `calls.*` | *(not implemented)* | Not yet ported. `request!` is the shared transport (any method, `:query`, JSON or multipart body, `:as :json`/`:string`/`:bytes`), so a new resource method is a single call. See Shared transport below. |
+| `client.files.create(file=, purpose=, expires_after=)` | `(tools.agents.openai.files/files-create client {"file" f "purpose" p "expires_after" {...}})` | `POST /files` multipart (`resources/files.py`, `types/file_create_params.py`). Fields go first, bracket-flattened as `_serialize_multipartform` does (`expires_after[anchor]`, `expires_after[seconds]`), then the `file` part. `file` is a `java.io.File` / `java.nio.file.Path` (streamed from disk, Content-Length kept, filename = the file's name) or `{:content byte[]\|File\|Path :filename :content-type}`. No InputStream: a retry would resend an already-drained stream. `purpose` (`assistants`, `batch`, `fine-tune`, `vision`, `user_data`, `evals`; `types/file_purpose.py`) is sent verbatim, not validated. **Deviations:** the part Content-Type defaults to `application/octet-stream` (httpx guesses it from the filename; the API infers the type from the filename anyway); a bare `byte[]` (httpx would name it `upload`) or a String is rejected with `:tools.agents.openai/invalid-request`. |
+| `client.files.list(after=, limit=, order=, purpose=)` / `.retrieve(file_id)` / `.delete(file_id)` | `(files-list client params)` / `(files-retrieve client id)` / `(files-delete client id)` | `GET /files` with `:query` (`types/file_list_params.py`) returns one cursor page (`"data"`, `"has_more"`, `"last_id"`; pass `"after"` for the next page). `GET`/`DELETE /files/{id}` with the id path-encoded. An empty id throws `:tools.agents.openai/invalid-request` before I/O (the SDK's `ValueError`). |
+| `client.files.content(file_id)` | `(files-content client id)` → `byte[]` | `GET /files/{id}/content` with `Accept: application/binary` and `:as :bytes`; byte-exact. The deprecated `retrieve_content` (the same GET decoded as `str`, `resources/files.py:331`) is not ported. |
+| `client.files.wait_for_processing(id, poll_interval=5.0, max_wait_seconds=1800)` | `(files-wait-for-processing client id {:poll-interval-ms :max-wait-ms :sleep-fn :now-fn})` | `lib/_files.py`: polls `retrieve` until `status` is `processed`, `error` or `deleted`. The SDK's `RuntimeError` on timeout is `:tools.agents.openai/wait-timeout`. |
+| `client.uploads.*` (`/uploads`, multi-part, up to 8 GB) | *(not implemented)* | Out of scope: `/files` takes up to 512 MB in one request. The SDK's `upload_file_chunked` uses 64 MB parts (`resources/uploads/uploads.py`). |
+| `client.images.*` / `.batches.*` / `.fine_tuning.*` / Assistants / Realtime `connect` + `calls.*` | *(not implemented)* | Not yet ported. `request!` is the shared transport (any method, `:query`, JSON or multipart body, `:as :json`/`:string`/`:bytes`), so a new resource method is a single call. See Shared transport below. |
 | `admin_api_key` / `OPENAI_ADMIN_KEY`, Workload Identity Federation | *(not implemented)* | The credential chain here is explicit `:api-key` → `OPENAI_API_KEY` → throw. The SDK's fuller chain (admin keys, token-exchange workload identity) is out of scope. |
 | Azure OpenAI v1: `OpenAI(base_url="https://<resource>.openai.azure.com/openai/v1/", api_key=...)` | `(client {:base-url "https://<resource>.openai.azure.com/openai/v1" :api-key ...})` | Works through `:base-url`; no Azure-specific code. API key or a static Entra ID token, both as `Authorization: Bearer`. A refreshing Entra token provider needs callable `:api-key` (#37). Not verified against a live Azure resource. See Azure OpenAI (v1 API) above. |
 | `AzureOpenAI(azure_endpoint=, azure_deployment=, api_version=)` (legacy) | *(not supported)* | Deployment path rewriting, the required `api-version` query and `AZURE_OPENAI_*` / `OPENAI_API_VERSION` env vars are not ported. Use the v1 API. |
@@ -185,6 +207,8 @@ Non-status error types:
 | malformed request/response JSON | `:tools.agents.openai/json-encode-error` / `:tools.agents.openai/json-parse-error` |
 | missing credentials (client construction or a hand-built client map) | `:tools.agents.openai/missing-credentials` |
 | `:stream true` requested | `:tools.agents.openai/streaming-unsupported` |
+| request rejected before any I/O (bad `:as`; files: missing/unsupported `"file"`, empty file id — the SDK's `ValueError`) | `:tools.agents.openai/invalid-request` |
+| `files-wait-for-processing` gave up after `:max-wait-ms` (the SDK's `RuntimeError`; not an HTTP timeout; never retried) | `:tools.agents.openai/wait-timeout` |
 | response has no `"output"` / `"choices"` array, or an empty `"choices"` | `:tools.agents.openai/invalid-response` |
 | structurally wrong content (non-array `"content"`, non-string `"text"`, non-string non-null `"content"`) | `:tools.agents.openai/invalid-content-shape` |
 | webhook: bad timestamp format, timestamp outside tolerance, or no matching signature (`InvalidWebhookSignatureError`) | `:tools.agents.openai/invalid-webhook-signature-error` |
@@ -455,7 +479,10 @@ tools.agents.anthropic's `18930`–`18946`, `18965`–`18971` for the retry
 tests, `19391` for the Azure v1 example, and `19400`–`19406` for the
 `request!` transport tests (GET + `:query` + extra headers, `:as :bytes` /
 `:string`, empty 2xx body, multipart, streaming rejection, 401 not retried,
-headers rebuilt per attempt). Port `18999` is additionally used by the three tests that deliberately
+headers rebuilt per attempt), and `19280`–`19285` for the
+`tools.agents.openai.files` tests (multipart wire format, File streamed from
+disk, list query, retrieve/delete, 404 typing, binary content round-trip,
+wait-for-processing). Port `18999` is additionally used by the three tests that deliberately
 start *no* server (missing credentials and the two connection-failure tests,
 which actually dial it and so assume nothing else on the host has `18999`
 bound).
