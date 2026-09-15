@@ -22,7 +22,9 @@
    the whole integration.
 
    THE CLIENT SIDE runs on both runtimes through `tools.agents.http/request!`,
-   the shared request function the provider clients use.
+   the shared request function the provider clients use, and reads an SSE
+   answer incrementally through `tools.agents.stream`, so notifications on a
+   request's stream (and on a `subscriptions/listen` stream) arrive live.
 
    HEADER MIRRORING (SEP-2243) is the fiddly part and it is all here:
    `MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name` and `Mcp-Param-{Name}`
@@ -36,7 +38,9 @@
   (:require [clojure.string :as str]
             [tools.agents.mcp :as mcp]
             [tools.agents.http :as http]
-            [tools.agents.mcp.server :as server]))
+            [tools.agents.mcp.server :as server]
+            [tools.agents.sse :as sse]
+            [tools.agents.stream :as stream]))
 
 ;; ---------------------------------------------------------------------------
 ;; UTF-8 + Base64, hand-rolled for portability
@@ -461,61 +465,144 @@
                        (error-http id mcp/internal-error
                                    (str "Internal error: " (or (ex-message e) (str e))) nil))))))))))))) 
 
-(defn parse-sse
-  "Extract the JSON payloads from an SSE body. A line beginning with a colon
-   is a comment (servers emit them as keep-alives on long-lived streams) and
-   carries no data, so it is skipped rather than treated as malformed."
-  [body]
-  (->> (str/split body #"\n\n")
-       (map (fn [block]
-              (->> (str/split-lines block)
-                   (filter #(str/starts-with? % "data:"))
-                   (map #(str/triml (subs % 5)))
-                   (str/join "\n"))))
-       (remove str/blank?)
-       (map mcp/read-json)
-       (vec)))
+(defn- response-to?
+  "True when `m` is the JSON-RPC response to request `msg`."
+  [msg m]
+  (and (map? m)
+       (= (get m "id") (get msg "id"))
+       (or (contains? m "result") (contains? m "error"))))
+
+(defn- slurp-body
+  "Read a streamed response body to a UTF-8 String, closing it."
+  [^java.io.InputStream in]
+  (if in
+    (with-open [in in] (String. (.readAllBytes in) "UTF-8"))
+    ""))
+
+(defn- read-sse-response!
+  "Consume one request's SSE stream incrementally. Every message is decoded
+   and dispatched as it arrives: the response to `msg` ends the stream
+   (`reduced`, which closes the body); anything else goes to
+   `on-notification`. Returns the response, or nil when the stream was
+   cancelled. Throws ::error/transport when the body ends, or breaks,
+   before the response arrives."
+  [msg resp {:keys [on-notification register! unregister!]}]
+  (let [s (stream/open-event-stream
+           {:request {:method :post}
+            ;; The response is already open (its headers chose this path);
+            ;; hand it over instead of sending a second request.
+            :send! (fn [_] resp)
+            :on-read-error (fn [e]
+                             (ex-info (str "tools.agents.mcp.http: SSE stream broke before responding: "
+                                           (ex-message e))
+                                      {:type :tools.agents.mcp.error/transport :request msg}
+                                      e))})]
+    (register! s)
+    (try
+      (let [result (reduce (fn [_ ev]
+                             (let [data (:data ev)]
+                               (if (str/blank? data)
+                                 nil
+                                 (let [m (mcp/read-json data)]
+                                   (if (response-to? msg m)
+                                     (reduced m)
+                                     (do (on-notification m) nil))))))
+                           nil s)]
+        (case (stream/outcome s)
+          :reduced result
+          :cancelled nil
+          (throw (ex-info "tools.agents.mcp.http: server closed the SSE stream before responding"
+                          {:type :tools.agents.mcp.error/transport :request msg
+                           :status (:status resp) :headers (:headers resp)}))))
+      (finally
+        (unregister! s)
+        (stream/close! s)))))
 
 (defn connect!
-  "A Streamable HTTP client transport. Returns {:send! f}, ready to hand to
-   `tools.agents.mcp.client/client`.
+  "A Streamable HTTP client transport. Returns
 
-   `:send!` mirrors the required headers off the body, POSTs, and returns the
-   JSON-RPC response. When the server answers with SSE it hands every
-   notification that preceded the response to `:on-notification` and returns
-   the response itself — so from the caller's point of view a streaming and a
-   non-streaming answer are the same value.
+     {:url url  :send! f  :close! f}
+
+   `:send!` goes straight into `tools.agents.mcp.client/client`. It mirrors
+   the required headers off the body, POSTs, and returns the JSON-RPC
+   response, whether the server answered with one JSON object or with an
+   SSE stream — from the caller's point of view the two are the same value.
+
+   AN SSE ANSWER IS READ LIVE (tools.agents.stream): each message is handed
+   to `:on-notification` the moment its event arrives, not when the stream
+   ends. Everything on the stream other than the response to this request's
+   id goes there — notifications, and any other JSON-RPC message; this
+   revision has no server-to-client requests. The response closes the
+   stream, which is also how a `subscriptions/listen` ends gracefully: the
+   server's closure response (`server/close-subscription`) carries the
+   listen request's id. A body that ends, or breaks, before the response
+   throws ::error/transport.
+
+   CANCELLATION closes the stream, and a cancelled `:send!` returns nil:
+     - `:send!` of `notifications/cancelled` closes the in-flight stream of
+       the request it names, then POSTs the notification, so
+       `client/cancel!` ends a listen on HTTP as it does on stdio;
+     - `:close!` closes every in-flight stream of this transport.
 
    `:tools-by-name` (name -> tool definition, e.g. from
    `client/list-all-tools!`) enables the `Mcp-Param-*` headers that
    `x-mcp-header` annotations demand. A client MUST send them when the tool
    asks for them, so a caller that has the definitions should pass them.
 
+   A JSON answer is returned whatever its status: a 4xx/5xx carrying a
+   JSON-RPC error is that error response, for `client/result-of` to type.
    Notifications POST with no expectation of a body: 202 Accepted returns
-   nil."
+   nil. A transport failure before any response propagates unwrapped."
   ([url] (connect! url nil))
   ([url {:keys [headers on-notification tools-by-name]
          :or {on-notification (fn [_])}}]
-   {:url url
-    :send!
-    (fn [msg]
-      (let [tool (get tools-by-name (get-in msg ["params" "name"]))
-            req-headers (merge (request-headers msg tool) headers)
-            resp (http/request! {:method :post :url url :headers req-headers
-                                 :body (mcp/write-json msg)})
-            resp-headers (:headers resp)
-            resp-body (:body resp)
-            ctype (str (or (get resp-headers "content-type")
-                           (get resp-headers "Content-Type") ""))]
-        (cond
-          (= 202 (:status resp)) nil
-          (str/includes? (str/lower-case ctype) "text/event-stream")
-          (let [msgs (parse-sse resp-body)]
-            (doseq [m (butlast msgs)] (on-notification m))
-            (last msgs))
-          (seq resp-body) (mcp/read-json resp-body)
-          :else (throw (ex-info (str "tools.agents.mcp.http: empty response body, HTTP " (:status resp))
-                                {:type :tools.agents.mcp.error/transport :response resp})))))}))
+   (let [in-flight (atom {})          ; stream -> request id
+         close-where (fn [pred]
+                       (doseq [[s id] @in-flight :when (pred id)]
+                         (stream/close! s)))]
+     {:url url
+      :close! (fn [] (close-where (constantly true)))
+      :send!
+      (fn [msg]
+        (when (= "notifications/cancelled" (get msg "method"))
+          ;; Close first: the client stops reading at once, and a server
+          ;; that serves one exchange at a time is freed to take the POST.
+          (let [target (get-in msg ["params" "requestId"])]
+            (close-where #(= target %))))
+        (let [tool (get tools-by-name (get-in msg ["params" "name"]))
+              req-headers (merge (request-headers msg tool) headers)
+              resp (http/request! {:method :post :url url :headers req-headers
+                                   :body (mcp/write-json msg) :as :stream})
+              status (:status resp)
+              ctype (let [c (get (:headers resp) "content-type")]
+                      (str/lower-case (str (if (sequential? c) (first c) c))))]
+          (cond
+            (= 202 status)
+            (do (slurp-body (:body resp)) nil)
+
+            (and (<= 200 status 299) (str/includes? ctype "text/event-stream"))
+            (read-sse-response! msg resp
+                                {:on-notification on-notification
+                                 :register! #(swap! in-flight assoc % (get msg "id"))
+                                 :unregister! #(swap! in-flight dissoc %)})
+
+            :else
+            (let [body (slurp-body (:body resp))]
+              (cond
+                (str/includes? ctype "text/event-stream")
+                ;; A non-2xx SSE answer (handle-http never sends one; other servers
+                ;; may): kept buffered, same dispatch as the live path.
+                (let [msgs (->> (sse/parse-string body)
+                                (remove (comp str/blank? :data))
+                                (map (comp mcp/read-json :data)))]
+                  (or (some (fn [m] (if (response-to? msg m) m (do (on-notification m) nil))) msgs)
+                      (throw (ex-info (str "tools.agents.mcp.http: SSE body without a response, HTTP " status)
+                                      {:type :tools.agents.mcp.error/transport
+                                       :response (assoc resp :body body)}))))
+                (seq body) (mcp/read-json body)
+                :else (throw (ex-info (str "tools.agents.mcp.http: empty response body, HTTP " status)
+                                      {:type :tools.agents.mcp.error/transport
+                                       :response (assoc resp :body body)})))))))})))
 
 ;; ---------------------------------------------------------------------------
 ;; Host adapter — JVM Clojure only
