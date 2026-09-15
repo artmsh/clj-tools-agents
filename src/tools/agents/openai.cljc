@@ -56,6 +56,7 @@
   (:require [clojure.string :as str]
             [tools.agents.http :as http]
             [tools.agents.json :as json]
+            [tools.agents.retry :as retry]
             [tools.agents.stream :as stream]
             [tools.agents.token :as token]))
 
@@ -713,54 +714,53 @@
            codec       (client-codec client)
            body-str    (when (some? body) ((:write codec) body))
            max-retries (resolve-max-retries client)]
-       (loop [retries-taken 0
-              auth-retried? false]
-         (let [credential (attempt-credential label client)
-               outcome    (try
-                            {:resp (slurp-error-stream as ((or (:http client) http/request!)
-                                    (cond-> (http/with-timeouts
-                                             {:method  method
-                                              :url     url
-                                              :query   query
-                                              :headers (request-headers credential client (some? multipart) headers)
-                                              :as      (case as (:bytes :stream) as :string)}
-                                             client req)
-                                      body-str  (assoc :body body-str)
-                                      multipart (assoc :multipart multipart))))}
-                            (catch Exception e
-                              (if (own-error? e) (throw e) {:error e})))]
-           (if (:error outcome)
-             ;; No response at all: DNS, connection refused, TLS handshake,
-             ;; timeout. The SDK retries these without consulting _should_retry.
-             (if (< retries-taken max-retries)
-               (do (sleep! (retry-delay-ms retries-taken nil (now-ms)))
-                   (recur (inc retries-taken) auth-retried?))
-               (throw (ex-info (str label ": " (if (http/timeout-exception? (:error outcome)) "request timed out" "connection failed")
-                                    ": " (:error outcome))
-                               (cond-> {:type :tools.agents.openai/api-connection-error :status nil :body nil
-                                        :retries-taken retries-taken}
-                                 (http/timeout-exception? (:error outcome)) (assoc :timeout? true))
-                               (:error outcome))))
-             (let [{:keys [status] resp-hdrs :headers resp-body :body} (:resp outcome)]
-               (cond
-                 (and status (>= status 200) (< status 300))
-                 (if (= as :stream) (:resp outcome) (decode-success codec as resp-body))
-
-                 ;; Invalidate first, on every 401; retry only once.
-                 (and (= status 401) (invalidate-credentials! client credential) (not auth-retried?))
-                 (recur retries-taken true)
-
-                 (and (< retries-taken max-retries) (should-retry? status resp-hdrs (now-ms)))
-                 (do (sleep! (retry-delay-ms retries-taken resp-hdrs (now-ms)))
-                     (recur (inc retries-taken) auth-retried?))
-
-                 :else
-                 (let [body-s  (body->string resp-body)
-                       err-msg (extract-error-message codec body-s)
-                       detail  (cond err-msg err-msg (seq body-s) body-s :else nil)]
-                   (throw (ex-info (str label ": HTTP " status (when detail (str " " detail)))
-                                   {:type (status->type status) :status status :body body-s
-                                    :retries-taken retries-taken}))))))))))))
+       (retry/with-retries
+        {:max-retries           max-retries
+         ;; Outside the try: a token fetch failure is not a connection failure.
+         :prepare               (fn [_] (attempt-credential label client))
+         :attempt               (fn [credential]
+                                  (slurp-error-stream as ((or (:http client) http/request!)
+                                                          (cond-> (http/with-timeouts
+                                                                   {:method  method
+                                                                    :url     url
+                                                                    :query   query
+                                                                    :headers (request-headers credential client (some? multipart) headers)
+                                                                    :as      (case as (:bytes :stream) as :string)}
+                                                                   client req)
+                                                            body-str  (assoc :body body-str)
+                                                            multipart (assoc :multipart multipart)))))
+         :rethrow?              own-error?
+         :unauthorized?         (fn [{:keys [response]}] (= 401 (:status response)))
+         ;; Invalidate first, on every 401; retry only once.
+         :on-unauthorized       (fn [{:keys [prepared]}] (invalidate-credentials! client prepared))
+         :invalidate-every-401? true
+         ;; No response at all (DNS, connection refused, TLS handshake,
+         ;; timeout): the SDK retries these without consulting _should_retry.
+         :retryable?            (fn [{:keys [error response]}]
+                                  (or (some? error)
+                                      (let [status (:status response)]
+                                        (and (not (and status (>= status 200) (< status 300)))
+                                             (should-retry? status (:headers response) (now-ms))))))
+         :delay                 (fn [{:keys [retries-taken error response]}]
+                                  (retry-delay-ms retries-taken (when-not error (:headers response)) (now-ms)))
+         :sleep!                #(sleep! %)
+         :finish                (fn [{:keys [retries-taken error response]}]
+                                  (if error
+                                    (throw (ex-info (str label ": " (if (http/timeout-exception? error) "request timed out" "connection failed")
+                                                         ": " error)
+                                                    (cond-> {:type :tools.agents.openai/api-connection-error :status nil :body nil
+                                                             :retries-taken retries-taken}
+                                                      (http/timeout-exception? error) (assoc :timeout? true))
+                                                    error))
+                                    (let [{:keys [status] resp-body :body} response]
+                                      (if (and status (>= status 200) (< status 300))
+                                        (if (= as :stream) response (decode-success codec as resp-body))
+                                        (let [body-s  (body->string resp-body)
+                                              err-msg (extract-error-message codec body-s)
+                                              detail  (cond err-msg err-msg (seq body-s) body-s :else nil)]
+                                          (throw (ex-info (str label ": HTTP " status (when detail (str " " detail)))
+                                                          {:type (status->type status) :status status :body body-s
+                                                           :retries-taken retries-taken})))))))})))))
 
 (defn post-json!
   "POST a JSON request map to path and decode the JSON response: a thin

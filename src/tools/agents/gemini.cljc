@@ -84,6 +84,7 @@
   (:require [clojure.string :as str]
             [tools.agents.http :as http]
             [tools.agents.json :as json]
+            [tools.agents.retry :as retry]
             [tools.agents.stream :as stream]
             [tools.agents.token :as token]))
 
@@ -427,6 +428,30 @@
              {:type (status->type status) :status status :body resp-body
               :retries-taken retries-taken})))
 
+(defn- two-xx? [status]
+  (boolean (and status (>= status 200) (< status 300))))
+
+;; Outcome classification for tools.agents.retry/with-retries, shared by
+;; post-json! and generate-content-stream.
+
+(defn- unauthorized? [{:keys [response]}]
+  (= 401 (:status response)))
+
+(defn- invalidate-fn
+  "on-unauthorized for a :credential-source client: invalidate the token the
+   attempt sent (the second element of `request-headers`' pair). nil for a
+   static key, whose 401 is never retried."
+  [client]
+  (when-let [src (:credential-source client)]
+    (fn [{[_ used-token] :prepared}] (token/invalidate! src used-token))))
+
+(defn- retryable-outcome?
+  "A transport failure, or a non-2xx retryable-status?."
+  [{:keys [error response]}]
+  (or (some? error)
+      (let [status (:status response)]
+        (and (not (two-xx? status)) (retryable-status? status)))))
+
 (defn- post-json!
   "Shared transport for generate-content/count-tokens: build URL + headers,
    encode the request map, POST it, classify the status, decode the body —
@@ -443,44 +468,34 @@
         codec       (client-codec client)
         body-str    ((:write codec) request)
         max-retries (resolve-max-retries client)]
-    (loop [retries-taken 0
-           auth-retried? false]
+    (retry/with-retries
+     {:max-retries     max-retries
       ;; Headers are rebuilt on every attempt, so credentials that change
       ;; between attempts (a refreshed token) land on the retry. Built outside
       ;; the try: a token fetch failure is not a connection failure.
-      (let [[headers used-token] (request-headers fn-name client)
-            outcome (try
-                      {:resp ((or (:http client) http/request!)
-                              (http/with-timeouts {:method :post :url url
-                                                   :headers headers
-                                                   :body body-str}
-                                                  client))}
-                      (catch Exception e
-                        (if (own-error? e) (throw e) {:error e})))]
-        (if (:error outcome)
-          ;; No response at all: DNS, connection refused, TLS handshake,
-          ;; timeout. Retried the same as a retryable status.
-          (if (< retries-taken max-retries)
-            (do (*sleep-fn* (retry-delay-ms retries-taken))
-                (recur (inc retries-taken) auth-retried?))
-            (throw (connection-error fn-name (:error outcome) retries-taken)))
-          (let [resp      (:resp outcome)
-                status    (:status resp)
-                resp-body (:body resp)]
-            (cond
-              (and status (>= status 200) (< status 300))
-              ((:read codec) resp-body)
-
-              (and (= status 401) (not auth-retried?) (:credential-source client)
-                   (token/invalidate! (:credential-source client) used-token))
-              (recur retries-taken true)
-
-              (and (< retries-taken max-retries) (retryable-status? status))
-              (do (*sleep-fn* (retry-delay-ms retries-taken))
-                  (recur (inc retries-taken) auth-retried?))
-
-              :else
-              (throw (http-status-error codec fn-name status resp-body retries-taken)))))))))
+      :prepare         (fn [_] (request-headers fn-name client))
+      :attempt         (fn [[headers _]]
+                         ((or (:http client) http/request!)
+                          (http/with-timeouts {:method :post :url url
+                                               :headers headers
+                                               :body body-str}
+                                              client)))
+      :rethrow?        own-error?
+      :unauthorized?   unauthorized?
+      :on-unauthorized (invalidate-fn client)
+      ;; No response at all (DNS, connection refused, TLS handshake,
+      ;; timeout): retried the same as a retryable status.
+      :retryable?      retryable-outcome?
+      :delay           (fn [{:keys [retries-taken]}] (retry-delay-ms retries-taken))
+      :sleep!          #(*sleep-fn* %)
+      :finish          (fn [{:keys [retries-taken error response]}]
+                         (if error
+                           (throw (connection-error fn-name error retries-taken))
+                           (let [status    (:status response)
+                                 resp-body (:body response)]
+                             (if (two-xx? status)
+                               ((:read codec) resp-body)
+                               (throw (http-status-error codec fn-name status resp-body retries-taken))))))})))
 
 ;; ---------------------------------------------------------------------------
 ;; Public API — resource methods
@@ -583,38 +598,35 @@
         codec       (client-codec client)
         body-str    ((:write codec) request)
         max-retries (resolve-max-retries client)
+        ;; retries-taken of the settled opening attempt, read by the error
+        ;; paths below once open! has returned.
         retries     (atom 0)
         ;; Headers for the attempt about to run, set by open! before each
         ;; (attempt) and read by send!, so a refreshed token lands on retries.
         headers     (volatile! nil)
-        backoff!    (fn [n] (*sleep-fn* (retry-delay-ms n)) (swap! retries inc))
         open!       (fn [attempt]
-                      (loop [auth-retried? false]
+                      (retry/with-retries
+                       {:max-retries     max-retries
                         ;; Outside the try: a token fetch failure is not a
                         ;; connection failure.
-                        (let [[hs used-token] (request-headers fn-name client)
-                              _       (vreset! headers hs)
-                              n       @retries
-                              outcome (try {:resp (attempt)}
-                                           (catch Exception e
-                                             (if (own-error? e) (throw e) {:error e})))]
-                          (if-let [e (:error outcome)]
-                            (if (< n max-retries)
-                              (do (backoff! n) (recur auth-retried?))
-                              (throw (connection-error fn-name e n)))
-                            (let [status (:status (:resp outcome))]
-                              (cond
-                                (and (= status 401) (not auth-retried?) (:credential-source client)
-                                     (token/invalidate! (:credential-source client) used-token))
-                                (recur true)
-
-                                (and (not (and status (<= 200 status 299)))
-                                     (retryable-status? status)
-                                     (< n max-retries))
-                                (do (backoff! n) (recur auth-retried?))
-
-                                :else
-                                (:resp outcome)))))))]
+                        :prepare         (fn [_]
+                                           (let [[hs :as pair] (request-headers fn-name client)]
+                                             (vreset! headers hs)
+                                             pair))
+                        :attempt         (fn [_] (attempt))
+                        :rethrow?        own-error?
+                        :unauthorized?   unauthorized?
+                        :on-unauthorized (invalidate-fn client)
+                        :retryable?      retryable-outcome?
+                        :delay           (fn [{:keys [retries-taken]}] (retry-delay-ms retries-taken))
+                        :sleep!          #(*sleep-fn* %)
+                        ;; A final non-2xx is returned: open-event-stream
+                        ;; hands it to :on-error below.
+                        :finish          (fn [{:keys [retries-taken error response]}]
+                                           (reset! retries retries-taken)
+                                           (if error
+                                             (throw (connection-error fn-name error retries-taken))
+                                             response))}))]
     (stream/open-event-stream
      {:request       {:method :post :url url :body body-str}
       :send!         (fn [req] ((or (:http client) http/request!)
