@@ -66,11 +66,12 @@ pages
 the [files guide](https://developers.openai.com/api/docs/guides/agents-api/environments/files.md)
 and openai-python's `sessions/artifacts.py` / `environments/files.py`.
 The reference has no environment-file retrieve, delete or content endpoint.
-Two points are **not yet verified live** (probe P1,
-`artifacts-and-environment-files-probe-against-the-real-api`, has not run):
-whether artifact content arrives inline or as a redirect, and how
-environment-file token paging behaves on a real environment. The content
-reference page has a `curl` example but no Returns block; the SDK sends
+Verified live on 2026-09-15 (probe P1,
+`artifacts-and-environment-files-probe-against-the-real-api`, 16 assertions):
+artifact content arrives inline as `200` bytes (no redirect), byte-exact
+including `\0` and `\377`; environment-file create and token-paged list work
+on a connected `openai_hosted` environment. The content reference page has a
+`curl` example but no Returns block; the SDK sends
 `Accept: application/octet-stream` and reads a binary response.
 
 Event streaming is implemented from two literal `curl` examples. The
@@ -207,9 +208,9 @@ test suite runs it instantly against a mock server) and
 | `codex exec-server --remote ... --environment-id ...` (shell, not an SDK call) | `(self-hosted-executor-command session)` | Pure function from a created self-hosted session to the executor's argv — see Self-hosted sandboxes below for what this library does and does not do here. |
 | `client.beta.agents.sessions.artifacts.list(session_id, **params)` — `GET /v1/agents/sessions/{session_id}/artifacts` | `(sessions-artifacts-list client session-id params)` / `(sessions-artifacts-list client session-id)` | Cursor paging like `sessions-list`: `after`/`limit` (1-100)/`order` (default `desc`), plus `environment_id`. Only `openai_hosted`, only `/workspace/outputs`, only on turn completion. Match on `turn_id` + `path`. |
 | `client.beta.agents.sessions.artifacts.retrieve(artifact_id, session_id=)` — `GET /v1/agents/sessions/{session_id}/artifacts/{artifact_id}` | `(sessions-artifacts-retrieve client session-id artifact-id)` | `SessionArtifact` metadata: `path`, `size_bytes`, `turn_id`, `environment_id`, `created_at`. |
-| `client.beta.agents.sessions.artifacts.content(artifact_id, session_id=)` — `GET /v1/agents/sessions/{session_id}/artifacts/{artifact_id}/content` | `(sessions-artifacts-content client session-id artifact-id)` | Returns `byte[]` (`:as :bytes`), `Accept: application/octet-stream`, whole body in memory (≤200 MiB per artifact). **Redirects are not followed** (JDK `Redirect.NEVER` on both runtimes; httpx in the SDK follows): a 3xx throws `api-status-error`. Transport unverified live (P1). |
+| `client.beta.agents.sessions.artifacts.content(artifact_id, session_id=)` — `GET /v1/agents/sessions/{session_id}/artifacts/{artifact_id}/content` | `(sessions-artifacts-content client session-id artifact-id)` | Returns `byte[]` (`:as :bytes`), `Accept: application/octet-stream`, whole body in memory (≤200 MiB per artifact). **Redirects are not followed** (JDK `Redirect.NEVER` on both runtimes; httpx in the SDK follows): a 3xx throws `api-status-error`. Live (P1, 2026-09-15): content is served inline, no redirect. |
 | `client.beta.agents.sessions.artifacts.delete(artifact_id, session_id=)` — `DELETE /v1/agents/sessions/{session_id}/artifacts/{artifact_id}` | `(sessions-artifacts-delete client session-id artifact-id)` | Deletes the published copy only. Returns `{"deleted" true "object" "agent.session.artifact.deleted"}`. |
-| `client.beta.agents.environments.files.list(environment_id, **params)` — `GET /v1/agents/environments/{environment_id}/files` | `(environments-files-list client environment-id params)` / `(environments-files-list client environment-id)` | **Token paging** (`SyncTokenPage`), not `after`: response `{"object" "page" "has_more" .. "next" ..}`; pass `"page"` = `"next"`, keeping `path`/`order`/`limit`. Connected environments only. Unverified live (P1). |
+| `client.beta.agents.environments.files.list(environment_id, **params)` — `GET /v1/agents/environments/{environment_id}/files` | `(environments-files-list client environment-id params)` / `(environments-files-list client environment-id)` | **Token paging** (`SyncTokenPage`), not `after`: response `{"object" "page" "has_more" .. "next" ..}`; pass `"page"` = `"next"`, keeping `path`/`order`/`limit`. Connected environments only. Verified live (P1, 2026-09-15). |
 | `client.beta.agents.environments.files.create(environment_id, type=, path=, data=/file_id=)` — `POST /v1/agents/environments/{environment_id}/files` | `(environments-files-create client environment-id request)` | JSON body, not multipart. `{"type" "inline" "path" .. "data" ..}` or `{"type" "file_id" "path" .. "file_id" ..}`. `"data"`: a base64 String is sent verbatim; `byte[]`/`File`/`Path` is read and std-base64-encoded. Inline ≤5 MiB before encoding (API-enforced). No delete/retrieve endpoint exists. |
 | `client.beta.agents.sessions.create(..., stream=True)` — `POST /v1/agents/sessions` with `"stream": true` | `(sessions-create-stream client request)` | Sets `"stream" true`; returns a single-use reducible of decoded events for the first turn, starting with `agent.session.created`. See Streaming below. |
 | `client.beta.agents.sessions.events.stream(session_id)` — `GET /v1/agents/sessions/{session_id}/events?stream=true` | `(sessions-events-stream client session-id)` / `(sessions-events-stream client session-id params)` | `Accept: text/event-stream` + `?stream=true`. Request sent at call time; retries and HTTP errors before the first byte, typed as every other method. Events are the decoded JSON maps, verbatim (including `error` events). |
@@ -466,7 +467,9 @@ injected so none of it costs real wall-clock.
 
 One test in that file hits the real API:
 `agents-crud-round-trip-against-the-real-api` runs create → retrieve →
-update → list contains → delete → retrieve 404. It runs no inference (no
+update → list contains → delete → retrieve 404. Listing is eventually
+consistent (a new agent appeared after ~5 s live), so the list step polls for
+up to 60 s. Verified live on 2026-09-15. It runs no inference (no
 model tokens) and passes as skipped unless both `OPENAI_AGENTS_LIVE=1` and
 `OPENAI_API_KEY` are set. It
 targets `https://api.openai.com/v1` (override: `OPENAI_AGENTS_BASE_URL`;
@@ -485,7 +488,7 @@ gate and overrides: an `openai_hosted` session whose turn writes
 connected it creates `/workspace/in.txt` and pages env files with `limit` 1;
 after the turn it lists, retrieves, downloads (byte-exact), and deletes the
 artifact, then expects a 404. Cleanup cancels and deletes the session,
-retrying a 409. It costs a short turn and **has not been run yet**.
+retrying a 409. It costs a short turn; it passed live on 2026-09-15.
 
 Event streaming (ports `19041`–`19048`): `sessions-events-stream` sends GET,
 `Accept: text/event-stream`, the beta header and `stream=true` alongside

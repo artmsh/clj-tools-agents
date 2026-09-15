@@ -41,8 +41,8 @@
    Every path and JSON shape below is one shown verbatim in a `curl` example
    or literal endpoint text on those pages. Saved/reusable agent CRUD
    (`agents-create` etc.), session artifacts and environment files are
-   sourced from the reference pages; artifact content transport (inline
-   bytes vs. redirect) is not yet verified live.
+   sourced from the reference pages; artifact content was verified live
+   (2026-09-15) to arrive inline, not as a redirect.
 
    SCOPE — what this namespace covers:
      - Saved (reusable) agents: create, retrieve, update, list (paginated),
