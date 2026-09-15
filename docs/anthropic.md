@@ -63,6 +63,7 @@ Programmatic Tool Calling below.
 | `anthropic.APIError` / `.APIStatusError` / `.RateLimitError` / etc. | `ex-info` with `:type` in `ex-data` | See the error-hierarchy table below — one exception constructor, discriminated by `:type`, rather than a Python-style class hierarchy (there is no `class` in Clojure to mirror it with). |
 | `client.with_options(...)` | *(not implemented)* | Per-request override without mutating the client. Out of scope for this port; `AnthropicClient` supports associative updates, so callers can use `(assoc client :base-url ...)` themselves. |
 | `max_retries` / automatic backoff | `:max-retries` client opt, default 2 | **Resolved, implemented.** See Retries below. |
+| `timeout` (`DEFAULT_TIMEOUT = httpx.Timeout(timeout=600, connect=5.0)`) / `APITimeoutError` | `:timeout-ms` (default 600000) and `:connect-timeout-ms` (default 5000) client opts; nil disables either; `(assoc client :timeout-ms n)` per call, `:timeout-ms`/`:connect-timeout-ms` in `request!`'s opts per request | For `messages-create`, `count-tokens` and batches the deadline covers the whole response; for `messages-stream` only the wait for the response headers, so a stream is never cut once it starts (httpx's 600 s is a per-read idle timeout instead; the JDK has none). A timeout is `:api-connection` with `:timeout? true` and the `HttpTimeoutException` as cause, retried like any connection failure, as the SDK retries `APITimeoutError`. Not ported: the SDK's non-streaming guard that raises for a large `max_tokens` expected to exceed 10 minutes. Token exchanges keep their own 30 s. See [divergences](divergences.md). |
 | *(no SDK equivalent)* | `:json` client opt | A `{:read :write}` codec used for request bodies, responses, error bodies, stream events and `batches-results`; its exceptions become `:json-parse`/`:json-encode` with the cause kept. `accumulate-event`'s tool-input parsing, `visualize` and credential JSON stay built-in. See README, Bring your own HTTP client / JSON codec. |
 | `Anthropic(http_client=httpx.Client(...))` | `:http` client opt | A request fn with `tools.agents.http/request!`'s contract; every exchange, streaming, batches and the token exchanges `client` resolves (profile, WIF from env) go through it. A pre-built `:credential-source` keeps its own `:http-fn`. See README, Bring your own HTTP client. |
 | `client.messages.create(..., stream=True)` / `client.messages.stream(...)` | `(messages-stream client params)` + `accumulate-event`/`accumulate-stream`/`stream-complete?` | **Resolved, implemented.** A single-use reducible of decoded events instead of a `Stream` iterator; the accumulator ports `accumulate_event`. `messages-create` still rejects `:stream true`. No `MessageStream` helper events (`text`, `input_json` snapshots) or `text_stream`. See Streaming below. |
@@ -408,7 +409,7 @@ for those functions' own failures) and `ex-data` `{:type <keyword> :status
 | ≥500 | `:tools.agents.anthropic.error/internal-server` |
 | in-stream `error` event with `error.type` `overloaded_error` (`messages-stream` only; other `error.type`s map as in Streaming below) | `:tools.agents.anthropic.error/overloaded` |
 | other non-2xx (e.g. 413, 529) | `:tools.agents.anthropic.error/api-status` |
-| no response at all (DNS/refused/TLS/timeout) | `:tools.agents.anthropic.error/api-connection` |
+| no response at all (DNS/refused/TLS/timeout); a timeout adds `:timeout? true` | `:tools.agents.anthropic.error/api-connection` |
 | malformed request/response JSON | `:tools.agents.anthropic.error/json-encode` / `:tools.agents.anthropic.error/json-parse` |
 | empty or non-string message batch id (`tools.agents.anthropic.batches`, before any request) | `:tools.agents.anthropic.error/invalid-argument` |
 | missing credentials (client construction) | `:tools.agents.anthropic.error/missing-credentials` |
@@ -673,7 +674,8 @@ Deviations from anthropic-sdk-python:
 - **No `workspace_id` / `user_profile_id` kwargs** (`anthropic-workspace-id`
   / `anthropic-user-profile-id` headers), and no per-call
   `extra_headers`/`extra_query`/`timeout`. Call `tools.agents.anthropic/request!`
-  with `:headers` if you need them.
+  with `:headers` / `:timeout-ms` if you need them, or `assoc` `:timeout-ms`
+  onto the client.
 - **Empty id** throws `:tools.agents.anthropic.error/invalid-argument` before
   any request, as the SDK's `ValueError`; the id is percent-encoded into the
   path, as the SDK's `path_template`.

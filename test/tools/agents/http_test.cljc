@@ -8,7 +8,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.string :as str]
             [tools.agents.http :as http]
-            [tools.agents.test-support :refer [start-server!]]))
+            [tools.agents.test-support :refer [start-server! start-stall-server!]]))
 
 (defn- url [port path] (str "http://127.0.0.1:" port path))
 
@@ -213,6 +213,83 @@
                    (catch Exception e e))]
         (is (instance? java.net.http.HttpTimeoutException e)))
       (finally (stop!)))))
+
+;; ---------------------------------------------------------------------------
+;; SDK default timeouts. Stall servers bind OS-assigned ports.
+;; ---------------------------------------------------------------------------
+
+(defn- elapsed-ms [f]
+  (let [t0 (System/nanoTime)
+        r  (try (f) (catch Exception e e))]
+    [r (quot (- (System/nanoTime) t0) 1000000)]))
+
+(deftest timeout-defaults-are-the-sdk-values
+  (is (= 600000 http/default-timeout-ms))
+  (is (= 5000 http/default-connect-timeout-ms))
+  (is (= {:timeout-ms 600000 :connect-timeout-ms 5000} (http/timeout-opts {})))
+  (testing "an explicit nil disables, it does not fall back to the default"
+    (is (= {:timeout-ms nil :connect-timeout-ms nil}
+           (http/timeout-opts {:timeout-ms nil :connect-timeout-ms nil}))))
+  (testing "with-timeouts: per-request override > client > default"
+    (is (= [600000 5000] ((juxt :timeout-ms :connect-timeout-ms) (http/with-timeouts {} nil))))
+    (is (= [10 20] ((juxt :timeout-ms :connect-timeout-ms)
+                    (http/with-timeouts {} {:timeout-ms 10 :connect-timeout-ms 20}))))
+    (is (= [nil 20] ((juxt :timeout-ms :connect-timeout-ms)
+                     (http/with-timeouts {} {:timeout-ms 10 :connect-timeout-ms 20} {:timeout-ms nil})))))
+  (testing "the built client carries a 5 s connect timeout unless disabled"
+    (is (= (java.time.Duration/ofSeconds 5) (.get (.connectTimeout (http/client)))))
+    (is (not (.isPresent (.connectTimeout (http/client {:connect-timeout-ms nil})))))))
+
+(deftest invalid-timeout-values-are-rejected-before-io
+  (doseq [[k v] [[:timeout-ms 0] [:timeout-ms -1] [:timeout-ms "600"] [:connect-timeout-ms 0]]]
+    (let [e (try (http/request! {:method :get :url "http://127.0.0.1:1/" k v}) nil (catch Exception e e))]
+      (is (= :tools.agents.http/invalid-request (:type (ex-data e))) (pr-str [k v]))
+      (is (= k (:option (ex-data e)))))))
+
+(deftest a-server-that-never-answers-times-out-and-the-connection-is-closed
+  (let [{:keys [port stop! closed]} (start-stall-server! {:mode :no-headers})]
+    (try
+      (doseq [as [:string :bytes :stream]]
+        (let [[e ms] (elapsed-ms #(http/request! {:method :get :url (url port "/") :as as :timeout-ms 200}))]
+          (is (instance? java.net.http.HttpTimeoutException e) (pr-str as))
+          (is (http/timeout-exception? e))
+          (is (< ms 3000) (str as " took " ms " ms"))))
+      (Thread/sleep 300)
+      (is (= 3 @closed) "a timed-out exchange is aborted, not left holding the socket")
+      (finally (stop!)))))
+
+(deftest a-stalled-body-times-out-a-non-streaming-request
+  (let [{:keys [port stop!]} (start-stall-server! {:mode :body})]
+    (try
+      (doseq [as [:string :bytes]]
+        (let [[e ms] (elapsed-ms #(http/request! {:method :get :url (url port "/") :as as :timeout-ms 300}))]
+          (is (instance? java.net.http.HttpTimeoutException e) (pr-str as))
+          (is (< ms 3000))))
+      (finally (stop!)))))
+
+(deftest a-stream-body-outlives-the-request-timeout
+  ;; The regression guard for timeouts on SSE: on JDK 26 HttpRequest.timeout
+  ;; would close this body mid-read at 200 ms.
+  (let [{:keys [port stop!]} (start-stall-server! {:mode :trickle :chunks (repeat 8 "ab") :delay-ms 100})]
+    (try
+      (let [resp (http/request! {:method :get :url (url port "/") :as :stream :timeout-ms 200})
+            [body ms] (elapsed-ms #(with-open [^java.io.InputStream in (:body resp)]
+                                     (String. (.readAllBytes in) "UTF-8")))]
+        (is (= 200 (:status resp)))
+        (is (= (apply str (repeat 8 "ab")) body))
+        (is (> ms 400) "the body really did take longer than the timeout"))
+      (finally (stop!)))))
+
+(deftest a-disabled-timeout-waits
+  (let [{:keys [port stop!]} (start-stall-server! {:mode :trickle :chunks (repeat 4 "ab") :delay-ms 100})]
+    (try
+      (is (= "abababab" (:body (http/request! {:method :get :url (url port "/") :timeout-ms nil}))))
+      (finally (stop!)))))
+
+(deftest timeout-exception?-walks-the-cause-chain
+  (is (http/timeout-exception? (java.net.SocketTimeoutException. "s")))
+  (is (http/timeout-exception? (ex-info "wrapped" {} (java.net.http.HttpTimeoutException. "t"))))
+  (is (not (http/timeout-exception? (java.net.ConnectException. "refused")))))
 
 (deftest transport-failure-throws-unwrapped
   (let [e (try (http/request! {:method :post :url "http://127.0.0.1:1/" :body "{}"}) nil

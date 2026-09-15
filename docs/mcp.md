@@ -105,6 +105,16 @@ stream that ends or breaks before the response throws
 id, or `:close!` for every in-flight request — closes the connection and
 makes the pending `:send!` return nil.
 
+Timeouts: `(http/connect! url {:timeout-ms ms :connect-timeout-ms ms})`,
+defaults 600000 and 5000 (the provider clients' SDK values), nil disables
+either. Every POST is read `:as :stream`, so `:timeout-ms` bounds only the
+wait for the response headers: neither a JSON body nor an SSE stream is
+timed once headers arrive, and a `subscriptions/listen` stream lives as long
+as the server holds it (this revision has no long-lived GET stream). A
+server that holds back the headers longer than `:timeout-ms` throws
+`::error/transport` with `:timeout? true` and the `HttpTimeoutException` as
+cause; other transport failures still propagate unwrapped.
+
 `(http/connect! url {:http f})` sends every POST through `f` instead of
 `tools.agents.http/request!` (same contract, called with `:as :stream`; a
 String body is accepted). See the README's "Bring your own HTTP client / JSON
@@ -354,9 +364,9 @@ and, where the schema fixes one, `:data`.
 | `::error/invalid-input-required` | `mcp/input-required` was given neither `inputRequests` nor `requestState` |
 | `::error/mrtr-exhausted` / `::error/mrtr-unsupported-method` | The client's MRTR loop hit `:max-rounds`, or the server asked for MRTR on a method that may not use it |
 | `::error/undeclared-input-request` / `::error/no-input-handler` | The server asked for a capability the client never declared, or one it declared without wiring a handler |
-| `::error/transport` | The transport failed underneath a request |
+| `::error/transport` | The transport failed underneath a request; `:timeout? true` when `http/connect!`'s `:timeout-ms` expired before the response headers |
 | `::error/unsupported-runtime` | See Platform limitations |
-| `::error/invalid-options` | `http/connect!` got a non-fn `:http`; `server/server`, `http/connect!` or `stdio/connect!` got a `:json` that is not a `{:read :write}` codec map |
+| `::error/invalid-options` | `http/connect!` got a non-fn `:http` or a `:timeout-ms`/`:connect-timeout-ms` that is neither nil nor a positive number; `server/server`, `http/connect!` or `stdio/connect!` got a `:json` that is not a `{:read :write}` codec map |
 
 `:type` values are flat keywords, not a `derive` hierarchy: flat keywords
 compare and pattern-match the same everywhere, and nothing here needs

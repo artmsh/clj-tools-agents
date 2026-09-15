@@ -11,7 +11,7 @@
             [tools.agents.openai :as oai]
             [tools.agents.sse :as sse]
             [tools.agents.stream :as stream]
-            [tools.agents.test-support :refer [start-server! start-abort-server! rotating-token-cache]]))
+            [tools.agents.test-support :refer [start-server! start-abort-server! start-stall-server! sse-chunks rotating-token-cache]]))
 
 (defn- free-port []
   (with-open [ss (java.net.ServerSocket. 0 50 (java.net.InetAddress/getByName "127.0.0.1"))]
@@ -32,7 +32,7 @@
 (defn- ev-json [m] (oai/write-json m))
 
 (defn- with-server [route handler f]
-  (let [{:keys [port stop!]} (start-server! (free-port) route handler)]
+  (let [{:keys [port stop!]} (start-server! 0 route handler)]
     (try (f (oai/client {:api-key "test-key" :base-url (base-url port)}))
          (finally (stop!)))))
 
@@ -220,7 +220,7 @@
 (deftest responses-credential-source-401-invalidates-and-retries-the-open-once
   (let [auths (atom [])
         {:keys [source fetches]} (rotating-token-cache)
-        {:keys [port stop!]} (start-server! (free-port) r-route
+        {:keys [port stop!]} (start-server! 0 r-route
                                (fn [req]
                                  (swap! auths conj (get (:headers req) "authorization"))
                                  (if (= 1 (count @auths))
@@ -267,7 +267,7 @@
           (is (oai/stream-complete? r)))))))
 
 (deftest responses-transport-failure-mid-stream-is-a-connection-error
-  (let [{:keys [port stop!]} (start-abort-server! (free-port)
+  (let [{:keys [port stop!]} (start-abort-server! 0
                                {:headers sse-headers
                                 :chunks  [(sse "response.created" (ev-json r-created))]})]
     (try
@@ -492,7 +492,7 @@
   (testing "credential-source 401: invalidate and retry the open once"
     (let [auths (atom [])
           {:keys [source]} (rotating-token-cache)
-          {:keys [port stop!]} (start-server! (free-port) c-route
+          {:keys [port stop!]} (start-server! 0 c-route
                                  (fn [req]
                                    (swap! auths conj (get (:headers req) "authorization"))
                                    (if (= 1 (count @auths))
@@ -505,3 +505,31 @@
                                                 (oai/chat-completions-stream client {"model" "m"})))))
           (is (= ["Bearer tok-1" "Bearer tok-2"] @auths)))
         (finally (stop!))))))
+
+;; ---------------------------------------------------------------------------
+;; Timeouts against a stalling server
+;; ---------------------------------------------------------------------------
+
+(deftest a-stalled-server-times-out-is-retried-and-typed
+  (let [{:keys [port stop! accepted]} (start-stall-server! {:mode :no-headers})
+        client (oai/client {:api-key "k" :base-url (base-url port) :max-retries 1 :timeout-ms 200})]
+    (try
+      (doseq [[label f] [["create" #(oai/responses-create client {"model" "m"})]
+                         ["stream" #(oai/responses-stream client {"model" "m"})]]]
+        (reset! accepted 0)
+        (let [e (with-redefs [oai/sleep! (fn [_])] (try (f) nil (catch Exception e e)))]
+          (is (= :tools.agents.openai/api-connection-error (:type (ex-data e))) label)
+          (is (true? (:timeout? (ex-data e))) label)
+          (is (= 2 @accepted) (str label ": one retry"))))
+      (finally (stop!)))))
+
+(deftest a-stream-is-not-cut-by-the-request-timeout
+  (let [{:keys [port stop!]} (start-stall-server! {:mode :trickle :headers sse-headers
+                                                   :chunks (sse-chunks (fixture "openai-responses-text"))
+                                                   :delay-ms 60})
+        client (oai/client {:api-key "k" :base-url (base-url port) :timeout-ms 150})]
+    (try
+      (let [r (oai/accumulate-response-stream (oai/responses-stream client {"model" "m"}))]
+        (is (oai/stream-complete? r))
+        (is (seq (oai/output-text r))))
+      (finally (stop!)))))

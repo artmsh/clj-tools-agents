@@ -18,8 +18,35 @@
    https:// ALPN would negotiate safely, but the pin keeps both runtimes on
    one wire protocol, and these clients send one request at a time.
 
-   TIMEOUTS are off by default: no connect timeout on the default client and
-   no request timeout unless `:timeout-ms` is given.
+   TIMEOUTS default to the official SDKs' values (openai-python and
+   anthropic-sdk-python: `httpx.Timeout(timeout=600, connect=5.0)`):
+   `default-connect-timeout-ms` 5 s and `default-timeout-ms` 600 s. A request
+   map key that is ABSENT gets the default; an explicit nil disables that
+   timeout. Semantics, identical on both runtimes:
+
+     :connect-timeout-ms  java.net.http HttpClient connectTimeout (a
+                          HttpConnectTimeoutException). Per HttpClient, so
+                          request! keeps one shared client per value.
+     :timeout-ms          a deadline from send until `.send`'s response is
+                          complete: the WHOLE response, body included, for
+                          :as :string/:bytes; only until the response HEADERS
+                          for :as :stream. A stream's body is never cut by it,
+                          so a long SSE stream (or an MCP subscriptions/listen)
+                          may run for hours; bound a stalled stream with
+                          tools.agents.stream/close! from a watchdog.
+
+   The deadline is NOT HttpRequest.timeout: its scope differs by JDK version.
+   Verified empirically: on JDK 26 (JVM Clojure) it also covers the body read,
+   so an `ofInputStream` stream is closed mid-body when it fires, while
+   Babashka's native image stops it at the headers. Instead request! uses
+   `sendAsync` plus a bounded `CompletableFuture.get`, which completes at the
+   headers for ofInputStream and after the body otherwise, on both runtimes;
+   on expiry the future is cancelled, which aborts the exchange and closes
+   its connection, and java.net.http.HttpTimeoutException is thrown.
+
+   httpx's 600 s is a per-read idle timeout (read, write and pool each), not a
+   total; the JDK has no idle-read timeout, so the non-streaming mapping is a
+   total-exchange deadline and the streaming one a header deadline.
 
    RESPONSE HEADERS are normalized the same way on both runtimes: names are
    lower-cased, a header sent once is a String, and a header sent more than
@@ -201,23 +228,83 @@
    (into-array java.net.http.HttpRequest$BodyPublisher
                (map publisher (multipart-chunks parts boundary)))))
 
+(def default-timeout-ms
+  "Default `:timeout-ms`: 600 s, openai-python's and anthropic-sdk-python's
+   `DEFAULT_TIMEOUT = httpx.Timeout(timeout=600, connect=5.0)`."
+  600000)
+
+(def default-connect-timeout-ms
+  "Default `:connect-timeout-ms`: 5 s, the same SDKs' `connect=5.0`."
+  5000)
+
+(defn timeout-option?
+  "True for a valid `:timeout-ms` / `:connect-timeout-ms` value: nil
+   (disabled) or a positive number of milliseconds (truncated to a long)."
+  [x]
+  (or (nil? x) (and (number? x) (pos? x))))
+
+(defn timeout-opts
+  "The two timeout keys resolved from an options map: a key present in `opts`
+   keeps its value (nil disables), an absent key gets the default. Clients
+   merge this into their record at construction."
+  [opts]
+  {:timeout-ms         (if (contains? opts :timeout-ms) (:timeout-ms opts) default-timeout-ms)
+   :connect-timeout-ms (if (contains? opts :connect-timeout-ms) (:connect-timeout-ms opts) default-connect-timeout-ms)})
+
+(defn with-timeouts
+  "req with :timeout-ms and :connect-timeout-ms set from `overrides` when it
+   has the key (a per-request override, nil included), else from `client`,
+   else the defaults. Every client passes both keys on every request map, so
+   an injected `:http` fn sees the effective values."
+  ([req client] (with-timeouts req client nil))
+  ([req client overrides]
+   (let [pick (fn [k default]
+                (cond (contains? overrides k) (get overrides k)
+                      (and client (contains? client k)) (get client k)
+                      :else default))]
+     (assoc req
+            :timeout-ms (pick :timeout-ms default-timeout-ms)
+            :connect-timeout-ms (pick :connect-timeout-ms default-connect-timeout-ms)))))
+
+(defn timeout-exception?
+  "True when `e`, or any exception in its cause chain, is a transport timeout:
+   java.net.http.HttpTimeoutException (HttpConnectTimeoutException included)
+   or java.net.SocketTimeoutException, the latter for injected `:http` fns
+   built on socket-level clients."
+  [e]
+  (boolean (some #(or (instance? java.net.http.HttpTimeoutException %)
+                      (instance? java.net.SocketTimeoutException %))
+                 (take-while some? (iterate #(.getCause ^Throwable %) e)))))
+
 (defn client
   "Build a java.net.http.HttpClient pinned to HTTP/1.1. opts:
-     :connect-timeout-ms  connect timeout; none when nil (the default)
+     :connect-timeout-ms  connect timeout, default `default-connect-timeout-ms`
+                          (5 s); nil disables it
    Pass the result as `request!`'s `:client` to use a separate connection
-   pool or a connect timeout."
+   pool; `request!`'s own `:connect-timeout-ms` is then ignored."
   ([] (client nil))
-  ([{:keys [connect-timeout-ms]}]
-   (let [b (-> (java.net.http.HttpClient/newBuilder)
+  ([opts]
+   (let [{:keys [connect-timeout-ms]} (timeout-opts opts)
+         b (-> (java.net.http.HttpClient/newBuilder)
                (.version java.net.http.HttpClient$Version/HTTP_1_1))]
      (when connect-timeout-ms
-       (.connectTimeout b (java.time.Duration/ofMillis (long connect-timeout-ms))))
+       (.connectTimeout b (java.time.Duration/ofMillis (max 1 (long connect-timeout-ms)))))
      (.build b))))
 
-;; One client per process, built lazily and shared by every namespace, so a
-;; retry does not allocate a fresh selector thread. java.net.http pools
-;; connections per host, so sharing across providers is harmless.
-(def ^:private default-client (delay (client)))
+;; One client per connect timeout per process, built lazily and shared by
+;; every namespace, so a retry does not allocate a fresh selector thread.
+;; java.net.http pools connections per host, so sharing across providers is
+;; harmless. `locking`, not swap!: a retried swap! fn would build (and leak
+;; the selector thread of) a second HttpClient.
+(def ^:private shared-clients (atom {}))
+
+(defn- shared-client ^java.net.http.HttpClient [connect-timeout-ms]
+  (or (get @shared-clients connect-timeout-ms)
+      (locking shared-clients
+        (or (get @shared-clients connect-timeout-ms)
+            (let [c (client {:connect-timeout-ms connect-timeout-ms})]
+              (swap! shared-clients assoc connect-timeout-ms c)
+              c)))))
 
 (defn normalize-headers
   "A java.net.http header map (name -> list of values) as a Clojure map:
@@ -246,6 +333,29 @@
     :bytes  (java.net.http.HttpResponse$BodyHandlers/ofByteArray)
     :stream (java.net.http.HttpResponse$BodyHandlers/ofInputStream)))
 
+(defn- await-response
+  "The response of a sendAsync future, waiting at most timeout-ms (nil: no
+   limit). The future completes when the body handler does: at the headers
+   for ofInputStream, after the body for ofString/ofByteArray. On expiry the
+   future is cancelled, which aborts the exchange and closes its connection,
+   and HttpTimeoutException is thrown; if it completed in the meantime, that
+   outcome wins. A failed exchange rethrows its cause unwrapped, as `.send`
+   does. An interrupt cancels the exchange and rethrows."
+  [^java.util.concurrent.CompletableFuture f timeout-ms]
+  (try
+    (if timeout-ms
+      (.get f (max 1 (long timeout-ms)) java.util.concurrent.TimeUnit/MILLISECONDS)
+      (.get f))
+    (catch java.util.concurrent.TimeoutException _
+      (if (.cancel f true)
+        (throw (java.net.http.HttpTimeoutException. "request timed out"))
+        (await-response f nil)))
+    (catch java.util.concurrent.ExecutionException e
+      (throw (or (.getCause e) e)))
+    (catch InterruptedException e
+      (.cancel f true)
+      (throw e))))
+
 (defn request!
   "Perform one HTTP request. Takes a map:
 
@@ -263,9 +373,17 @@
                   :headers already has a content-type
      :as          :string (default) | :bytes (raw byte[], untouched) |
                   :stream (java.io.InputStream)
-     :timeout-ms  request timeout (java.net.http's HttpRequest timeout,
-                  covering the wait for response headers); none when nil
-     :client      a java.net.http.HttpClient; defaults to one shared client
+     :timeout-ms  deadline in ms for the whole response with :as
+                  :string/:bytes, for the response headers only with :as
+                  :stream (the body of a stream is never timed); default
+                  `default-timeout-ms` (600 s) when the key is absent, none
+                  when nil. See the ns docstring
+     :connect-timeout-ms
+                  TCP/TLS connect timeout in ms; default
+                  `default-connect-timeout-ms` (5 s) when absent, none when
+                  nil. Ignored when :client is given
+     :client      a java.net.http.HttpClient; defaults to a shared client
+                  per :connect-timeout-ms value
 
    Returns {:status int :headers map :body String|byte[]|InputStream} for
    ANY HTTP response, 2xx or not; see the ns docstring for the header shape.
@@ -275,33 +393,39 @@
    including non-2xx responses, or the pooled connection stays checked out.
 
    Throws only when no response arrives: the transport exception (an
-   IOException such as ConnectException or HttpTimeoutException, or an
-   InterruptedException) propagates unwrapped, as does an invalid URL's
-   IllegalArgumentException."
-  [{:keys [method url query headers body multipart as timeout-ms] :as req}]
+   IOException such as ConnectException, HttpConnectTimeoutException or
+   HttpTimeoutException, or an InterruptedException) propagates unwrapped,
+   as does an invalid URL's IllegalArgumentException. `timeout-exception?`
+   tells a timeout apart. An invalid timeout value throws
+   :tools.agents.http/invalid-request before any I/O."
+  [{:keys [method url query headers body multipart as] :as req}]
   (when (and (some? body) (some? multipart))
     (throw (ex-info "tools.agents.http/request!: :body and :multipart are mutually exclusive"
                     {:type :tools.agents.http/invalid-request})))
-  (let [boundary  (when multipart (*boundary-fn*))
-        headers   (cond-> (or headers {})
-                    (and multipart (not (has-header? headers "content-type")))
-                    (assoc "content-type" (str "multipart/form-data; boundary=" boundary)))
-        builder   (-> (java.net.http.HttpRequest/newBuilder (java.net.URI/create (with-query url query)))
-                      (.version java.net.http.HttpClient$Version/HTTP_1_1))
-        handler   (body-handler as)]
-    (doseq [[k v] headers
-            v     (if (sequential? v) v [v])
-            :when (some? v)]
-      (.header builder (param-name k) (str v)))
-    (when timeout-ms
-      (.timeout builder (java.time.Duration/ofMillis (long timeout-ms))))
-    (.method builder (str/upper-case (name method))
-             (if multipart (multipart-publisher multipart boundary) (publisher body)))
-    (let [^java.net.http.HttpClient c (or (:client req) @default-client)
-          resp (.send c (.build builder) handler)]
-      {:status  (.statusCode resp)
-       :headers (normalize-headers (.map (.headers resp)))
-       :body    (.body resp)})))
+  (let [{:keys [timeout-ms connect-timeout-ms]} (timeout-opts req)]
+    (doseq [[k v] [[:timeout-ms timeout-ms] [:connect-timeout-ms connect-timeout-ms]]]
+      (when-not (timeout-option? v)
+        (throw (ex-info (str "tools.agents.http/request!: " k " must be nil or a positive number of milliseconds, got: " (pr-str v))
+                        {:type :tools.agents.http/invalid-request :option k}))))
+    (let [boundary  (when multipart (*boundary-fn*))
+          headers   (cond-> (or headers {})
+                      (and multipart (not (has-header? headers "content-type")))
+                      (assoc "content-type" (str "multipart/form-data; boundary=" boundary)))
+          builder   (-> (java.net.http.HttpRequest/newBuilder (java.net.URI/create (with-query url query)))
+                        (.version java.net.http.HttpClient$Version/HTTP_1_1))
+          handler   (body-handler as)]
+      (doseq [[k v] headers
+              v     (if (sequential? v) v [v])
+              :when (some? v)]
+        (.header builder (param-name k) (str v)))
+      (.method builder (str/upper-case (name method))
+               (if multipart (multipart-publisher multipart boundary) (publisher body)))
+      (let [^java.net.http.HttpClient c (or (:client req) (shared-client connect-timeout-ms))
+            ^java.net.http.HttpResponse resp
+            (await-response (.sendAsync c (.build builder) handler) timeout-ms)]
+        {:status  (.statusCode resp)
+         :headers (normalize-headers (.map (.headers resp)))
+         :body    (.body resp)}))))
 
 (defn stream-body
   "The body of an `:as :stream` response as a java.io.InputStream. An

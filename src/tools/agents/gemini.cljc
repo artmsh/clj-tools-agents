@@ -226,6 +226,20 @@
                    own default for the Gemini Developer API)
      :max-retries  how many times to retry a failed request, default 4
                    (`default-max-retries`). 0 disables retries.
+     :timeout-ms   request deadline in ms, default 600000; nil disables it.
+                   python-genai has NO default (`HttpOptions.timeout` None
+                   -> httpx `timeout=None`); this library uses openai-python's
+                   and anthropic-sdk-python's 600 s for all clients. Covers
+                   the whole response for `generate-content` and only the
+                   wait for the response headers for
+                   `generate-content-stream`, whose body is never timed (see
+                   tools.agents.http). No `X-Server-Timeout` header is sent.
+                   Override per call with `(assoc client :timeout-ms n)`.
+     :connect-timeout-ms  connect timeout in ms, default 5000; nil disables
+                   it. A timeout is a connection failure: retried, then
+                   :tools.agents.gemini/api-connection-error with :timeout?
+                   true. Anything but nil or a positive number throws
+                   {:type :tools.agents.gemini/invalid-options}.
      :http         request fn replacing tools.agents.http/request! for every
                    exchange, streaming included. Same contract as request!:
                    takes its request map, returns {:status :headers :body}
@@ -250,6 +264,11 @@
      (throw (ex-info (str "tools.agents.gemini/client: :http must be a request fn with "
                           "tools.agents.http/request!'s contract, got: " (pr-str (type (:http opts))))
                      {:type :tools.agents.gemini/invalid-options :option :http})))
+   (doseq [k [:timeout-ms :connect-timeout-ms]
+           :when (and (contains? opts k) (not (http/timeout-option? (get opts k))))]
+     (throw (ex-info (str "tools.agents.gemini/client: " k " must be nil or a positive number of milliseconds, got: "
+                          (pr-str (get opts k)))
+                     {:type :tools.agents.gemini/invalid-options :option k})))
    (let [creds (resolve-client-credentials opts getenv)]
      (map->GeminiClient
       (cond-> (merge {:base-url    (or (:base-url opts) (getenv "GOOGLE_GEMINI_BASE_URL") default-base-url)
@@ -257,6 +276,7 @@
                       :max-retries (if (number? (:max-retries opts))
                                      (max 0 (long (:max-retries opts)))
                                      default-max-retries)}
+                     (http/timeout-opts opts)
                      creds)
         (:http opts) (assoc :http (:http opts))
         (:json opts) (assoc :json (:json opts)))))))
@@ -370,6 +390,18 @@
         "content-type"   "application/json"}
        nil])))
 
+(defn- connection-error
+  "The :api-connection-error thrown once no response arrived within the retry
+   budget; a timeout adds :timeout? true. e (the transport exception) is the
+   cause."
+  [fn-name ^Throwable e retries-taken]
+  (let [timeout? (http/timeout-exception? e)]
+    (ex-info (str "tools.agents.gemini/" fn-name ": " (if timeout? "request timed out" "connection failed") ": " e)
+             (cond-> {:type :tools.agents.gemini/api-connection-error :status nil :body nil
+                      :retries-taken retries-taken}
+               timeout? (assoc :timeout? true))
+             e)))
+
 (defn- own-error?
   "True for an already-typed tools.agents.gemini/* ex-info — an SDK-side
    permanent error, which it would be pointless as well as noisy to retry.
@@ -418,9 +450,11 @@
       ;; the try: a token fetch failure is not a connection failure.
       (let [[headers used-token] (request-headers fn-name client)
             outcome (try
-                      {:resp ((or (:http client) http/request!) {:method :post :url url
-                                             :headers headers
-                                             :body body-str})}
+                      {:resp ((or (:http client) http/request!)
+                              (http/with-timeouts {:method :post :url url
+                                                   :headers headers
+                                                   :body body-str}
+                                                  client))}
                       (catch Exception e
                         (if (own-error? e) (throw e) {:error e})))]
         (if (:error outcome)
@@ -429,9 +463,7 @@
           (if (< retries-taken max-retries)
             (do (*sleep-fn* (retry-delay-ms retries-taken))
                 (recur (inc retries-taken) auth-retried?))
-            (throw (ex-info (str "tools.agents.gemini/" fn-name ": connection failed: " (str (:error outcome)))
-                             {:type :tools.agents.gemini/api-connection-error :status nil :body nil
-                              :retries-taken retries-taken})))
+            (throw (connection-error fn-name (:error outcome) retries-taken)))
           (let [resp      (:resp outcome)
                 status    (:status resp)
                 resp-body (:body resp)]
@@ -566,9 +598,7 @@
                           (if-let [e (:error outcome)]
                             (if (< n max-retries)
                               (do (backoff! n) (recur auth-retried?))
-                              (throw (ex-info (str "tools.agents.gemini/" fn-name ": connection failed: " e)
-                                              {:type :tools.agents.gemini/api-connection-error :status nil
-                                               :body nil :retries-taken n})))
+                              (throw (connection-error fn-name e n)))
                             (let [status (:status (:resp outcome))]
                               (cond
                                 (and (= status 401) (not auth-retried?) (:credential-source client)
@@ -584,7 +614,8 @@
                                 (:resp outcome)))))))]
     (stream/open-event-stream
      {:request       {:method :post :url url :body body-str}
-      :send!         (fn [req] ((or (:http client) http/request!) (assoc req :headers @headers)))
+      :send!         (fn [req] ((or (:http client) http/request!)
+                                (http/with-timeouts (assoc req :headers @headers) client)))
       :open!         open!
       :on-error      (fn [{:keys [status body]}]
                        (throw (http-status-error codec fn-name status body @retries)))

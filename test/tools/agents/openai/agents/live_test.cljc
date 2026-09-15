@@ -1329,7 +1329,7 @@
 (deftest sessions-create-with-api-key-fn-calls-it-per-attempt
   (let [auths (atom [])
         calls (atom 0)
-        {:keys [port stop!]} (start-server! (free-port) "/v1/agents/sessions"
+        {:keys [port stop!]} (start-server! 0 "/v1/agents/sessions"
                                 (fn [req]
                                   (swap! auths conj [(get (:headers req) "authorization")
                                                      (get (:headers req) "openai-beta")])
@@ -1347,7 +1347,7 @@
   (let [auths (atom [])
         calls (atom 0)
         {:keys [port stop!]}
-        (start-server! (free-port) "/v1/agents/sessions/sess_1/events"
+        (start-server! 0 "/v1/agents/sessions/sess_1/events"
           (fn [req]
             (swap! auths conj (get (:headers req) "authorization"))
             (if (= 1 (count @auths))
@@ -1365,7 +1365,7 @@
 (deftest sessions-create-with-api-key-fn-401-is-not-retried
   (let [hits  (atom 0)
         calls (atom 0)
-        {:keys [port stop!]} (start-server! (free-port) "/v1/agents/sessions"
+        {:keys [port stop!]} (start-server! 0 "/v1/agents/sessions"
                                 (fn [_] (swap! hits inc) {:status 401 :body "{}"}))]
     (try
       (let [client (oai/client {:api-key #(str "entra-" (swap! calls inc)) :base-url (base-url port)})

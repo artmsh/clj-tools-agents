@@ -471,7 +471,7 @@
 (deftest api-key-fn-called-before-every-attempt-without-caching
   (let [seen (atom [])
         {:keys [f calls]} (counting-key-fn)
-        {:keys [port stop!]} (start-server! (free-port) "/v1/responses"
+        {:keys [port stop!]} (start-server! 0 "/v1/responses"
                                 (fn [req]
                                   (swap! seen conj (get (:headers req) "authorization"))
                                   (case (count @seen)
@@ -491,7 +491,7 @@
 (deftest api-key-fn-401-is-not-retried
   (let [hits (atom 0)
         {:keys [f calls]} (counting-key-fn)
-        {:keys [port stop!]} (start-server! (free-port) "/v1/responses"
+        {:keys [port stop!]} (start-server! 0 "/v1/responses"
                                 (fn [_] (swap! hits inc)
                                   {:status 401 :body "{\"error\":{\"message\":\"bad token\"}}"}))]
     (try
@@ -505,7 +505,7 @@
 
 (deftest api-key-fn-bad-return-throws-typed-before-any-request
   (let [hits (atom 0)
-        {:keys [port stop!]} (start-server! (free-port) "/v1/responses"
+        {:keys [port stop!]} (start-server! 0 "/v1/responses"
                                 (fn [_] (swap! hits inc) {:status 200 :body (canned-response)}))]
     (try
       (doseq [bad [nil "" "   " 42 :sekrit-kw {"k" "sekrit-map"}]]
@@ -528,7 +528,7 @@
 (deftest api-key-fn-assoced-onto-a-client-is-called-per-attempt
   (let [seen (atom [])
         {:keys [f]} (counting-key-fn)
-        {:keys [port stop!]} (start-server! (free-port) "/v1/responses"
+        {:keys [port stop!]} (start-server! 0 "/v1/responses"
                                 (fn [req]
                                   (swap! seen conj (get (:headers req) "authorization"))
                                   (if (= 1 (count @seen))

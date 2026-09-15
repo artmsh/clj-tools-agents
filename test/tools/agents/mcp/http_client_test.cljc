@@ -11,7 +11,7 @@
             [tools.agents.mcp.client :as client]
             [tools.agents.mcp.http :as http]
             [tools.agents.mcp.server :as server]
-            [tools.agents.test-support :refer [start-server! start-abort-server! recording-codec throwing-codec]]))
+            [tools.agents.test-support :refer [start-server! start-abort-server! start-stall-server! recording-codec throwing-codec]]))
 
 (defn- free-port []
   (with-open [s (java.net.ServerSocket. 0)] (.getLocalPort s)))
@@ -24,9 +24,8 @@
   "Start the mock on a free port; `handler` gets the request map with its
    body already JSON-decoded under :message."
   [handler]
-  (let [port (free-port)]
-    (start-server! port "/mcp"
-                   (fn [req] (handler (assoc req :message (mcp/read-json (:body req))))))))
+  (start-server! 0 "/mcp"
+                 (fn [req] (handler (assoc req :message (mcp/read-json (:body req)))))))
 
 (defn- until-gone!
   "Send SSE keep-alive comments every 10 ms until the client disconnects,
@@ -132,8 +131,7 @@
       (finally (stop!)))))
 
 (deftest a-stream-cut-off-mid-body-is-a-transport-error
-  (let [port (free-port)
-        {:keys [stop!]} (start-abort-server! port {:headers sse-headers
+  (let [{:keys [port stop!]} (start-abort-server! 0 {:headers sse-headers
                                                    :chunks [(http/sse-event (mcp/notification "notifications/x" {}))]})]
     (try
       (let [e (try ((:send! (http/connect! (url port))) (mcp/request 3 "tools/list" {})) nil
@@ -324,3 +322,44 @@
          (is (= "hi" (mcp/output-text (client/call-tool! (a-client (http/connect! (url port))) "echo" {"m" "hi"}))))
          (is (= [1 1] [@reads @writes]))
          (finally (stop!))))))
+
+;; ---------------------------------------------------------------------------
+;; Timeouts
+;; ---------------------------------------------------------------------------
+
+(deftest timeouts-default-to-the-sdk-values-and-reach-the-http-fn
+  (let [calls (atom [])
+        fake  (fn [req] (swap! calls conj req)
+                {:status 200 :headers {"content-type" "application/json"}
+                 :body (mcp/write-json {"jsonrpc" "2.0" "id" 1 "result" {}})})]
+    ((:send! (http/connect! "https://mcp.fake/mcp" {:http fake})) (mcp/request 1 "tools/list" {}))
+    ((:send! (http/connect! "https://mcp.fake/mcp" {:http fake :timeout-ms nil :connect-timeout-ms 7}))
+     (mcp/request 1 "tools/list" {}))
+    (is (= [[600000 5000] [nil 7]] (mapv (juxt :timeout-ms :connect-timeout-ms) @calls))))
+  (let [e (try (http/connect! "https://mcp.fake/mcp" {:timeout-ms 0}) nil (catch Exception e e))]
+    (is (= :tools.agents.mcp.error/invalid-options (:type (ex-data e))))
+    (is (= :timeout-ms (:option (ex-data e))))))
+
+(deftest a-server-that-never-answers-is-a-timed-out-transport-error
+  (let [{:keys [port stop!]} (start-stall-server! {:mode :no-headers})]
+    (try
+      (let [e (try ((:send! (http/connect! (url port) {:timeout-ms 200})) (mcp/request 1 "tools/list" {})) nil
+                   (catch Exception e e))]
+        (is (= :tools.agents.mcp.error/transport (:type (ex-data e))))
+        (is (true? (:timeout? (ex-data e))))
+        (is (instance? java.net.http.HttpTimeoutException (ex-cause e))))
+      (finally (stop!)))))
+
+(deftest a-listen-stream-outlives-the-request-timeout
+  (let [notes  (atom [])
+        note   (fn [i] (http/sse-event {"jsonrpc" "2.0" "method" "notifications/progress" "params" {"i" i}}))
+        resp   (http/sse-event {"jsonrpc" "2.0" "id" 5 "result" {}})
+        {:keys [port stop!]} (start-stall-server! {:mode :trickle :headers sse-headers
+                                                   :chunks (conj (mapv note (range 6)) resp)
+                                                   :delay-ms 60})]
+    (try
+      (let [t (http/connect! (url port) {:timeout-ms 150 :on-notification #(swap! notes conj %)})]
+        (is (= {"jsonrpc" "2.0" "id" 5 "result" {}}
+               ((:send! t) (mcp/request 5 "subscriptions/listen" {}))))
+        (is (= 6 (count @notes))))
+      (finally (stop!)))))
