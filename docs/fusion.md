@@ -67,6 +67,7 @@ Useful keys:
 | `:base-url` | Explicit endpoint override, useful for local tests |
 | `:http` | Request fn forwarded to the provider's `client` (see README, Bring your own HTTP client / JSON codec) |
 | `:json` | `{:read :write}` codec forwarded to the provider's `client` |
+| `:timeout-ms` / `:connect-timeout-ms` | Forwarded to the provider's `client`; defaults 600000 / 5000, nil disables (see README, Timeouts) |
 | `:max-tokens` | Anthropic `max_tokens`, defaults to `1024` |
 | `:call` | Test/demo hook: `(fn [spec prompt] {:text ... :response ...})` |
 

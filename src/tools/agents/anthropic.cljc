@@ -682,6 +682,8 @@
                :body an undecoded String
      :timeout-ms / :connect-timeout-ms
                per-request override of the client's values (nil disables)
+               a distinct :connect-timeout-ms selects a cached shared
+               HttpClient per value, so vary it on the client, not per call
 
    `content-type: application/json` is sent on bodyless requests too, as
    anthropic-sdk-python's default_headers do."
