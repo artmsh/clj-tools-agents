@@ -257,15 +257,15 @@
           (is (= 2 @fetches)))
         (finally (stop!)))))
   (testing "a second 401 surfaces as the typed status error"
-    (let [hits (atom 0)
+    (let [paths (atom [])
           {:keys [source]} (rotating-token-cache)
           {:keys [port stop!]} (start-server! (free-port) model-path
-                                 (fn [_] (swap! hits inc) {:status 401 :body "{\"error\":{\"message\":\"nope\"}}"}))]
+                                 (fn [req] (swap! paths conj (:path req)) {:status 401 :body "{\"error\":{\"message\":\"nope\"}}"}))]
       (try
         (let [client (g/client {:credential-source source :base-url (base-url port) :max-retries 0})
-              e      (try (g/generate-content-stream client "m" {}) nil (catch Exception e e))]
+              e      (try (g/generate-content-stream client "gemini-2.5-flash" {}) nil (catch Exception e e))]
           (is (= 401 (:status (ex-data e))))
-          (is (= 2 @hits))
+          (is (= [model-path model-path] @paths))
           (is (not (str/includes? (pr-str (ex-data e)) "tok-"))))
         (finally (stop!)))))
   (testing "a static key's 401 is not retried"
