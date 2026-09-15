@@ -2,7 +2,8 @@
   "Pure logic — zero I/O, zero network, identical on JVM Clojure and
    Babashka. Mock-server / transport-level coverage lives in
    tools.agents.gemini.live-test."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.string :as str]
+            [clojure.test :refer [deftest is testing]]
             [tools.agents.gemini :as g]))
 
 ;; ---------------------------------------------------------------------------
@@ -116,3 +117,102 @@
   (is (= [{"role" "user" "parts" [{"text" "hi"}]}
           {"role" "model" "parts" [{"text" "hello"}]}]
          (-> [] (g/add-user-message "hi") (g/add-model-message "hello")))))
+
+;; ---------------------------------------------------------------------------
+;; Stream accumulation (pure)
+;; ---------------------------------------------------------------------------
+
+(defn- cand [parts & {:as extra}]
+  (merge {"content" {"role" "model" "parts" parts} "index" 0} extra))
+
+(deftest accumulate-chunk-arities
+  (is (nil? (g/accumulate-chunk)))
+  (is (= {"a" 1} (g/accumulate-chunk {"a" 1})))
+  (is (nil? (g/accumulate-stream [])))
+  (is (= "ab" (g/output-text (transduce identity g/accumulate-chunk
+                                        [{"candidates" [(cand [{"text" "a"}])]}
+                                         {"candidates" [(cand [{"text" "b"}])]}])))))
+
+(deftest accumulate-keeps-thought-and-answer-text-apart
+  (let [r (g/accumulate-stream
+           [{"candidates" [(cand [{"text" "think " "thought" true}])]}
+            {"candidates" [(cand [{"text" "more" "thought" true}])]}
+            {"candidates" [(cand [{"text" "Ans" "thoughtSignature" "sig1"}])]}
+            {"candidates" [(cand [{"text" "wer"}])]}
+            {"candidates" [(cand [{"text" "." "thoughtSignature" "sig2"}] "finishReason" "STOP")]}])]
+    (is (= [{"text" "think more" "thought" true}
+            {"text" "Answer." "thoughtSignature" "sig2"}]
+           (get-in r ["candidates" 0 "content" "parts"])))
+    (is (= "Answer." (g/output-text r)))))
+
+(deftest accumulate-non-text-parts-arrive-whole
+  (let [fc {"functionCall" {"name" "get_weather" "args" {"city" "Kyiv"}}}
+        r  (g/accumulate-stream
+            [{"candidates" [(cand [{"text" "Let me check. "}])]}
+             {"candidates" [(cand [fc])]}
+             {"candidates" [(cand [{"text" "Done"}] "finishReason" "STOP")]}])]
+    (is (= [{"text" "Let me check. "} fc {"text" "Done"}]
+           (get-in r ["candidates" 0 "content" "parts"])))))
+
+(deftest accumulate-joins-adjacent-code-execution-parts
+  (let [r (g/accumulate-stream
+           [{"candidates" [(cand [{"executableCode" {"language" "PYTHON" "code" "print("}}])]}
+            {"candidates" [(cand [{"executableCode" {"language" "PYTHON" "code" "1)"}}])]}
+            {"candidates" [(cand [{"codeExecutionResult" {"outcome" "OUTCOME_UNSPECIFIED" "output" "1"}}])]}
+            {"candidates" [(cand [{"codeExecutionResult" {"outcome" "OUTCOME_OK" "output" "\n"}}])]}])]
+    (is (= [{"executableCode" {"language" "PYTHON" "code" "print(1)"}}
+            {"codeExecutionResult" {"outcome" "OUTCOME_OK" "output" "1\n"}}]
+           (get-in r ["candidates" 0 "content" "parts"])))))
+
+(deftest accumulate-groups-candidates-by-index-into-a-sorted-vector
+  (let [r (g/accumulate-stream
+           [{"candidates" [{"index" 1 "content" {"role" "model" "parts" [{"text" "B1"}]}}]}
+            {"candidates" [{"content" {"role" "model" "parts" [{"text" "A1"}]}}
+                           {"index" 1 "content" {"parts" [{"text" "B2"}]}}]}
+            {"candidates" [{"index" 0 "content" {"parts" [{"text" "A2"}]} "finishReason" "STOP"}
+                           {"index" 1 "finishReason" "MAX_TOKENS"
+                            "safetyRatings" [{"category" "HARM_CATEGORY_HARASSMENT" "probability" "LOW"}]}]}])
+        [a b] (get r "candidates")]
+    (is (vector? (get r "candidates")))
+    (is (= "A1A2" (g/output-text r)) "output-text reads candidate index 0")
+    (is (= [{"text" "A1A2"}] (get-in a ["content" "parts"])))
+    (is (= [{"text" "B1B2"}] (get-in b ["content" "parts"])))
+    (is (= "model" (get-in b ["content" "role"])) "role from the first chunk that had one")
+    (is (= "MAX_TOKENS" (get b "finishReason")))
+    (is (= "LOW" (get-in b ["safetyRatings" 0 "probability"])))
+    (is (g/stream-complete? r))
+    (is (false? (g/stream-complete? (update r "candidates" #(assoc-in % [1 "finishReason"] nil))))
+        "every candidate needs a finishReason")))
+
+(deftest accumulate-top-level-fields
+  (let [r (g/accumulate-stream
+           [{"candidates" [(cand [{"text" "a"}])] "usageMetadata" {"totalTokenCount" 3}
+             "modelVersion" "m1" "responseId" "r" "promptFeedback" {"safetyRatings" []}}
+            {"candidates" [(cand [{"text" "b"}])] "usageMetadata" {"totalTokenCount" 5}
+             "promptFeedback" {"blockReason" "later"}}
+            {"candidates" [(cand [] "finishReason" "STOP")] "modelVersion" "m2"}])]
+    (is (= {"totalTokenCount" 5} (get r "usageMetadata")) "last non-nil")
+    (is (= "m2" (get r "modelVersion")))
+    (is (= "r" (get r "responseId")))
+    (is (= {"safetyRatings" []} (get r "promptFeedback")) "first promptFeedback wins")
+    (is (= "ab" (g/output-text r)))))
+
+(deftest accumulate-blocked-prompt
+  (let [r (g/accumulate-stream [{"promptFeedback" {"blockReason" "SAFETY"}
+                                 "usageMetadata" {"promptTokenCount" 4}}])]
+    (is (nil? (g/output-text r)))
+    (is (g/stream-complete? r))
+    (is (false? (g/stream-complete? {})))
+    (is (false? (g/stream-complete? nil)))
+    (is (false? (g/stream-complete? {"candidates" []})))))
+
+(deftest accumulate-throws-typed-on-an-error-chunk
+  (let [e (try (g/accumulate-stream [{"candidates" [(cand [{"text" "a"}])]}
+                                     {"error" {"code" 429 "message" "quota" "status" "RESOURCE_EXHAUSTED"}}])
+               nil (catch Exception e e))]
+    (is (= :tools.agents.gemini/resource-exhausted-error (:type (ex-data e))))
+    (is (= 429 (:status (ex-data e))))
+    (is (str/starts-with? (ex-message e) "tools.agents.gemini/accumulate-chunk: stream error 429 quota")))
+  (let [e (try (g/accumulate-chunk nil {"error" {"message" "no code"}}) nil (catch Exception e e))]
+    (is (= :tools.agents.gemini/api-status-error (:type (ex-data e))))
+    (is (nil? (:status (ex-data e))))))
