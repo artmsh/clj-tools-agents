@@ -58,6 +58,8 @@
      - Files: list and download (`byte[]`) a session's published artifacts,
        delete one; list a connected environment's files (token paging) and
        copy a file into it (inline base64 or a Files API id).
+     - Environment templates: reusable OpenAI-hosted environment config —
+       create, retrieve, update, list, delete.
      - Vaults and their MCP credentials: vault create, retrieve, list,
        delete; credential create, retrieve, rotate (update), list, delete.
        Secrets are write-only and never logged.
@@ -878,6 +880,89 @@
   (send-request! client "environments-files-create" :post (environment-files-path environment-id)
                  (cond-> request
                    (contains? request "data") (update "data" base64-data))))
+
+;; ---------------------------------------------------------------------------
+;; Public API — environment templates
+;;
+;; Source: https://developers.openai.com/api/reference/resources/beta/subresources/agents/subresources/environments/subresources/templates/methods/{create,retrieve,update,list,delete}/index.md
+;; and openai-python src/openai/resources/beta/agents/environments/templates.py.
+;; ---------------------------------------------------------------------------
+
+(defn- templates-path
+  ([] "/agents/environments/templates")
+  ([template-id] (str (templates-path) "/" (path-segment template-id))))
+
+(defn environments-templates-create
+  "POST {base-url}/agents/environments/templates — create reusable
+   OpenAI-hosted environment configuration, the analogue of
+   `client.beta.agents.environments.templates.create(**params)`. Every field
+   is optional and passed through verbatim:
+
+     \"name\"                    display name
+     \"capability_directories\"  directories exposing capabilities
+     \"env\"                     {string string}, confidential (never returned)
+     \"files\"                   [{\"type\" \"inline\" \"path\" .. \"data\" <base64 String>}
+                                 {\"type\" \"file_id\" \"path\" .. \"file_id\" ..}]
+     \"network\"                 {\"access\" \"enabled\"|\"disabled\"|\"restricted\"
+                                 \"allowed_domains\" [..]}
+     \"packages\"                {\"npm\" [..] \"python\" [..] \"system\" [..]}
+     \"plugins\"                 [{\"type\" \"inline\" \"name\" .. \"description\" ..
+                                  \"source\" {\"type\" \"base64\"
+                                            \"media_type\" \"application/zip\" \"data\" ..}}]
+     \"setup_commands\"          [{\"command\" .. \"cwd\" ..}], confidential
+     \"skills\"                  [{\"type\" \"skill_reference\" \"skill_id\" .. \"version\" ..}
+                                 or an inline ZIP like \"plugins\"]
+
+   Unlike `environments-files-create`, \"files\" \"data\" is NOT encoded
+   here: pass a standard-base64 String.
+
+   Returns the `EnvironmentTemplate`: \"id\", \"object\"
+   \"agent.environment.template\", \"created_at\", \"updated_at\", and the
+   fields above as safe metadata — no \"env\", no \"setup_commands\", inline
+   files as \"path\"/\"size_bytes\" only. Use its \"id\" as
+   `sessions-create`'s `environment` {\"type\" \"openai_hosted\"
+   \"environment_template_id\" ..}; inline session fields then override it
+   (a network override cannot broaden the template's policy)."
+  ([client] (environments-templates-create client nil))
+  ([client request]
+   (send-request! client "environments-templates-create" :post (templates-path) request)))
+
+(defn environments-templates-retrieve
+  "GET {base-url}/agents/environments/templates/{template-id} — the analogue
+   of `client.beta.agents.environments.templates.retrieve(environment_template_id)`.
+   Returns the `EnvironmentTemplate` without confidential values."
+  [client template-id]
+  (send-request! client "environments-templates-retrieve" :get (templates-path template-id) nil))
+
+(defn environments-templates-update
+  "POST {base-url}/agents/environments/templates/{template-id} — the analogue
+   of `client.beta.agents.environments.templates.update(environment_template_id, **params)`.
+   `request` takes `environments-templates-create`'s fields, passed through
+   verbatim. The reference documents \"env\", \"files\", \"plugins\",
+   \"setup_commands\" and \"skills\" as REPLACEMENTS, and \"name\" nil as
+   clearing the name; it does not say what an omitted field does. Returns
+   the updated `EnvironmentTemplate`."
+  [client template-id request]
+  (send-request! client "environments-templates-update" :post (templates-path template-id) request))
+
+(defn environments-templates-list
+  "GET {base-url}/agents/environments/templates — the analogue of
+   `client.beta.agents.environments.templates.list(**params)`. `params`, if
+   given: \"after\", \"limit\" (1-100, default 20), \"order\" (\"asc\"|\"desc\",
+   default \"desc\"). CURSOR PAGING (`SyncCursorPage`, not the token paging of
+   `environments-files-list`): pass \"after\" = the previous page's
+   \"last_id\" while \"has_more\" is true."
+  ([client] (environments-templates-list client nil))
+  ([client params]
+   (send-request! client "environments-templates-list" :get (templates-path) nil {:query params})))
+
+(defn environments-templates-delete
+  "DELETE {base-url}/agents/environments/templates/{template-id} — the
+   analogue of `client.beta.agents.environments.templates.delete(environment_template_id)`.
+   Returns {\"id\" ... \"deleted\" true \"object\"
+   \"agent.environment.template.deleted\"}."
+  [client template-id]
+  (send-request! client "environments-templates-delete" :delete (templates-path template-id) nil))
 
 ;; ---------------------------------------------------------------------------
 ;; Public API — vaults and vault credentials
