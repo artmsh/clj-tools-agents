@@ -64,7 +64,7 @@ Programmatic Tool Calling below.
 | `max_retries` / automatic backoff | `:max-retries` client opt, default 2 | **Resolved, implemented.** See Retries below. |
 | `client.messages.stream(...)` / `stream=True` | **rejected outright** | Not resolved — this is  an open TODO. |
 | `client.messages.count_tokens(...)` | `(count-tokens client request)` | **Resolved, implemented** — same request shape as `messages-create` minus `max_tokens`, same retry policy and error hierarchy, POSTs to `/v1/messages/count_tokens`. |
-| `.batches.*` | *(not implemented)* | Kept out of scope — a whole separate resource family (create/retrieve/list/cancel/JSONL results), unlike `count_tokens`'s single endpoint. |
+| `client.messages.batches.create/retrieve/list/cancel/delete/results` | `tools.agents.anthropic.batches`: `batches-create`, `batches-retrieve`, `batches-list` (+ `next-page-params`, `batches-list-all`), `batches-cancel`, `batches-delete`, `batches-results` | **Resolved, implemented.** Same client, retries and error typing as `messages-create`. SDK deviations (no pre-flight `retrieve` in `results`, no `workspace_id`/`user_profile_id` kwargs, results buffered then decoded lazily) are listed in Message Batches below. |
 | Workload Identity Federation / `ant auth login` OAuth profile / `ANTHROPIC_PROFILE` | *(not implemented)* | The credential chain here is explicit-arg → `ANTHROPIC_API_KEY` → `ANTHROPIC_AUTH_TOKEN` → throw. The Python SDK's fuller chain (OAuth profile, WIF env vars, default disk profile) is out of scope. |
 | `tools=[...]` / manual `tool_use`/`tool_result` handling | `"tools"` passes straight through `messages-create`; `tool-use?`/`tool-calls`/`add-tool-results`/`add-tool-result` add the response-side/reply-side ergonomics | **New.** See Tool calling below. |
 | `client.beta.messages.create(..., betas=[...])` (Programmatic Tool Calling and other beta features) | `:betas` client opt → comma-joined `anthropic-beta` header | **New.** See Credential resolution below and Programmatic Tool Calling below. |
@@ -187,6 +187,7 @@ for those functions' own failures) and `ex-data` `{:type <keyword> :status
 | other non-2xx (e.g. 413, 529) | `:tools.agents.anthropic.error/api-status` |
 | no response at all (DNS/refused/TLS/timeout) | `:tools.agents.anthropic.error/api-connection` |
 | malformed request/response JSON | `:tools.agents.anthropic.error/json-encode` / `:tools.agents.anthropic.error/json-parse` |
+| empty or non-string message batch id (`tools.agents.anthropic.batches`, before any request) | `:tools.agents.anthropic.error/invalid-argument` |
 | missing credentials (client construction) | `:tools.agents.anthropic.error/missing-credentials` |
 | `:max-retries` is not a non-negative integer (client construction) | `:tools.agents.anthropic.error/invalid-max-retries` |
 | `:stream true` requested | `:tools.agents.anthropic.error/streaming-unsupported` |
@@ -369,6 +370,85 @@ consistency (it widens `add-user-message`/`add-assistant-message` in place
 rather than adding a competing parallel API) and portability (plain functions
 over string-keyed maps, no macros, no new grammar).
 
+### Message Batches
+
+`tools.agents.anthropic.batches` ports `client.messages.batches.*`
+([anthropic-sdk-python `src/anthropic/resources/messages/batches.py`](https://github.com/anthropics/anthropic-sdk-python/blob/eb21a4352015686c30f5759e8c2f02d70f5371e2/src/anthropic/resources/messages/batches.py),
+[API reference](https://platform.claude.com/docs/en/api/messages/batches)):
+
+| function | request | returns |
+|---|---|---|
+| `(batches-create client {"requests" [...]})` | `POST /v1/messages/batches`, body verbatim | MessageBatch map |
+| `(batches-retrieve client id)` | `GET /v1/messages/batches/{id}` | MessageBatch map |
+| `(batches-list client)` / `(batches-list client params)` | `GET /v1/messages/batches?limit&after_id&before_id` | page map `{"data" "has_more" "first_id" "last_id"}` |
+| `(next-page-params params page)` | — (pure) | params for the next page, or `nil` |
+| `(batches-list-all client params)` | pages on demand | lazy seq of MessageBatch maps |
+| `(batches-cancel client id)` | `POST /v1/messages/batches/{id}/cancel`, no body | MessageBatch map |
+| `(batches-delete client id)` | `DELETE /v1/messages/batches/{id}` | `{"id" id "type" "message_batch_deleted"}` |
+| `(batches-results client id)` | `GET /v1/messages/batches/{id}/results`, `accept: application/binary` | lazy seq of decoded JSONL lines |
+
+```clojure
+(require '[tools.agents.anthropic :as a]
+         '[tools.agents.anthropic.batches :as b])
+
+(def client (a/client))
+
+(def batch
+  (b/batches-create client
+    {"requests" [{"custom_id" "q1"
+                  "params" {"model" "claude-haiku-4-5" "max_tokens" 100
+                            "messages" [{"role" "user" "content" "Hello"}]}}]}))
+
+;; poll until processing ends (batches can take up to 24h)
+(loop []
+  (when-not (= "ended" (get (b/batches-retrieve client (get batch "id")) "processing_status"))
+    (Thread/sleep 60000)
+    (recur)))
+
+(doseq [{:strs [custom_id result]} (b/batches-results client (get batch "id"))]
+  (case (get result "type")
+    "succeeded" (println custom_id (a/output-text (get result "message")))
+    "errored"   (println custom_id "failed:" (get-in result ["error" "error" "message"]))
+    (println custom_id (get result "type"))))          ;; "canceled" / "expired"
+
+(take 50 (b/batches-list-all client {"limit" 20}))    ;; newest first, pages fetched on demand
+```
+
+All six calls go through `tools.agents.anthropic/request!`, the general
+request function (method, path, query, body, extra headers, `:as
+:json|:response`), so they share `messages-create`'s credentials,
+`anthropic-version`, `:betas`, retry policy (a 409 on a concurrent batch edit
+is retried like any 408/429/5xx) and error typing. Batches are GA: the SDK
+sends no `anthropic-beta` header for them, and neither does this namespace.
+
+Paging mirrors the SDK's `SyncPage`: `has_more: false` ends paging; when the
+request carried `before_id`, the next page is `{"before_id" first_id}`,
+otherwise `{"after_id" last_id}`; other params such as `limit` carry over.
+
+An `"errored"` result line is data, not an exception. A malformed line throws
+`:tools.agents.anthropic.error/json-parse` (ex-data `:line`) when the seq is
+realized that far. `request-id` works on the returned seq.
+
+Deviations from anthropic-sdk-python:
+
+- **`results` makes one request.** The SDK first calls `retrieve`, raises
+  `AnthropicError` when `results_url` is null, then GETs the absolute
+  `results_url`. Following that URL would bypass `:base-url` (gateways, mock
+  servers) and could send credentials to a different host, so
+  `batches-results` GETs `{base-url}/v1/messages/batches/{id}/results`
+  directly, the path the API reference documents. A batch with no results
+  yet surfaces as the API's typed HTTP error instead.
+- **Results are buffered.** The SDK's `JSONLDecoder` streams the body. Here
+  the body is read into a String inside the retry loop (so no connection
+  leaks on a retried or abandoned attempt) and decoded lazily from it.
+- **No `workspace_id` / `user_profile_id` kwargs** (`anthropic-workspace-id`
+  / `anthropic-user-profile-id` headers), and no per-call
+  `extra_headers`/`extra_query`/`timeout`. Call `tools.agents.anthropic/request!`
+  with `:headers` if you need them.
+- **Empty id** throws `:tools.agents.anthropic.error/invalid-argument` before
+  any request, as the SDK's `ValueError`; the id is percent-encoded into the
+  path, as the SDK's `path_template`.
+
 ### Response visualization
 
 `src/tools/agents/anthropic/visualize.cljc` is a port of anthropic-cookbooks'
@@ -530,6 +610,19 @@ pass-through, or breaking its error wiring, would otherwise pass the suite
 clean). A real retry-then-succeed round trip (for both `messages-create` and
 `count-tokens`) and the tool-calling example's 2-request loop each drive the
 mock server through multiple requests.
+
+`test/tools/agents/anthropic/batches_test.cljc` — the Message Batches
+namespace against the mock server: method, path, query string, verbatim body
+and headers for all six endpoints (including `anthropic-version`, no beta
+header, and `:betas`/`:auth-token` still applied), percent-encoded ids and the
+empty-id guard, `next-page-params` forward/backward paging, `batches-list-all`
+laziness across pages, JSONL results with succeeded/errored/canceled/expired
+lines, blank lines and CRLF, a malformed line's typed parse error, 404 typing
+and a 409 both surfaced (`:max-retries 0`) and retried. Its last test is a
+real-API create → retrieve → list → cancel → poll → results → delete round trip,
+skipped unless `ANTHROPIC_LIVE=1` and `ANTHROPIC_API_KEY` are both set (cost:
+at most one `max_tokens: 1` request at batch rates; delete is skipped, not
+failed, if the batch has not ended within ~60s).
 
 `test/tools/agents/anthropic/spec_test.clj` — asserts each spec both
 accepts a valid value and REJECTS a malformed one (including the exact

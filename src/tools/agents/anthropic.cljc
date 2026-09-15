@@ -23,7 +23,8 @@
    \"max_tokens\").
 
    STREAMING: not implemented. :stream true is rejected with a clear error
-   rather than silently ignored. See README's platform-limitations section."
+   rather than silently ignored. See docs/anthropic.md, section \"Streaming is
+   not supported\"."
   (:require [clojure.string :as str]
             [tools.agents.http :as http]
             [tools.agents.json :as json]))
@@ -75,6 +76,14 @@
    malformed input — never returns a partial result."
   [s]
   ((:read json-codec) s))
+
+(defn read-jsonl
+  "Decode JSON Lines from a String or java.io.Reader into a LAZY seq
+   (tools.agents.json/read-jsonl). Blank lines are skipped. A malformed line
+   throws, when realized, ex-info {:type :tools.agents.anthropic.error/json-parse
+   :line n} with message prefix `tools.agents.anthropic/read-jsonl: line n: `."
+  [src]
+  ((:read-jsonl json-codec) src))
 
 ;; ---------------------------------------------------------------------------
 ;; Process boundary — `getenv` is the env-var seam. Network I/O is
@@ -355,17 +364,16 @@
                           ":auth-token — build it via tools.agents.anthropic/client")
                      {:type :tools.agents.anthropic.error/missing-credentials}))))
 
-(defn- post-json!
-  "POST body-str to url with headers via tools.agents.http/request!,
-   classifying a genuine transport failure (DNS/refused/TLS/timeout — no
-   response at all) as :tools.agents.anthropic.error/api-connection.
-   caller-name (e.g. \"tools.agents.anthropic/messages-create\") prefixes
-   that error's message. An already-typed tools.agents.anthropic.error/*
-   ex-info surfaces verbatim instead — those are permanent, not connection
-   failures."
-  [caller-name url headers body-str]
+(defn- send-http!
+  "One tools.agents.http/request! exchange for req, classifying a genuine
+   transport failure (DNS/refused/TLS/timeout — no response at all) as
+   :tools.agents.anthropic.error/api-connection. caller-name (e.g.
+   \"tools.agents.anthropic/messages-create\") prefixes that error's message.
+   An already-typed tools.agents.anthropic.error/* ex-info surfaces verbatim
+   instead — those are permanent, not connection failures."
+  [caller-name req]
   (try
-    (http/request! {:method :post :url url :headers headers :body body-str})
+    (http/request! req)
     (catch Exception e
       (let [data (ex-data e)]
         (if (and data (keyword? (:type data)) (= "tools.agents.anthropic.error" (namespace (:type data))))
@@ -373,20 +381,29 @@
           (throw (ex-info (str caller-name ": connection failed: " (str e))
                            {:type :tools.agents.anthropic.error/api-connection :status nil :body nil})))))))
 
+(defn- post-json!
+  "POST body-str to url with headers — send-http! with :method :post."
+  [caller-name url headers body-str]
+  (send-http! caller-name {:method :post :url url :headers headers :body body-str}))
+
 (defn- decode-or-throw!
-  "Shared response handling for messages-create/count-tokens: 2xx decodes the
-   body and attaches resp's :headers as metadata (see request-id below),
-   anything else throws a typed ex-info with :status/:body/:headers in
-   ex-data (:headers feeds request-with-retries!'s Retry-After handling)."
-  [caller-name resp]
-  (let [status    (:status resp)
-        resp-body (:body resp)]
-    (if (and status (>= status 200) (< status 300))
-      (with-meta (read-json resp-body) {::headers (:headers resp)})
-      (let [err-msg (extract-error-message resp-body)
-            detail  (cond err-msg err-msg (seq resp-body) resp-body :else nil)]
-        (throw (ex-info (str caller-name ": HTTP " status (when detail (str " " detail)))
-                         {:type (status->type status) :status status :body resp-body :headers (:headers resp)}))))))
+  "Shared response handling for every request: 2xx decodes the body and
+   attaches resp's :headers as metadata (see request-id below) — or, with
+   as :response, returns resp itself untouched — anything else throws a typed
+   ex-info with :status/:body/:headers in ex-data (:headers feeds
+   request-with-retries!'s Retry-After handling)."
+  ([caller-name resp] (decode-or-throw! caller-name resp :json))
+  ([caller-name resp as]
+   (let [status    (:status resp)
+         resp-body (:body resp)]
+     (if (and status (>= status 200) (< status 300))
+       (if (= as :response)
+         resp
+         (with-meta (read-json resp-body) {::headers (:headers resp)}))
+       (let [err-msg (extract-error-message resp-body)
+             detail  (cond err-msg err-msg (seq resp-body) resp-body :else nil)]
+         (throw (ex-info (str caller-name ": HTTP " status (when detail (str " " detail)))
+                          {:type (status->type status) :status status :body resp-body :headers (:headers resp)})))))))
 
 (defn- attempt-request!
   "One HTTP round trip: build headers, POST body-str to url, decode-or-throw!
@@ -413,6 +430,41 @@
     (request-with-retries! (or (:max-retries client) default-max-retries)
                            #(attempt-request! caller-name url headers-fn body-str))))
 
+(defn request!
+  "The general request function every Anthropic resource method can build on
+   (tools.agents.anthropic.batches uses it): one API call under client's
+   retry policy (request-with-retries!), with auth headers rebuilt on EVERY
+   attempt and non-2xx responses typed exactly as messages-create's (see the
+   error-hierarchy table in docs/anthropic.md).
+
+   caller-name prefixes every error message, e.g.
+   \"tools.agents.anthropic.batches/batches-list\". opts:
+     :method   :get | :post | :delete ..., default :post
+     :path     API path starting with \"/\", appended to client's :base-url
+     :query    optional query-params map (tools.agents.http/encode-params)
+     :body     optional request map, JSON-encoded ONCE before the retry loop;
+               nil sends no body
+     :headers  optional extra headers (lower-case string names), merged over
+               the auth headers
+     :as       :json (default) -> the decoded 2xx body with response headers
+               as metadata (request-id works on it);
+               :response -> the 2xx response map {:status :headers :body} with
+               :body an undecoded String
+
+   `content-type: application/json` is sent on bodyless requests too, as
+   anthropic-sdk-python's default_headers do."
+  [client caller-name {:keys [method path query body headers as] :or {method :post as :json}}]
+  (let [url      (api-url (:base-url client) path)
+        body-str (when (some? body) (write-json body))]
+    (request-with-retries!
+     (or (:max-retries client) default-max-retries)
+     (fn []
+       (decode-or-throw! caller-name
+                         (send-http! caller-name {:method method :url url :query query
+                                                  :headers (merge (auth-headers client) headers)
+                                                  :body body-str})
+                         as)))))
+
 (defn messages-create
   "POST request (a plain map, passed through to JSON almost verbatim — model,
    max_tokens, messages, system, temperature, stop_sequences, thinking, tools,
@@ -432,13 +484,13 @@
 
    Throws ex-info on any failure, message prefixed
    \"tools.agents.anthropic/messages-create: \", ex-data
-   {:type <keyword — see the error-hierarchy table in README> :status
+   {:type <keyword — see the error-hierarchy table in docs/anthropic.md> :status
    <http-status-or-nil> :body <raw-response-body-or-nil> :headers
    <response-headers-map-or-nil>}."
   [client request]
   (when (or (true? (get request :stream)) (true? (get request "stream")))
     (throw (ex-info (str "tools.agents.anthropic/messages-create: :stream true is not supported — "
-                          "SSE streaming is not implemented by this client. See README.")
+                          "SSE streaming is not implemented by this client. See docs/anthropic.md.")
                      {:type :tools.agents.anthropic.error/streaming-unsupported})))
   (post-request! client "tools.agents.anthropic/messages-create" "/v1/messages" request))
 
@@ -463,7 +515,7 @@
    The Python SDK exposes this via a hidden attribute on the response
    object; this library has no object to hang it off of — messages-create
    returns the decoded body as a plain map, verbatim, per its
-   data-transparency contract (see README). So the header is carried as
+   data-transparency contract (see docs/anthropic.md, parity table). So the header is carried as
    Clojure metadata on that same map instead, out of the way of equality,
    printing, and JSON re-encoding, rather than as a wire-format map key.
    Use this accessor rather than reading `(meta response)` directly, since
