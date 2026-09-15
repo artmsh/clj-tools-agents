@@ -24,7 +24,8 @@
   ;; A session/environment id containing URL-structural characters must not
   ;; silently reroute the request to a different path — every send-request!
   ;; caller wraps its id argument through this function first.
-  (is (= "sess%2F1%3Fx%3D1" (#'agents/path-segment "sess/1?x=1"))))
+  (is (= "sess%2F1%3Fx%3D1" (#'agents/path-segment "sess/1?x=1")))
+  (is (= "agent_1%2F..%2Fsessions" (#'agents/path-segment "agent_1/../sessions"))))
 
 (deftest query-string-encodes-keyword-values-via-name-not-print-form
   ;; Regression: encoding a keyword VALUE via `str` (its print-form) would

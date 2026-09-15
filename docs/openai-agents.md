@@ -31,14 +31,28 @@ example" is turns (`GET .../sessions/{id}/turns[/{turn_id}]`): the events
 guide links them only through the API reference, so their shape and default
 newest-first order were confirmed against the live API.
 
-Two things the docs show only as SDK method calls, with no literal REST path
-or JSON schema anywhere — saved/reusable `agent` CRUD
-(`client.beta.agents.create/list/retrieve/delete`, distinct from a
-*session's* inline `agent` config, which `sessions-create` passes through
-fine) and the session/environment Artifacts and Files APIs — are deliberately
-**not implemented**, rather than guessed at. Both are additive; nothing here
-would need to change to add them once their wire shape is confirmed the same
-way.
+The API reference is a second accepted source. Each reference HTML page
+advertises a raw Markdown alternate (`<link rel="alternate"
+type="text/markdown">`) at
+`https://developers.openai.com/api/reference/resources/beta/subresources/agents/<...>/index.md`
+(only the `.../index.md` form resolves; `.../methods/create.md` 404s). Those
+pages carry literal endpoint text (`**post** /agents`) plus a `curl` example
+per method, which meets the rule above. Its turns page
+(`.../sessions/subresources/turns/methods/list/index.md`: `after`/`limit`/`order`,
+default `desc`) matches what the live API returned, which is the
+cross-check for trusting the rest. openai-python ships the same paths in
+`src/openai/resources/beta/agents/**` (added in `1c4284a08294`,
+2026-09-10; read at `d421d7ab8c0a`).
+
+Saved (reusable) agent CRUD is implemented from those reference pages:
+[create](https://developers.openai.com/api/reference/resources/beta/subresources/agents/methods/create/index.md),
+[retrieve](https://developers.openai.com/api/reference/resources/beta/subresources/agents/methods/retrieve/index.md),
+[update](https://developers.openai.com/api/reference/resources/beta/subresources/agents/methods/update/index.md),
+[list](https://developers.openai.com/api/reference/resources/beta/subresources/agents/methods/list/index.md),
+[delete](https://developers.openai.com/api/reference/resources/beta/subresources/agents/methods/delete/index.md).
+A saved agent is distinct from a *session's* inline `agent` config, which
+`sessions-create` passes through either way. The session/environment
+Artifacts and Files APIs are still **not implemented**; they are additive.
 
 ## Usage
 
@@ -74,6 +88,21 @@ way.
 ;; Pull the assistant's final text out of the session's saved items.
 (-> (agents/sessions-items-list client (get session "id") {"order" "asc"})
     (agents/items-output-text))
+
+;; Saved agents: store the config once, start sessions from its id.
+(def saved
+  (agents/agents-create client
+    {"model" "gpt-6-astra"
+     "name" "tree-builder"
+     "instructions" "Write clean code, run it, and report the actual output."}))
+
+(agents/agents-update client (get saved "id") {"name" "tree-builder-v2"})  ; omitted fields unchanged
+(agents/sessions-create client
+  {"agent_id" (get saved "id")
+   "environment" {"type" "openai_hosted"}
+   "input" "Print a directory tree."})
+(agents/agents-list client {"limit" 20})   ; page with "after" = "last_id" while "has_more"
+(agents/agents-delete client (get saved "id"))
 ```
 
 See `examples/openai/agents_sandbox_task.clj` for the complete polling loop
@@ -87,6 +116,11 @@ test suite runs it instantly against a mock server) and
 
 | openai-python | tools.agents.openai.agents | Notes |
 |---|---|---|
+| `client.beta.agents.create(**params)` — `POST /v1/agents` (API reference) | `(agents-create client request)` | `"model"` required; `name`, `instructions`, `metadata`, `multi_agent`, `reasoning`, `service_tier`, `text`, `tools` passed through. Returns the `Agent` with defaults resolved. |
+| `client.beta.agents.retrieve(agent_id)` — `GET /v1/agents/{agent_id}` | `(agents-retrieve client agent-id)` | |
+| `client.beta.agents.update(agent_id, **params)` — `POST /v1/agents/{agent_id}` | `(agents-update client agent-id request)` | Omitted fields unchanged; `nil` clears `name`/`instructions`; `"metadata"` replaces wholesale (`nil`/`{}` clears). |
+| `client.beta.agents.list(**params)` — `GET /v1/agents` | `(agents-list client params)` / `(agents-list client)` | Same cursor paging as `sessions-list`: `after`/`limit`/`order` (default `desc`); response has `first_id`/`last_id`/`has_more`. |
+| `client.beta.agents.delete(agent_id)` — `DELETE /v1/agents/{agent_id}` | `(agents-delete client agent-id)` | Returns `{"deleted" true "object" "agent.deleted"}`. Deleting an agent live sessions reference is undocumented. |
 | `client.beta.agents.sessions.create(**params)` | `(sessions-create client request)` | `request` passed through to JSON almost verbatim. Throws immediately on `stream: true` — see Streaming below. |
 | `client.beta.agents.sessions.retrieve(id)` | `(sessions-retrieve client session-id)` | |
 | `client.beta.agents.sessions.list(**params)` | `(sessions-list client params)` / `(sessions-list client)` | `params` is a plain query-param map (`{"limit" 20 "order" "desc" "after" "sess_..."}`); page with `"after"` = the previous page's `"last_id"` while `"has_more"` is true. |
@@ -100,10 +134,9 @@ test suite runs it instantly against a mock server) and
 | `GET /v1/agents/sessions/{id}/turns/{turn_id}` (API reference; verified live) | `(sessions-turns-retrieve client session-id turn-id)` | |
 | *(no SDK helper)* | `(latest-root-turn turns-response)` / `(turn-finished? turn)` | Pure: newest turn with `"subagent_id"` nil; terminal status check. See Streaming below. |
 | `item.content[…].text` traversal (no single SDK helper — see below) | `(items-output-text items-response)` | Concatenates every assistant `output_text` block, oldest-first when called with `{"order" "asc"}`. Deliberately more lenient than `tools.agents.openai/output-text` on a non-array `"content"`; see [divergences.md](divergences.md). |
-| `GET /v1/agents/environments/{id}` (literal endpoint text, not an SDK example) | `(environments-retrieve client environment-id)` | Poll an `openai_hosted` sandbox's provisioning state: `"provisioning"` → `"connected"`/`"failed"`. |
+| `GET /v1/agents/environments/{id}` (literal endpoint text, API reference) | `(environments-retrieve client environment-id)` | Poll a sandbox's `"status"`: `"pending"`, `"connected"`, `"disconnected"`, `"expired"` or `"failed"` (API reference). Also carries `"type"`, `"files"`, `"plugins"`, `"skills"`. |
 | `codex exec-server --remote ... --environment-id ...` (shell, not an SDK call) | `(self-hosted-executor-command session)` | Pure function from a created self-hosted session to the executor's argv — see Self-hosted sandboxes below for what this library does and does not do here. |
-| `client.beta.agents.create/list/retrieve/delete` (saved, reusable agent config) | *(not implemented)* | No literal REST path or schema shown anywhere in OpenAI's docs — see the primary-source note above. `sessions-create`'s inline `"agent"` / `"agent_id"` fields are unaffected and pass through fine. |
-| Artifacts / environment Files APIs | *(not implemented)* | Same reason. |
+| Artifacts / environment Files APIs | *(not implemented)* | Additive; see the primary-source note above. |
 | `client.beta.agents.sessions.create(..., stream=True)` / `.events.stream(...)` | **rejected outright** / *(not implemented)* | See Streaming below. |
 
 ### Credentials & headers
@@ -271,8 +304,10 @@ isolation.
 
 `test/tools/agents/openai/agents/live_test.cljc` runs the same local mock
 server the sibling suites share (`tools.agents.test-support`): request
-method/path/headers/body for every resource method, query-string building
-for `sessions-list`/`sessions-items-list`/`sessions-turns-list` (compared as parsed params, not an
+method/path/headers/body for every resource method (including the five
+`agents-*` saved-agent methods, `nil` reaching `agents-update`'s body as JSON
+null, and a 404 on `agents-retrieve` typed `not-found-error`), query-string building
+for `sessions-list`/`agents-list`/`sessions-items-list`/`sessions-turns-list` (compared as parsed params, not an
 exact string, since neither this library's `query-string` builder nor a
 Clojure map's own iteration order guarantees key order), the exact wire
 shape of `send-message`/`cancel-turn`/`send-tool-result`, non-2xx errors
@@ -285,6 +320,13 @@ server — including the live no-credits shape (session `"idle"`, items holding
 only the input, the turn `"failed"` with `credit_balance_exhausted`) surfacing
 through `run-example`'s `:turn`, and the polling example's timeout path, with `sleep-fn`
 injected so none of it costs real wall-clock.
+
+One test in that file hits the real API:
+`agents-crud-round-trip-against-the-real-api` runs create → retrieve →
+update → list contains → delete → retrieve 404. It runs no inference (no
+model tokens) and passes as skipped unless `OPENAI_API_KEY` is set. It
+targets `https://api.openai.com/v1` (override: `OPENAI_AGENTS_BASE_URL`;
+model: `OPENAI_AGENTS_MODEL`, default `gpt-5.5`).
 
 Port range `19000`–`19039` — chosen not to collide with the sibling suites'
 ranges (anthropic `18930`–`18975`, gemini `18980`–`18997`, openai

@@ -164,6 +164,132 @@
       (finally (stop!)))))
 
 ;; ---------------------------------------------------------------------------
+;; saved agents: agents-create / -retrieve / -update / -list / -delete
+;; Fixtures follow the API reference's example responses.
+;; ---------------------------------------------------------------------------
+
+(defn- canned-agent [id name]
+  (str "{\"id\":\"" id "\",\"object\":\"agent\",\"created_at\":1789413451,\"updated_at\":1789413451,"
+       "\"model\":\"gpt-6-astra\",\"name\":" (if name (str "\"" name "\"") "null") ","
+       "\"instructions\":null,\"metadata\":{\"team\":\"docs\"},"
+       "\"multi_agent\":{\"enabled\":false,\"max_concurrent_subagents\":null},"
+       "\"reasoning\":{\"effort\":\"medium\",\"summary\":null},\"service_tier\":\"auto\","
+       "\"text\":{\"format\":{\"type\":\"text\"},\"verbosity\":\"medium\"},\"tools\":[]}"))
+
+(deftest agents-create-posts-to-agents-with-beta-header-and-body
+  (let [captured (atom nil)
+        {:keys [port stop!]} (start-server! 19025 "/v1/agents"
+                                (fn [req] (reset! captured req) {:status 200 :body (canned-agent "agent_1" "helper")}))]
+    (try
+      (let [client (oai/client {:api-key "k" :base-url (base-url port)})
+            agent  (agents/agents-create client {"model" "gpt-6-astra" "name" "helper"
+                                                 "metadata" {"team" "docs"}
+                                                 "reasoning" {"effort" "medium"}})]
+        (is (= "agent_1" (get agent "id")))
+        (is (= "agent" (get agent "object")))
+        (is (= "docs" (get-in agent ["metadata" "team"])))
+        (let [req @captured]
+          (is (= "POST" (:method req)))
+          (is (= "/v1/agents" (:path req)))
+          (is (nil? (:query req)))
+          (is (= "agents=v1" (get (:headers req) "openai-beta")))
+          (is (= "application/json" (get (:headers req) "content-type")))
+          (is (str/includes? (:body req) "\"model\":\"gpt-6-astra\""))
+          (is (str/includes? (:body req) "\"name\":\"helper\""))
+          (is (str/includes? (:body req) "\"metadata\":{\"team\":\"docs\"}"))
+          (is (str/includes? (:body req) "\"reasoning\":{\"effort\":\"medium\"}"))))
+      (finally (stop!)))))
+
+(deftest agents-retrieve-gets-by-id
+  (let [captured (atom nil)
+        {:keys [port stop!]} (start-server! 19026 "/v1/agents"
+                                (fn [req] (reset! captured req) {:status 200 :body (canned-agent "agent_42" nil)}))]
+    (try
+      (let [client (oai/client {:api-key "k" :base-url (base-url port)})
+            agent  (agents/agents-retrieve client "agent_42")]
+        (is (= "GET" (:method @captured)))
+        (is (= "/v1/agents/agent_42" (:path @captured)))
+        (is (= "agents=v1" (get-in @captured [:headers "openai-beta"])))
+        (is (= "agent_42" (get agent "id")))
+        (is (nil? (get agent "name"))))
+      (finally (stop!)))))
+
+(deftest agents-update-posts-to-the-agent-and-sends-null-to-clear
+  ;; nil must reach the wire as JSON null: the reference defines null as
+  ;; "clear" for name/instructions/metadata, distinct from omitting the key.
+  (let [captured (atom nil)
+        {:keys [port stop!]} (start-server! 19027 "/v1/agents"
+                                (fn [req] (reset! captured req) {:status 200 :body (canned-agent "agent_1" "renamed")}))]
+    (try
+      (let [client (oai/client {:api-key "k" :base-url (base-url port)})
+            agent  (agents/agents-update client "agent_1" {"name" "renamed" "instructions" nil})]
+        (is (= "POST" (:method @captured)))
+        (is (= "/v1/agents/agent_1" (:path @captured)))
+        (is (str/includes? (:body @captured) "\"name\":\"renamed\""))
+        (is (str/includes? (:body @captured) "\"instructions\":null"))
+        (is (not (str/includes? (:body @captured) "\"model\"")))
+        (is (= "renamed" (get agent "name"))))
+      (finally (stop!)))))
+
+(deftest agents-list-sends-cursor-params-and-decodes-the-page
+  (let [captured (atom nil)
+        {:keys [port stop!]} (start-server! 19028 "/v1/agents"
+                                (fn [req] (reset! captured req)
+                                  {:status 200
+                                   :body (str "{\"object\":\"list\",\"data\":[" (canned-agent "agent_2" "b") ","
+                                              (canned-agent "agent_3" "c") "],"
+                                              "\"first_id\":\"agent_2\",\"last_id\":\"agent_3\",\"has_more\":true}")}))]
+    (try
+      (let [client (oai/client {:api-key "k" :base-url (base-url port)})
+            page   (agents/agents-list client {"after" "agent_1" "limit" 2 "order" :asc})]
+        (is (= "GET" (:method @captured)))
+        (is (= "/v1/agents" (:path @captured)))
+        (is (= {"after" "agent_1" "limit" "2" "order" "asc"} (parse-query (:query @captured))))
+        (is (= ["agent_2" "agent_3"] (mapv #(get % "id") (get page "data"))))
+        (is (true? (get page "has_more")))
+        (is (= "agent_3" (get page "last_id"))))
+      (finally (stop!)))))
+
+(deftest agents-list-with-no-params-sends-no-query-string
+  (let [captured (atom nil)
+        {:keys [port stop!]} (start-server! 19029 "/v1/agents"
+                                (fn [req] (reset! captured req)
+                                  {:status 200 :body "{\"object\":\"list\",\"data\":[],\"first_id\":null,\"last_id\":null,\"has_more\":false}"}))]
+    (try
+      (let [client (oai/client {:api-key "k" :base-url (base-url port)})
+            page   (agents/agents-list client)]
+        (is (= "/v1/agents" (:path @captured)))
+        (is (nil? (:query @captured)))
+        (is (= [] (get page "data"))))
+      (finally (stop!)))))
+
+(deftest agents-delete-sends-delete
+  (let [captured (atom nil)
+        {:keys [port stop!]} (start-server! 19030 "/v1/agents"
+                                (fn [req] (reset! captured req)
+                                  {:status 200 :body "{\"id\":\"agent_1\",\"deleted\":true,\"object\":\"agent.deleted\"}"}))]
+    (try
+      (let [client (oai/client {:api-key "k" :base-url (base-url port)})
+            result (agents/agents-delete client "agent_1")]
+        (is (= "DELETE" (:method @captured)))
+        (is (= "/v1/agents/agent_1" (:path @captured)))
+        (is (= "agents=v1" (get-in @captured [:headers "openai-beta"])))
+        (is (true? (get result "deleted")))
+        (is (= "agent.deleted" (get result "object"))))
+      (finally (stop!)))))
+
+(deftest agents-retrieve-404-maps-to-not-found
+  (let [{:keys [port stop!]} (start-server! 19031 "/v1/agents"
+                                (fn [_] {:status 404 :body "{\"error\":{\"message\":\"No such agent\"}}"}))]
+    (try
+      (let [client (oai/client {:api-key "k" :base-url (base-url port) :max-retries 0})
+            e (try (agents/agents-retrieve client "agent_missing") nil (catch Exception e e))]
+        (is (= :tools.agents.openai/not-found-error (:type (ex-data e))))
+        (is (= 404 (:status (ex-data e))))
+        (is (str/starts-with? (str (ex-message e)) "tools.agents.openai.agents/agents-retrieve: HTTP 404 No such agent")))
+      (finally (stop!)))))
+
+;; ---------------------------------------------------------------------------
 ;; events: send-message / cancel-turn / send-tool-result
 ;; ---------------------------------------------------------------------------
 
@@ -514,3 +640,46 @@
                 "--environment-id" "ccarenv_1"]
                executor-command)))
       (finally (stop!)))))
+
+;; ---------------------------------------------------------------------------
+;; REAL-API saved-agent CRUD round trip — the one test in this file that
+;; talks to OpenAI. Skipped (a single passing assertion) unless both
+;; OPENAI_AGENTS_LIVE=1 and OPENAI_API_KEY are set, so a key merely present in
+;; the environment never makes the regular suite hit the network. Agent CRUD runs no inference, so it costs no model
+;; tokens. Base URL defaults to https://api.openai.com/v1 regardless of
+;; OPENAI_BASE_URL (which script/live_check.clj points at a gateway without
+;; /agents); override with OPENAI_AGENTS_BASE_URL. Model: OPENAI_AGENTS_MODEL.
+;; ---------------------------------------------------------------------------
+
+(defn- env [k default] (let [v (System/getenv k)] (if (seq v) v default)))
+
+(deftest agents-crud-round-trip-against-the-real-api
+  (if-let [api-key (and (= "1" (System/getenv "OPENAI_AGENTS_LIVE"))
+                       (not-empty (System/getenv "OPENAI_API_KEY")))]
+    (let [client  (oai/client {:api-key api-key
+                               :base-url (env "OPENAI_AGENTS_BASE_URL" "https://api.openai.com/v1")})
+          model   (env "OPENAI_AGENTS_MODEL" "gpt-5.5")
+          created (agents/agents-create client {"model" model "name" "clj-tools-agents-live-test"
+                                                "metadata" {"probe" "1"}})
+          id      (get created "id")]
+      (try
+        (is (string? id))
+        (is (= "agent" (get created "object")))
+        (is (= "clj-tools-agents-live-test" (get created "name")))
+        (is (= id (get (agents/agents-retrieve client id) "id")))
+        (let [updated (agents/agents-update client id {"name" "clj-tools-agents-live-test-2"})]
+          (is (= "clj-tools-agents-live-test-2" (get updated "name")))
+          (is (= model (get updated "model")) "omitted fields are left unchanged"))
+        (let [page (agents/agents-list client {"limit" 100})]
+          (is (= "list" (get page "object")))
+          (is (some #(= id (get % "id")) (get page "data"))))
+        (let [deleted (agents/agents-delete client id)]
+          (is (true? (get deleted "deleted")))
+          (is (= "agent.deleted" (get deleted "object"))))
+        (let [e (try (agents/agents-retrieve client id) nil (catch Exception e e))]
+          (is (= :tools.agents.openai/not-found-error (:type (ex-data e)))))
+        (catch Exception e
+          ;; best-effort cleanup when a step before delete threw
+          (try (agents/agents-delete client id) (catch Exception _ nil))
+          (throw e))))
+    (is true "skipped: set OPENAI_AGENTS_LIVE=1 and OPENAI_API_KEY")))

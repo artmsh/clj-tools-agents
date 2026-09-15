@@ -28,17 +28,24 @@
      architecture,quickstart,sessions,sessions/manage,sessions/webhooks,
      configuration,tools/functions,environments/{openai-hosted,self-hosted,
      files}}.md
+   plus the API reference's raw Markdown alternates (each reference HTML page
+   advertises one via `<link rel=\"alternate\" type=\"text/markdown\">`):
+     https://developers.openai.com/api/reference/resources/beta/subresources/
+     agents/{methods/{create,retrieve,update,list,delete},subresources/...}/index.md
+   Those pages carry literal endpoint text (\"**post** /agents\") and a
+   `curl` example per method; their turns page matches the paging behaviour
+   confirmed against the live API. openai-python's
+   `src/openai/resources/beta/agents/**` (added in 1c4284a08294, 2026-09-10)
+   ships the same paths.
    Every path and JSON shape below is one shown verbatim in a `curl` example
-   or literal endpoint text on those pages. Two things those pages document
-   only as SDK method calls, with no literal REST path or schema shown, are
-   deliberately NOT implemented here rather than guessed at: saved/reusable
-   `agent` CRUD (`client.beta.agents.create/list/retrieve/delete`, distinct
-   from a SESSION's inline `agent` config, which `sessions-create` passes
-   through fine) and the session/environment Artifacts and Files APIs. Both
-   are additive — nothing here would need to change to add them once their
-   wire shape is confirmed the same way.
+   or literal endpoint text on those pages. Saved/reusable agent CRUD
+   (`agents-create` etc.) is sourced from the reference pages. The
+   session/environment Artifacts and Files APIs are still not implemented
+   here; they are additive.
 
    SCOPE — what this namespace covers:
+     - Saved (reusable) agents: create, retrieve, update, list (paginated),
+       delete.
      - Session lifecycle: create, retrieve, list (paginated), delete.
      - Turn input: send a message, steer or cancel the active turn, return a
        pending function-tool result.
@@ -248,6 +255,79 @@
                                     :retries-taken retries-taken})))))))))))
 
 ;; ---------------------------------------------------------------------------
+;; Public API — saved (reusable) agents
+;;
+;; Source: https://developers.openai.com/api/reference/resources/beta/subresources/agents/methods/{create,retrieve,update,list,delete}/index.md
+;; and openai-python src/openai/resources/beta/agents/agents.py.
+;; ---------------------------------------------------------------------------
+
+(defn agents-create
+  "POST {base-url}/agents — create a reusable agent (no credentials stored),
+   the analogue of `client.beta.agents.create(**params)`. `request` is a
+   plain map passed through to JSON verbatim:
+
+     \"model\"         required
+     \"instructions\"  appended to the default base instructions
+     \"name\"          human-readable name
+     \"metadata\"      up to 16 string pairs (key <= 64, value <= 512 chars)
+     \"multi_agent\"   {\"enabled\" bool \"max_concurrent_subagents\" n}
+     \"reasoning\"     {\"effort\" \"none\"|\"minimal\"|\"low\"|\"medium\"|
+                      \"high\"|\"xhigh\"|\"max\"
+                      \"summary\" \"concise\"|\"detailed\"|\"auto\"}
+     \"service_tier\"  \"auto\"|\"default\"|\"flex\"|\"priority\"|\"fast\"
+     \"text\"          {\"format\" {\"type\" \"text\"} or
+                      {\"type\" \"json_schema\" \"schema\" {...}}
+                      \"verbosity\" \"low\"|\"medium\"|\"high\"}
+     \"tools\"         \"function\", \"tool_search\",
+                      \"programmatic_tool_calling\", \"mcp\" (credential-free;
+                      \"credential_id\" picks a vault credential) or
+                      \"web_search\" entries
+
+   Returns the `Agent`: \"id\", \"object\" \"agent\", \"created_at\",
+   \"updated_at\" and every field above with server defaults resolved. Pass
+   its \"id\" as `sessions-create`'s \"agent_id\". Throws ex-info on any
+   failure, typed as `sessions-create` documents."
+  [client request]
+  (send-request! client "agents-create" :post "/agents" request))
+
+(defn agents-retrieve
+  "GET {base-url}/agents/{agent-id} — the analogue of
+   `client.beta.agents.retrieve(agent_id)`. Returns the `Agent`. An unknown
+   id throws `:tools.agents.openai/not-found-error`."
+  [client agent-id]
+  (send-request! client "agents-retrieve" :get (str "/agents/" (path-segment agent-id)) nil))
+
+(defn agents-update
+  "POST {base-url}/agents/{agent-id} — the analogue of
+   `client.beta.agents.update(agent_id, **params)`. `request` takes the same
+   fields as `agents-create`, all optional (\"model\" included) and passed
+   through verbatim. Per the API reference: an omitted field is left
+   unchanged; \"name\" and \"instructions\" set to nil clear them;
+   \"metadata\" REPLACES all metadata (nil or {} clears it). Returns the
+   updated `Agent`."
+  [client agent-id request]
+  (send-request! client "agents-update" :post (str "/agents/" (path-segment agent-id)) request))
+
+(defn agents-list
+  "GET {base-url}/agents — the project's reusable agents, the analogue of
+   `client.beta.agents.list(**params)`. `params`, if given, is a plain map of
+   query parameters: \"after\", \"limit\", \"order\" (\"asc\"|\"desc\",
+   default \"desc\"). Page with `\"after\"` set to the previous page's
+   `\"last_id\"` while `\"has_more\"` is true in the response, exactly as
+   OpenAI's own cursor pagination works (keep \"order\" fixed across pages)."
+  ([client] (agents-list client nil))
+  ([client params]
+   (send-request! client "agents-list" :get (str "/agents" (query-string params)) nil)))
+
+(defn agents-delete
+  "DELETE {base-url}/agents/{agent-id} — the analogue of
+   `client.beta.agents.delete(agent_id)`. Returns
+   {\"id\" ... \"deleted\" true \"object\" \"agent.deleted\"}. The reference
+   does not document deleting an agent that sessions still reference."
+  [client agent-id]
+  (send-request! client "agents-delete" :delete (str "/agents/" (path-segment agent-id)) nil))
+
+;; ---------------------------------------------------------------------------
 ;; Public API — sessions
 ;; ---------------------------------------------------------------------------
 
@@ -259,6 +339,7 @@
      \"agent\"       {\"model\" ... \"instructions\" ...} — inline agent
                     config (or use \"agent_id\" to reuse a saved agent)
      \"agent_id\"    reuse a saved agent's configuration for this session
+                    (an \"id\" from `agents-create` / `agents-list`)
      \"environment\" {\"type\" \"none\"|\"openai_hosted\"|\"self_hosted\" ...}
      \"input\"       a bare string, or an array of
                     {\"role\" \"user\" \"content\" [{\"type\" \"input_text\"
@@ -497,13 +578,15 @@
 ;; ---------------------------------------------------------------------------
 
 (defn environments-retrieve
-  "GET {base-url}/agents/environments/{environment-id} — poll an
-   `openai_hosted` sandbox's provisioning state, using the session's own
-   `environment.id` (from `sessions-create`'s response, or `sessions-retrieve`
-   thereafter). \"provisioning\" means setup is still running, \"connected\"
-   means the agent can run commands, \"failed\" means setup errored (read
-   `environment.error` off the `agent.session.environment.failed` event —
-   this endpoint's own response does not carry it, per OpenAI's docs)."
+  "GET {base-url}/agents/environments/{environment-id} — poll a
+   sandbox's connection state, using the session's own `environment.id`
+   (from `sessions-create`'s response, or `sessions-retrieve` thereafter).
+   \"status\" is one of \"pending\", \"connected\", \"disconnected\",
+   \"expired\" or \"failed\" (API reference); \"connected\" means the agent
+   can run commands. The response also carries \"type\" (\"openai_hosted\"
+   or \"self_hosted\") and the installed \"files\", \"plugins\" and
+   \"skills\" (metadata only). It does not carry a failure reason: read
+   `environment.error` off the `agent.session.environment.failed` event."
   [client environment-id]
   (send-request! client "environments-retrieve" :get (str "/agents/environments/" (path-segment environment-id)) nil))
 
