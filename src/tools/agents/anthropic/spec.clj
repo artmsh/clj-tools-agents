@@ -73,6 +73,7 @@
 (s/def ::api-key string?)
 (s/def ::auth-token string?)
 (s/def ::credential-source token/token-source?)
+(s/def ::profile string?)
 (s/def ::base-url string?)
 (s/def ::max-retries (s/and int? #(>= % 0)))
 
@@ -82,7 +83,7 @@
 ;; concern resolve-credentials owns, not a static shape concern this spec
 ;; should duplicate.
 (s/def ::client-opts
-  (s/keys :opt-un [::api-key ::auth-token ::credential-source ::base-url ::max-retries]))
+  (s/keys :opt-un [::api-key ::auth-token ::credential-source ::profile ::base-url ::max-retries]))
 
 ;; The AnthropicClient record `client` RETURNS — unlike ::client-opts,
 ;; credential resolution has
@@ -132,6 +133,9 @@
     :tools.agents.anthropic.error/json-parse
     :tools.agents.anthropic.error/missing-credentials
     :tools.agents.anthropic.error/invalid-credentials
+    :tools.agents.anthropic.error/identity-token
+    :tools.agents.anthropic.error/token-exchange
+    :tools.agents.anthropic.error/profile
     :tools.agents.anthropic.error/invalid-max-retries
     :tools.agents.anthropic.error/streaming-unsupported
     :tools.agents.anthropic.error/invalid-response

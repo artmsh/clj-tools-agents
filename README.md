@@ -104,6 +104,12 @@ openai (and so openai.agents) and gemini clients:
   `ANTHROPIC_ORGANIZATION_ID` and `ANTHROPIC_IDENTITY_TOKEN[_FILE]` when no
   static Anthropic key or token is set. See
   [docs/anthropic.md](docs/anthropic.md#workload-identity-federation).
+- **Anthropic profiles** (#36): `ANTHROPIC_PROFILE` / `ANTHROPIC_CONFIG_DIR`
+  / `active_config` / `~/.config/anthropic/configs/default.json`, or
+  `(anthropic/client {:profile "work"})`. `user_oauth` profiles refresh with
+  a `refresh_token` grant and write the new tokens back atomically (0600);
+  `oidc_federation` profiles run WIF with a disk cache. See
+  [docs/anthropic.md](docs/anthropic.md#profiles).
 - **OpenAI Workload Identity Federation** (#38):
   `tools.agents.openai.credentials/workload-identity-source` with a subject
   token provider (`k8s-service-account-token-provider`,

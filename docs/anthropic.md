@@ -67,7 +67,7 @@ Programmatic Tool Calling below.
 | `client.messages.count_tokens(...)` | `(count-tokens client request)` | **Resolved, implemented** — same request shape as `messages-create` minus `max_tokens`, same retry policy and error hierarchy, POSTs to `/v1/messages/count_tokens`. |
 | `client.messages.batches.create/retrieve/list/cancel/delete/results` | `tools.agents.anthropic.batches`: `batches-create`, `batches-retrieve`, `batches-list` (+ `next-page-params`, `batches-list-all`), `batches-cancel`, `batches-delete`, `batches-results` | **Resolved, implemented.** Same client, retries and error typing as `messages-create`. SDK deviations (no pre-flight `retrieve` in `results`, no `workspace_id`/`user_profile_id` kwargs, results buffered then decoded lazily) are listed in Message Batches below. |
 | Workload Identity Federation: `WorkloadIdentityCredentials`, `ANTHROPIC_FEDERATION_RULE_ID` + `ANTHROPIC_ORGANIZATION_ID` + `ANTHROPIC_IDENTITY_TOKEN[_FILE]` | `tools.agents.anthropic.credentials`: `workload-identity-source`, `workload-identity-from-env`, `exchange-token!`; env discovery is step 4 of `client`'s chain | **Resolved, implemented** (#35). See Workload Identity Federation below. Verified against a fake token endpoint only. |
-| `ANTHROPIC_PROFILE` / `ANTHROPIC_CONFIG_DIR` / `profile=` / `config=` profiles (files written by `ant auth login`) | *(not implemented, #36)* | Chain steps 3 and 5. Hook points are marked in `resolve-client-credentials`. |
+| `ANTHROPIC_PROFILE` / `ANTHROPIC_CONFIG_DIR` / `active_config` / `profile=` profiles (`CredentialsFile`: `user_oauth` refresh with write-back, externally rotated files, `oidc_federation` with disk cache) | `:profile` client opt; `tools.agents.anthropic.credentials`: `profile-source`, `profile-from-env`, `fallback-profile`, `config-dir`, `active-profile`; chain steps 3 and 5 of `client` | **Resolved, implemented** (#36). See Profiles below. `config=` (`InMemoryConfig`) is not ported. Verified against temp config dirs and a fake token endpoint only. |
 | `tools=[...]` / manual `tool_use`/`tool_result` handling | `"tools"` passes straight through `messages-create`; `tool-use?`/`tool-calls`/`add-tool-results`/`add-tool-result` add the response-side/reply-side ergonomics | **New.** See Tool calling below. |
 | `client.beta.messages.create(..., betas=[...])` (Programmatic Tool Calling and other beta features) | `:betas` client opt → comma-joined `anthropic-beta` header | **New.** See Credential resolution below and Programmatic Tool Calling below. |
 | `message._request_id` | `(request-id response)` | **Resolved.** The Python SDK hangs this off a hidden attribute on the response object; `messages-create`/`count-tokens` return a plain map, verbatim, per the data-transparency contract above — so the `request-id` response header is carried as Clojure metadata on that same map instead (out of the way of equality, printing, and JSON re-encoding) and `request-id` reads it back. Returns `nil` for a hand-built map or a response genuinely missing the header. For most logging/correlation purposes the response body's own `"id"` field (`msg_...`) needs no accessor and works just as well. |
@@ -79,15 +79,16 @@ Precedence, first match wins (anthropic-sdk-python v1.5.0 @ `eb21a435`,
 
 | step | source | result | status |
 |---|---|---|---|
-| 1 | explicit `:credential-source`, else `:api-key` → `:auth-token` | as given; any explicit credential disables env lookup | implemented |
+| 1 | explicit `:profile` or `:credential-source`, else `:api-key` → `:auth-token` | as given; any explicit credential disables env lookup | implemented (`:profile` #36) |
 | 2 | `ANTHROPIC_API_KEY` → `ANTHROPIC_AUTH_TOKEN` (empty = unset) | `x-api-key` / static Bearer | implemented |
-| 3 | explicit profile: `ANTHROPIC_PROFILE`, `ANTHROPIC_CONFIG_DIR` or an `active_config` pointer; errors propagate | profile credential | **not implemented (#36)** |
+| 3 | explicit profile: `ANTHROPIC_PROFILE`, `ANTHROPIC_CONFIG_DIR` or a non-empty `active_config` pointer (`_chain.py:116-129`); errors propagate | refreshable `:credential-source` + profile `workspace_id` header + profile `base_url` | implemented (#36, `profile-from-env`) |
 | 4 | WIF env: `ANTHROPIC_FEDERATION_RULE_ID` + `ANTHROPIC_ORGANIZATION_ID` + `ANTHROPIC_IDENTITY_TOKEN_FILE` or `ANTHROPIC_IDENTITY_TOKEN` | refreshable `:credential-source` (jwt-bearer exchange) | implemented (#35) |
-| 5 | fallback on-disk profile (`configs/<active or default>.json`); errors swallowed | profile credential | **not implemented (#36)** |
+| 5 | fallback on-disk profile: `configs/<active>.json` is a file (`_chain.py:138-153`, `_constants.py:193-205`); config errors swallowed | as step 3 | implemented (#36, `fallback-profile`) |
 | — | nothing matched | throws `missing-credentials` | implemented |
 
-Combining `:credential-source` with `:api-key`/`:auth-token` throws
-`invalid-credentials`. Steps 1–2 are exactly the public
+Combining `:credential-source` or `:profile` with each other or with
+`:api-key`/`:auth-token` throws `invalid-credentials` (the SDK lets a static
+credential win with a warning). Steps 1–2 are exactly the public
 `resolve-credentials`, unchanged; the chain lives in the private
 `resolve-client-credentials`, which `client` calls with its resolved base
 URL. Step 4 sits between 3 and 5 so a leftover default profile never beats
@@ -217,6 +218,110 @@ the SDK's federation-rule hint. The `request-id` response header is in
 Verified only against a fake token endpoint (`credentials_test.cljc`); no
 live WIF credentials were available.
 
+### Profiles
+
+Port of anthropic-sdk-python v1.5.0 @ `eb21a435` `CredentialsFile`
+(`src/anthropic/lib/credentials/_providers.py:146-733`), the reader of the
+files the `ant` CLI writes. The SDK has no login flow; neither does this
+library. A profile is a pair of JSON files under the config directory:
+
+```clojure
+(anthropic/client)                      ; ANTHROPIC_PROFILE / active_config / configs/default.json
+(anthropic/client {:profile "work"})    ; explicit, SDK profile=
+(credentials/profile-source {:profile "work" :config-dir "/etc/anthropic"})
+;; => {:credential-source <TokenSource> :profile "work"
+;;     :credential-headers {"anthropic-workspace-id" "wrkspc_..."} :base-url nil}
+```
+
+Directory and name (`_constants.py:67-190`):
+
+- Config dir: `ANTHROPIC_CONFIG_DIR` (non-empty), else `~/.config/anthropic`
+  on Linux **and macOS** (the SDK explicitly rejects `~/Library/Application
+  Support`), else `%APPDATA%\Anthropic` on Windows.
+- Active profile: `ANTHROPIC_PROFILE` (non-empty) > trimmed
+  `<config-dir>/active_config` > `"default"`.
+- Names must be non-empty, without surrounding whitespace, leading `.`, `/`,
+  `\` or NUL; `configs/<p>.json` and `credentials/<p>.json` must
+  canonicalize under the config dir (a symlinked `configs/` cannot escape).
+
+`configs/<profile>.json` (not secret; read once, at client construction):
+
+| field | meaning |
+|---|---|
+| `authentication.type` | `user_oauth` or `oidc_federation` (`_providers.py:83-84`); anything else fails on the first token |
+| `authentication.client_id` | `user_oauth`: present → refresh_token grants; absent → externally rotated file |
+| `authentication.credentials_path` | overrides `credentials/<profile>.json`; leading `~` expanded (`_providers.py:346-350`) |
+| `authentication.federation_rule_id`, `service_account_id`, `identity_token` `{"source":"file","path":…}` | `oidc_federation` exchange inputs; any other `source` throws (`_providers.py:700-718`) |
+| `organization_id` | `oidc_federation` exchange input |
+| `workspace_id` | `user_oauth`: sent as `anthropic-workspace-id` on every request; `oidc_federation`: sent in the exchange body instead (`_providers.py:287-302`) |
+| `base_url` | used by the client when neither `:base-url` nor `ANTHROPIC_BASE_URL` is set, and as the token endpoint host |
+
+Env vars fill only fields the file leaves absent or empty
+(`_providers.py:87-116`): `ANTHROPIC_BASE_URL`, `ANTHROPIC_ORGANIZATION_ID`,
+`ANTHROPIC_WORKSPACE_ID`; for `oidc_federation` also
+`ANTHROPIC_FEDERATION_RULE_ID`, `ANTHROPIC_SERVICE_ACCOUNT_ID`,
+`ANTHROPIC_SCOPE`, `ANTHROPIC_IDENTITY_TOKEN_FILE`. `client_id` is never
+env-filled.
+
+`credentials/<profile>.json` (secret; re-read on every token fetch):
+`{"version": "1.0", "type": "oauth_token", "access_token", "expires_at": <int unix seconds or null>, "refresh_token"}`.
+On POSIX a symlink or any group/other permission bit is refused
+(`_providers.py:369-386`). `type`, if present, must be `oauth_token`.
+`expires_at` must be an integer (or numeric string); ISO 8601 is rejected
+(`_providers.py:59-71`).
+
+`user_oauth` (`_providers.py:509-617`):
+
+- Without `client_id`: whatever the file holds, never refreshed.
+- With `client_id`: the disk token while `now < expires_at` (strict; the
+  cache's 120 s skew only makes it re-read the file sooner, so a refresh by
+  another process is picked up). Otherwise
+  `POST {base}/v1/oauth/token` with JSON
+  `{"grant_type": "refresh_token", "refresh_token", "client_id"}` and
+  `anthropic-beta: oauth-2025-04-20` **only**: the
+  `oidc-federation-2026-04-01` flag would route the grant to the jwt-bearer
+  handler (`_constants.py:18-28`). No client secret, no `scope`.
+- Response: `access_token` required; `expires_in` defaults to 3600;
+  `refresh_token` replaces the stored one when present (rotation). Non-200
+  is an error.
+- Write-back (`_providers.py:447-487,608-615`): the existing file map with
+  `version`, `type`, `access_token`, `expires_at` (seconds) and
+  `refresh_token` updated, unknown fields kept. A temp file is created
+  **0600** in the same directory (parent created 0700 if missing), written,
+  fsynced, then renamed over the target with `ATOMIC_MOVE`. On failure the
+  temp file is removed, the original is untouched, and the call **throws**
+  `profile`: the server may already have rotated the refresh token. No file
+  lock (the SDK has none): two processes refreshing at once can invalidate
+  each other's refresh token.
+
+`oidc_federation` (`_providers.py:634-680`): the Workload Identity Federation
+exchange above, with `credentials/<profile>.json` as a cross-process cache.
+A disk token is reused while `now < expires_at - 30 s`. After an exchange the
+file is rewritten the same atomic way, but an I/O failure is ignored.
+
+401 and force (`_cache.py:76-103,177-185`): a 401 on an API request
+invalidates the token and arms a one-shot force flag, so the next fetch skips
+the disk freshness check instead of re-serving the revoked token; one retry
+follows. A 401 from the token endpoint itself is retried once with force.
+Concurrent callers share one in-flight fetch (`tools.agents.token/token-cache`).
+
+Error timing follows the SDK: a bad name, a missing or malformed **config**
+or a cleartext base URL throws `profile` at `client` construction for steps
+1 and 3 and is swallowed at step 5 (`missing-credentials` if nothing else
+matches). **Credentials** file problems surface on the first request.
+Errors carry the path, never file contents or tokens; the credentials
+file's JSON parse detail is dropped because it can quote the file.
+
+Windows: POSIX permission checks are skipped and files are written without a
+mode, as in the SDK (`os.name == "posix"` there, the `posix` file attribute
+view here). Untested on Windows.
+
+Not ported: `config=` (`InMemoryConfig`), `reload()`, `for_base_url` copies
+(each client builds its own source), the SDK's shadow warnings (no logger),
+`User-Agent`, pretty-printed (`indent=2`) JSON on write-back, parent
+directory fsync. Verified only against temp directories and a fake token
+endpoint (`profile_test.cljc`); no live `ant` credentials were available.
+
 ### Retries
 
 `messages-create` and `count-tokens` both retry automatically on connection
@@ -305,8 +410,9 @@ for those functions' own failures) and `ex-data` `{:type <keyword> :status
 | malformed request/response JSON | `:tools.agents.anthropic.error/json-encode` / `:tools.agents.anthropic.error/json-parse` |
 | empty or non-string message batch id (`tools.agents.anthropic.batches`, before any request) | `:tools.agents.anthropic.error/invalid-argument` |
 | missing credentials (client construction) | `:tools.agents.anthropic.error/missing-credentials` |
-| `:credential-source` not a `TokenSource`, or combined with `:api-key`/`:auth-token`; bad `workload-identity-source` options, including a cleartext non-loopback base URL | `:tools.agents.anthropic.error/invalid-credentials` |
-| WIF token endpoint unreachable, non-2xx, or oversized/malformed response; assertion over 16 KiB. `ex-data` `{:type :status :body <redacted> :request-id}` | `:tools.agents.anthropic.error/token-exchange` |
+| profile name invalid; config file missing, malformed or with a cleartext `base_url`; credentials file missing, malformed, a symlink or group/other accessible; refreshed credentials not written back; bad `identity_token` source. `ex-data` `{:type :path}` | `:tools.agents.anthropic.error/profile` |
+| `:credential-source` not a `TokenSource`, or combined with `:api-key`/`:auth-token`/`:profile`; bad `workload-identity-source` options, including a cleartext non-loopback base URL | `:tools.agents.anthropic.error/invalid-credentials` |
+| WIF or profile refresh token endpoint unreachable, non-2xx, or oversized/malformed response; assertion over 16 KiB; `user_oauth` with `client_id` but no `refresh_token`; `oidc_federation` profile without `federation_rule_id`/`organization_id`. `ex-data` `{:type :status :body <redacted> :request-id}` | `:tools.agents.anthropic.error/token-exchange` |
 | WIF identity token file missing, unreadable, a directory or empty; `ANTHROPIC_IDENTITY_TOKEN` removed after discovery. `ex-data` `{:type :path}` | `:tools.agents.anthropic.error/identity-token` |
 | `:max-retries` is not a non-negative integer (client construction) | `:tools.agents.anthropic.error/invalid-max-retries` |
 | `:stream true` requested on `messages-create` (use `messages-stream`) | `:tools.agents.anthropic.error/streaming-unsupported` |
@@ -846,6 +952,22 @@ and env literal re-read per exchange, a messages 401 re-exchanging once, the
 token endpoint's own 401 retried once, errors that never carry the
 assertion or access token, size limits, https enforcement, and chain
 precedence via an injected env map (the real env is never read).
+
+`test/tools/agents/anthropic/profile_test.cljc` — profiles in temp config
+directories (the env is an injected map and `user.home` a temp dir; the
+real `~/.config/anthropic` is never read) against a fake token endpoint:
+config-dir and active-profile precedence, name validation and symlink
+escape, chain steps 3 and 5 (triggers, WIF between them, error propagation
+vs swallowing), `:profile`, config format and env fill-in, base URL and
+`anthropic-workspace-id` through `client`, externally rotated files, refresh
+request shape (exact beta), write-back content, 0600 mode, rotation and no
+temp residue, strict expiry under a fake clock, 8 concurrent callers sharing
+one refresh, a messages 401 forcing past a fresh disk token, the token
+endpoint's 401 retried once, an unwritable directory leaving the original
+bytes intact, malformed refresh responses writing nothing, credentials-file
+refusals (0644, symlink, bad JSON, ISO `expires_at`) without leaking
+tokens, and `oidc_federation` profiles with the 30 s disk cache and
+best-effort write-back.
 
 `test/tools/agents/anthropic/stream_test.cljc` — `messages-stream` against
 the streaming mock servers on OS-assigned ports: request line, body

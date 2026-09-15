@@ -103,6 +103,11 @@
 (defn- getenv [name]
   (System/getenv name))
 
+(defn- user-home
+  "Seam for the profile chain's default config dir (~/.config/anthropic)."
+  []
+  (System/getProperty "user.home"))
+
 ;; ---------------------------------------------------------------------------
 ;; Credentials / client construction
 ;; ---------------------------------------------------------------------------
@@ -135,24 +140,42 @@
   "The full credential chain `client` uses, first match wins
    (anthropic-sdk-python v1.5.0 _client.py:186-208, lib/credentials/_chain.py:76-155):
 
-     1. explicit :credential-source, else explicit :api-key > :auth-token
+     1. explicit :profile or :credential-source, else explicit :api-key >
+        :auth-token
      2. ANTHROPIC_API_KEY > ANTHROPIC_AUTH_TOKEN
      3. explicit profile (ANTHROPIC_PROFILE / ANTHROPIC_CONFIG_DIR /
-        active_config pointer): NOT IMPLEMENTED, #36 hook below
+        active_config pointer; credentials/profile-from-env), errors propagate
      4. workload identity federation env vars
         (tools.agents.anthropic.credentials/workload-identity-from-env)
-     5. fallback on-disk profile: NOT IMPLEMENTED, #36 hook below
+     5. fallback on-disk profile (credentials/fallback-profile), errors
+        swallowed
      then `resolve-credentials` throws missing-credentials.
 
    Steps 1-2 are exactly `resolve-credentials`, unchanged. Returns
-   {:credential-source src}, {:api-key s} or {:auth-token s}. base-url is
-   the client's resolved base URL: a token exchange must hit the same
-   deployment as the API calls (_chain.py:72). http-fn performs the
-   exchange (tools.agents.http/request! in production)."
+   {:credential-source src}, {:api-key s} or {:auth-token s}; a profile adds
+   :credential-headers (non-empty only) and :profile-base-url (when the
+   config sets base_url). base-url is the client's resolved base URL: a
+   token exchange must hit the same deployment as the API calls
+   (_chain.py:72). http-fn performs the exchange
+   (tools.agents.http/request! in production)."
   ([opts getenv-fn]
    (resolve-client-credentials opts getenv-fn default-base-url http/request!))
   ([opts getenv-fn base-url http-fn]
+   (let [profile-creds (fn [{:keys [credential-source credential-headers] :as p}]
+                         (cond-> {:credential-source credential-source}
+                           (seq credential-headers) (assoc :credential-headers credential-headers)
+                           (:base-url p)            (assoc :profile-base-url (:base-url p))))
+         profile-opts  {:getenv getenv-fn :home (user-home) :base-url base-url :http-fn http-fn}]
    (cond
+     ;; Step 1, SDK `profile=` (_client.py:260-267).
+     (some? (:profile opts))
+     (do
+       (when (or (some? (:api-key opts)) (some? (:auth-token opts)) (contains? opts :credential-source))
+         (throw (ex-info (str "tools.agents.anthropic/client: pass only one of :api-key, :auth-token, "
+                              ":credential-source or :profile")
+                         {:type :tools.agents.anthropic.error/invalid-credentials})))
+       (profile-creds (credentials/profile-source (assoc profile-opts :profile (:profile opts)))))
+
      (contains? opts :credential-source)
      (let [src (:credential-source opts)]
        (when-not (token/token-source? src)
@@ -172,8 +195,9 @@
 
      :else
      (or
-      ;; Step 3 hook (#36): explicit profile selection. Errors must
-      ;; propagate (_chain.py:116-129).
+      ;; Step 3: explicit profile selection. Errors propagate
+      ;; (_chain.py:116-129).
+      (some-> (credentials/profile-from-env profile-opts) profile-creds)
 
       ;; Step 4: WIF env vars. Sits above the fallback profile so a leftover
       ;; default profile never beats WIF (_chain.py:131-136).
@@ -181,22 +205,30 @@
                       {:getenv getenv-fn :base-url base-url :http-fn http-fn})]
         {:credential-source src})
 
-      ;; Step 5 hook (#36): fallback active profile from disk. Errors are
-      ;; swallowed and the chain falls through (_chain.py:138-153).
+      ;; Step 5: fallback active profile from disk. Errors are swallowed and
+      ;; the chain falls through (_chain.py:138-153).
+      (some-> (credentials/fallback-profile profile-opts) profile-creds)
 
-      (resolve-credentials opts getenv-fn)))))
+      (resolve-credentials opts getenv-fn))))))
 
 (defn client
   "Build an AnthropicClient record — the 'client object' analogue of Python's
    Anthropic(...) constructor. Resolves credentials eagerly (fails fast with
    a catchable ex-info BEFORE any network request, matching the original
    builtin's contract) unless :api-key/:auth-token/env vars are present.
-   Chain: :credential-source | :api-key | :auth-token > ANTHROPIC_API_KEY >
-   ANTHROPIC_AUTH_TOKEN > workload identity federation env vars (a
-   refreshable source, see tools.agents.anthropic.credentials) > throw.
-   See resolve-client-credentials.
+   Chain: :profile | :credential-source | :api-key | :auth-token >
+   ANTHROPIC_API_KEY > ANTHROPIC_AUTH_TOKEN > explicit profile
+   (ANTHROPIC_PROFILE / ANTHROPIC_CONFIG_DIR / active_config) > workload
+   identity federation env vars > ~/.config/anthropic/configs/default.json >
+   throw. Profiles and WIF are refreshable sources, see
+   tools.agents.anthropic.credentials. See resolve-client-credentials.
 
    opts:
+     :profile      profile name under the Anthropic config dir (SDK
+                   `profile=`); replaces the other credentials and the env
+                   chain. Its config's base_url is used when neither
+                   :base-url nor ANTHROPIC_BASE_URL is set, and its
+                   workspace_id is sent as `anthropic-workspace-id`.
      :api-key      explicit API key -> sent as `x-api-key`
      :auth-token   explicit bearer/OAuth token -> sent as `Authorization: Bearer`
                    (+ the required `anthropic-beta: oauth-2025-04-20` header)
@@ -234,8 +266,11 @@
                    See messages-create's retry note."
   ([] (client {}))
   ([opts]
-   (let [base-url    (or (:base-url opts) (getenv "ANTHROPIC_BASE_URL") default-base-url)
-         creds       (resolve-client-credentials opts getenv base-url http/request!)
+   (let [explicit    (or (:base-url opts) (getenv "ANTHROPIC_BASE_URL"))
+         creds       (resolve-client-credentials opts getenv (or explicit default-base-url) http/request!)
+         ;; kwarg > ANTHROPIC_BASE_URL > profile base_url > default (_client.py:231-240,260-274)
+         base-url    (or explicit (:profile-base-url creds) default-base-url)
+         creds       (dissoc creds :profile-base-url)
          max-retries (or (:max-retries opts) default-max-retries)]
      (when-not (and (integer? max-retries) (>= max-retries 0))
        (throw (ex-info (str "tools.agents.anthropic/client: :max-retries must be a non-negative "
@@ -456,6 +491,9 @@
    a 401 can invalidate exactly the token that attempt sent."
   ([client] (auth-headers client (fn [_])))
   ([client on-token]
+   (merge
+    ;; A profile's anthropic-workspace-id (_chain.py:124-128), under the auth headers.
+    (:credential-headers client)
    (cond
      (:api-key client)
      (cond-> {"x-api-key" (:api-key client)
@@ -474,7 +512,7 @@
      :else
      (throw (ex-info (str "tools.agents.anthropic: client has neither :api-key nor "
                            ":auth-token — build it via tools.agents.anthropic/client")
-                      {:type :tools.agents.anthropic.error/missing-credentials})))))
+                      {:type :tools.agents.anthropic.error/missing-credentials}))))))
 
 (defn- send-http!
   "One tools.agents.http/request! exchange for req, classifying a genuine

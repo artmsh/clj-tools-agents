@@ -37,6 +37,12 @@
     (spit f content)
     f))
 
+(defn empty-home
+  "A fresh empty directory standing in for user.home, so the profile steps of
+   the chain never look at the real ~/.config/anthropic."
+  []
+  (str (java.nio.file.Files/createTempDirectory "anthropic-home" (make-array java.nio.file.attribute.FileAttribute 0))))
+
 (defn- thrown [f]
   (try (f) nil (catch Exception e e)))
 
@@ -103,7 +109,8 @@
           (token-response "at-env")
           {:status 200 :body (canned-message)}))
       (fn [port]
-        (with-redefs [a/getenv (env-fn (assoc wif-env "ANTHROPIC_BASE_URL" (local port)))]
+        (with-redefs [a/getenv (env-fn (assoc wif-env "ANTHROPIC_BASE_URL" (local port)))
+                      a/user-home (constantly (empty-home))]
           (let [c (a/client)]
             (is (token/token-source? (:credential-source c)))
             (is (empty? @reqs) "nothing is exchanged at construction")
@@ -401,7 +408,9 @@
 
 (deftest chain-precedence
   (let [no-http (fn [_] (throw (ex-info "must not exchange during resolution" {})))
-        resolve (fn [opts env] (resolve-chain opts (env-fn env) "https://api.anthropic.com" no-http))]
+        home    (empty-home)
+        resolve (fn [opts env] (with-redefs [a/user-home (constantly home)]
+                                 (resolve-chain opts (env-fn env) "https://api.anthropic.com" no-http)))]
     (testing "static env credentials shadow WIF; precedence among them is unchanged"
       (is (= {:api-key "k"} (resolve {} (assoc wif-env "ANTHROPIC_API_KEY" "k"))))
       (is (= {:auth-token "t"} (resolve {} (assoc wif-env "ANTHROPIC_AUTH_TOKEN" "t"))))
