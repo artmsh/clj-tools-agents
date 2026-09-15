@@ -1,0 +1,12 @@
+data: {"type":"agent.session.turn.created","event_id":"event_1","session_id":"session_1","turn_id":"turn_1","turn":{"id":"turn_1","object":"agent.session.turn","session_id":"session_1","agent_id":"agent_1","subagent_id":null,"status":"queued","created_at":0,"started_at":null,"completed_at":null,"error":null}}
+
+data: {"type":"agent.session.turn.output_text.delta","event_id":"event_2","session_id":"session_1","turn_id":"turn_1","item_id":"item_1","output_index":0,"content_index":0,"delta":"Hel"}
+
+data: {"type":"agent.session.turn.output_text.delta","event_id":"event_3","session_id":"session_1","turn_id":"turn_1","item_id":"item_1","output_index":0,"content_index":0,"delta":"lo"}
+
+data: {"type":"agent.session.turn.output_text.done","event_id":"event_4","session_id":"session_1","turn_id":"turn_1","item_id":"item_1","output_index":0,"content_index":0,"text":"Hello"}
+
+data: {"type":"agent.session.turn.completed","event_id":"event_5","session_id":"session_1","turn_id":"turn_1","turn":{"id":"turn_1","object":"agent.session.turn","session_id":"session_1","agent_id":"agent_1","subagent_id":null,"status":"completed","created_at":0,"started_at":0,"completed_at":1,"error":null}}
+
+data: {"type":"agent.session.idle","event_id":"event_6","session":{"metadata":{},"id":"session_1","object":"agent.session","created_at":0,"last_active_at":1,"status":"idle"}}
+
