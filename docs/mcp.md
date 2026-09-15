@@ -102,6 +102,10 @@ runtimes.
   server](https://github.com/modelcontextprotocol/servers/tree/main/src/everything):
   16 tools, 107 resources, 3 templates, 4 prompts, completions, progress,
   logging, subscriptions and MRTR.
+- `examples/mcp/search.cljc` — a port of this repo's own TypeScript
+  `mcp-servers/search-mcp` (a single tool over a self-hosted SearXNG
+  instance): same env var, same error contract, now on stdio via
+  `tools.agents.mcp.stdio` instead of the TS SDK.
 
 ## Design notes
 

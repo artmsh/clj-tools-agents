@@ -1,5 +1,5 @@
 (ns tools.agents.mcp.examples-test
-  "The two example servers, driven through a real client over the in-process
+  "The example servers, driven through a real client over the in-process
    loopback.
 
    `examples.mcp.weather` is the deliverable that verifies this library
@@ -7,14 +7,19 @@
    is on the tutorial's own strings and shapes. `examples.mcp.everything` is
    the port of the reference everything server; the assertions there
    concentrate on the places where the port DIVERGES from the original,
-   because those are the claims that could be wrong.
+   because those are the claims that could be wrong. `examples.mcp.search` is
+   a different kind of example — not a port of an official reference, but a
+   migration of this repo's own TypeScript search-mcp server; the assertions
+   there pin its error contract (`SEARXNG_UNAVAILABLE:` on any non-2xx status
+   or transport failure) to the original's.
 
-   Both servers take their impure inputs — the HTTP fetch, the clock, the
-   sleep, the notification sink — as arguments, so every test here is exact
-   rather than approximate, and runs on both runtimes."
+   All three servers take their impure inputs — the HTTP fetch, the clock,
+   the sleep, the notification sink — as arguments, so every test here is
+   exact rather than approximate, and runs on both runtimes."
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [examples.mcp.everything :as everything]
+            [examples.mcp.search :as search]
             [examples.mcp.weather :as weather]
             [tools.agents.mcp :as mcp]
             [tools.agents.mcp.client :as client]
@@ -134,6 +139,60 @@
     (is (str/includes? (mcp/output-text (client/call-tool! c "get_forecast"
                                                            {"latitude" 38.58 "longitude" -121.49}))
                        "Period 0:"))))
+
+;; ---------------------------------------------------------------------------
+;; examples.mcp.search — migrated from mcp-servers/search-mcp
+;; ---------------------------------------------------------------------------
+
+(defn search-canned-fetch
+  "A canned `http-get!` for search/search-server: `responses` maps a URL
+   substring to the {:status :body} map `http-get!` would have returned."
+  [responses]
+  (fn [url]
+    (or (some (fn [[pattern v]] (when (str/includes? url pattern) v)) responses)
+        (throw (ex-info "search-canned-fetch: no canned response for" {:url url})))))
+
+(defn search-throwing-fetch
+  "An `http-get!` that fails the way a real transport failure does — no
+   response at all — so `search!`'s catch clause is exercised the same way
+   the TS original's try/catch was."
+  [message]
+  (fn [_url] (throw (ex-info message {}))))
+
+(deftest search-passes-the-query-through-and-returns-the-body-verbatim
+  (let [seen (atom nil)
+        fetch (fn [url] (reset! seen url) {:status 200 :body "{\"results\":[]}"})]
+    (is (= "{\"results\":[]}" (search/search! fetch "https://sear.xng" "clojure mcp")))
+    (testing "query string matches the TS original's URLSearchParams({ q, format: \"json\" })"
+      (is (str/includes? @seen "/search?q=clojure"))
+      (is (str/includes? @seen "format=json"))
+      (is (str/includes? @seen "clojure+mcp")
+          "a space in the query is form-encoded as `+`, same as URLSearchParams.toString()"))))
+
+(deftest search-reports-a-non-2xx-status-the-same-way-the-ts-original-did
+  (is (= "SEARXNG_UNAVAILABLE: HTTP 503"
+         (search/search! (search-canned-fetch [["/search" {:status 503 :body "unavailable"}]])
+                          "https://sear.xng" "q"))))
+
+(deftest search-reports-a-transport-failure-the-same-way-the-ts-original-did
+  (is (= "SEARXNG_UNAVAILABLE: connection refused"
+         (search/search! (search-throwing-fetch "connection refused") "https://sear.xng" "q"))))
+
+(deftest search-server-exposes-the-ts-original-surface
+  (let [c (connect (search/search-server
+                     (search-canned-fetch [["/search" {:status 200 :body "{\"results\":[]}"}]])
+                     "https://sear.xng"))
+        d (client/discover! c)]
+    (is (= {"name" "search-mcp" "version" "1.0.0"} (get-in d ["_meta" mcp/meta-server-info])))
+    (let [tools (client/list-all-tools! c)]
+      (is (= ["search"] (mapv #(get % "name") tools)))
+      (is (= "Search the web via a self-hosted SearXNG instance. Returns results as JSON."
+             (get (first tools) "description")))
+      (is (= {"type" "object"
+              "properties" {"query" {"type" "string" "description" "Search query"}}
+              "required" ["query"]}
+             (get (first tools) "inputSchema"))))
+    (is (= "{\"results\":[]}" (mcp/output-text (client/call-tool! c "search" {"query" "hi"}))))))
 
 ;; ---------------------------------------------------------------------------
 ;; examples.mcp.everything
