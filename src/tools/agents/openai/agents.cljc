@@ -621,7 +621,9 @@
   [event]
   (let [t     (get event "type")
         label "tools.agents.openai.agents/await-root-turn"
-        ;; the same predicate and ex-data the stream throws with
+        ;; The same predicate and ex-data the stream throws with, checked
+        ;; first: over a stream such an event never reaches the specific
+        ;; branches below (it throws in decode), so a collection must agree.
         err   (oai/stream-event-error label event nil)
         fail  (fn [kw msg extra]
                 (ex-info (str label ": " msg)
