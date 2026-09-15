@@ -55,10 +55,10 @@ JSON almost verbatim — `model`, `input`, `instructions`, `max_output_tokens`,
 etc. all pass straight through untouched, with no kebab↔snake key conversion
 (see the parity table below).
 
-See `examples/` for three complete, runnable-against-a-mock-server ports of
+See `examples/` for four complete, runnable-against-a-mock-server ports of
 real openai-python usage shapes (Responses-API basic chat, legacy Chat
-Completions with a `developer` turn, and a custom-gateway `base_url` +
-org/project client).
+Completions with a `developer` turn, a custom-gateway `base_url` +
+org/project client, and the Azure OpenAI v1 API).
 
 ### `base_url` carries `/v1` — this is not the sibling's shape
 
@@ -72,6 +72,45 @@ yourself, exactly as the Python README's own example does:
 ```clojure
 (oai/client {:base-url "http://my.test.server.example.com:8083/v1"})
 ```
+
+### Azure OpenAI (v1 API)
+
+Azure's v1 API is served at `{endpoint}/openai/v1/`. It needs no `api-version`
+query parameter, and Microsoft documents it for the plain `OpenAI()` client
+instead of `AzureOpenAI()`
+([Azure OpenAI v1 API](https://learn.microsoft.com/en-us/azure/foundry/openai/api-version-lifecycle)).
+So `:base-url` is all it takes:
+
+```clojure
+(oai/client {:base-url "https://<resource>.openai.azure.com/openai/v1"
+             :api-key  (System/getenv "AZURE_OPENAI_API_KEY")})
+```
+
+- `https://<resource>.services.ai.azure.com/openai/v1` is accepted too. A
+  trailing slash is fine either way.
+- `"model"` is the **deployment name**.
+- `OPENAI_BASE_URL` + `OPENAI_API_KEY` work instead of the options, matching
+  Microsoft's env-var example.
+- Runnable port: `examples/openai/azure.clj` (reads `AZURE_OPENAI_ENDPOINT`
+  and `AZURE_OPENAI_API_KEY` or `AZURE_OPENAI_AUTH_TOKEN`).
+
+This client always sends `Authorization: Bearer <:api-key>`. What Azure v1
+accepts, per Microsoft:
+
+| credential | Azure v1 | this client |
+|---|---|---|
+| API key as `Authorization: Bearer <key>` | Accepted. Microsoft's API-key examples for the OpenAI Python, JavaScript, Go and Java SDKs pass the Azure key as the SDK's `api_key`, which those SDKs send as `Authorization: Bearer`. The [v1 OpenAPI spec](https://github.com/Azure/azure-rest-api-specs/blob/a6943a926f76b3a2f90371b3466157eddf760e25/specification/ai/data-plane/OpenAI.v1/azure-v1-v1-generated.json) declares an API-key scheme in the `authorization` header next to `api-key`. The prose never states it separately. | **works** |
+| API key as `api-key: <key>` header | Accepted (Microsoft's REST example). | not sent. The client has no custom-header option, and the Bearer form above makes it unnecessary. |
+| Microsoft Entra ID access token as `Authorization: Bearer <token>` | Accepted. Scope `https://ai.azure.com/.default`, role `Cognitive Services OpenAI User`. | **static token only**: pass it as `:api-key`. It is never refreshed, so rebuild the client before it expires. A refreshing token provider (the SDK's `api_key=token_provider`) needs callable `:api-key`, #37. |
+
+Not supported: the legacy `AzureOpenAI` client shape, i.e.
+`{endpoint}/openai/deployments/{deployment}/...` routing, the required
+`api-version` query parameter, and the `AZURE_OPENAI_*` / `OPENAI_API_VERSION`
+env vars. Use the v1 API.
+
+**Not verified against a live Azure resource.** Coverage is the mock-server
+test for `examples/openai/azure.clj` (path `/openai/v1/responses`, Bearer
+header, no query string) plus Microsoft's documentation.
 
 ## Design notes
 
@@ -97,7 +136,9 @@ yourself, exactly as the Python README's own example does:
 | `client.webhooks.verify_signature(payload, headers, secret=, tolerance=300)` / `client.webhooks.unwrap(payload, headers, secret=)` | `(tools.agents.openai.webhooks/verify-signature payload headers {:secret :tolerance :now-s})` / `(tools.agents.openai.webhooks/unwrap payload headers opts)` | Pure, no HTTP (`lib/_webhooks.py`). Standard Webhooks HMAC-SHA256 over `{webhook-id}.{webhook-timestamp}.{body}`; `payload` must be the raw body (String or `byte[]`). Two-sided 300 s window, `whsec_` secrets base64-decoded (others used as raw bytes), space-separated `v1,<b64>` or bare signatures, constant-time compare. Secret: `:secret` → `OPENAI_WEBHOOK_SECRET`; the SDK's client-level `webhook_secret` is not on `OpenAIClient`. `unwrap` returns the event parsed by `read-json`. |
 | `client.realtime.client_secrets.create(**params)` | `(tools.agents.openai.realtime/realtime-client-secrets-create client params)` | `POST /realtime/client_secrets` (`resources/realtime/client_secrets.py`); `expires_after` / `session` pass through verbatim. |
 | `client.images.*` / `.files.*` / `.batches.*` / `.fine_tuning.*` / Assistants / Realtime `connect` + `calls.*` | *(not implemented)* | Not yet ported. `post-json!` is the shared transport, so adding another POST resource is a two-line change. |
-| `admin_api_key` / `OPENAI_ADMIN_KEY`, Workload Identity Federation, `AzureOpenAI` | *(not implemented)* | The credential chain here is explicit `:api-key` → `OPENAI_API_KEY` → throw. The SDK's fuller chain (admin keys, token-exchange workload identity, Azure's separate deployment/api-version routing) is out of scope. |
+| `admin_api_key` / `OPENAI_ADMIN_KEY`, Workload Identity Federation | *(not implemented)* | The credential chain here is explicit `:api-key` → `OPENAI_API_KEY` → throw. The SDK's fuller chain (admin keys, token-exchange workload identity) is out of scope. |
+| Azure OpenAI v1: `OpenAI(base_url="https://<resource>.openai.azure.com/openai/v1/", api_key=...)` | `(client {:base-url "https://<resource>.openai.azure.com/openai/v1" :api-key ...})` | Works through `:base-url`; no Azure-specific code. API key or a static Entra ID token, both as `Authorization: Bearer`. A refreshing Entra token provider needs callable `:api-key` (#37). Not verified against a live Azure resource. See Azure OpenAI (v1 API) above. |
+| `AzureOpenAI(azure_endpoint=, azure_deployment=, api_version=)` (legacy) | *(not supported)* | Deployment path rewriting, the required `api-version` query and `AZURE_OPENAI_*` / `OPENAI_API_VERSION` env vars are not ported. Use the v1 API. |
 
 ### Credential resolution & headers (confirmed from openai-python source)
 
@@ -302,8 +343,8 @@ end-to-end (a 429 retried then succeeding, retries exhausted into a status
 error, a non-retryable 400 not retried, `x-should-retry` overriding the status
 in both directions, `:max-retries 0` disabling retries, and connection errors
 retried then typed — all with `retry-after-ms: 1` so they cost no measurable
-wall-clock), and all three `examples/*.clj` ports run end-to-end against the
-mock server.
+wall-clock), and all four `examples/openai/*.clj` Responses/Chat ports run
+end-to-end against the mock server.
 
 The mock server is `tools.agents.test-support/start-server!`, shared by all three provider suites — two tiny leaves, same shape as
 `http-post!`. Babashka uses `org.httpkit.server`
@@ -311,8 +352,8 @@ The mock server is `tools.agents.test-support/start-server!`, shared by all thre
 image). JVM Clojure uses `com.sun.net.httpserver.HttpServer` (built into the
 JDK, zero deps). Mock
 ports are `18950`–`18964`, chosen not to collide with
-tools.agents.anthropic's `18930`–`18946`, and `18965`–`18971` for the retry
-tests. Port `18999` is additionally used by the three tests that deliberately
+tools.agents.anthropic's `18930`–`18946`, `18965`–`18971` for the retry
+tests, and `19391` for the Azure v1 example. Port `18999` is additionally used by the three tests that deliberately
 start *no* server (missing credentials and the two connection-failure tests,
 which actually dial it and so assume nothing else on the host has `18999`
 bound).

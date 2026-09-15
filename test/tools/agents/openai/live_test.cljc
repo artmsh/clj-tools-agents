@@ -14,6 +14,7 @@
             [examples.openai.basic-chat :as ex-basic]
             [examples.openai.chat-completions :as ex-chat]
             [examples.openai.custom-gateway :as ex-gateway]
+            [examples.openai.azure :as ex-azure]
             [tools.agents.test-support :refer [start-server!]]))
 
 (defn- base-url [port] (str "http://127.0.0.1:" port "/v1"))
@@ -410,4 +411,22 @@
         (is (= "org-abc" (get (:headers @captured) "openai-organization")))
         (is (str/includes? (:body @captured) "\"model\":\"gpt-4o\""))
         (is (str/includes? (:body @captured) "\"format\":{\"type\":\"json_object\"}")))
+      (finally (stop!)))))
+
+(deftest example-d-azure-v1-runs-against-mock-server
+  ;; Azure v1 shape: {endpoint}/openai/v1/responses, credential as Bearer, no
+  ;; api-version query. Mock only; never run against a live Azure resource.
+  (let [captured (atom nil)
+        {:keys [port stop!]} (start-server! 19391 "/openai/v1/responses"
+                                (fn [req] (reset! captured req) {:status 200 :body (canned-response)}))]
+    (try
+      (let [endpoint (str "http://127.0.0.1:" port "/")
+            client   (oai/client {:api-key "azure-key" :base-url (ex-azure/azure-v1-base-url endpoint)})]
+        (is (= "hello back" (ex-azure/run-example client)))
+        (is (= "POST" (:method @captured)))
+        (is (= "/openai/v1/responses" (:path @captured)))
+        (is (nil? (:query @captured)))
+        (is (= "Bearer azure-key" (get (:headers @captured) "authorization")))
+        (is (nil? (get (:headers @captured) "api-key")))
+        (is (str/includes? (:body @captured) "\"model\":\"gpt-4.1-nano\"")))
       (finally (stop!)))))
