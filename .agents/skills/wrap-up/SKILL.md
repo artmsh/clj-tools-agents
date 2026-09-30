@@ -39,7 +39,7 @@ Steps:
   
   ```
   2. **Append-only.** Read the existing file first; add bullets under the existing list. **Never overwrite** the day's note or re-add an entry already there (other tools and the user also write to it).
-  3. **One terse bullet per meaningful thing done** — match the day's voice (Ukrainian, fallback English; identifiers as-is), `<project>: <thing>` prefix style. Example: `- mcp: #66 — split out the conformance suite + research doc`.
+  3. **One terse bullet per meaningful thing done** — match the day's voice (Ukrainian, fallback English; identifiers as-is), `<project>: <thing>` prefix style. Example: `- clz: #66 — split out clz.relational spec (FRP) + research doc`.
   4. **Same filter as memory** — only what's worth recalling later; no secrets, no "what we chatted about".
   
   Synced vault — edit markdown directly; Obsidian and the `brain` qmd index pick up changes on their own.
