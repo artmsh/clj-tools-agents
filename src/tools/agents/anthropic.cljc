@@ -774,6 +774,95 @@
              {:type (stream-error-type et) :status nil :body body :headers headers
               :error-type et :error err :event ev})))
 
+(defn stream-event-error
+  "The ex-info a stream throws for the decoded event ev, or nil when ev is
+   not an `error` event ({\"type\" \"error\" \"error\" {...}}). Public so a
+   function that reduces a plain collection of events (a fixture, or
+   tools.agents.anthropic.agents/await-idle) throws the same :type and
+   ex-data as the stream does; body is the raw `data:` string, nil there."
+  ([caller-name ev] (stream-event-error caller-name ev nil nil))
+  ([caller-name ev body headers]
+   (when (error-event? ev)
+     (stream-error caller-name ev body headers))))
+
+(defn open-stream!
+  "The streaming counterpart of `request!`: send one request NOW and return a
+   SINGLE-USE reducible (tools.agents.stream/open-event-stream) of its SSE
+   events as decoded maps. messages-stream and
+   tools.agents.anthropic.agents/sessions-events-stream are both this.
+
+   The opening exchange runs under the client's retry policy
+   (request-with-retries!: 408/409/429/5xx and connection failures,
+   :max-retries, Retry-After, *sleep-fn*; a :credential-source client's first
+   401 invalidates the token and retries once outside :max-retries), with auth
+   and `anthropic-beta` headers rebuilt per attempt. Once a 2xx arrives
+   nothing is retried. A final non-2xx or connection failure throws from this
+   call, typed as `request!` types it.
+
+   caller-name prefixes every error message. opts:
+     :method   default :post
+     :path     API path starting with \"/\", appended to client's :base-url
+     :query    optional query-params map (tools.agents.http/encode-params)
+     :body     optional request map, JSON-encoded ONCE; nil sends no body
+     :headers  optional extra headers (lower-case names), merged over the
+               auth headers
+     :xform    optional transducer over the decoded events
+
+   Framing follows anthropic-sdk-python's Stream.__stream__: each event's
+   data is decoded as JSON, a missing \"type\" is filled from the SSE event
+   name, and an `error` event (by event name, or data \"type\" \"error\")
+   throws from the reduce instead of being delivered (see messages-stream). A
+   `ping` frame with an empty data line decodes to {\"type\" \"ping\"}."
+  [client caller-name {:keys [method path query body headers xform] :or {method :post}}]
+  (let [url         (api-url (:base-url client) path)
+        codec       (client-codec client)
+        body-str    (when (some? body) ((:write codec) body))
+        src         (:credential-source client)
+        used-token  (volatile! nil)
+        auth        (volatile! nil)
+        resp-hdrs   (volatile! nil)
+        open!       (fn [attempt]
+                      (let [resp (request-with-retries!
+                                  (or (:max-retries client) default-max-retries)
+                                  (fn []
+                                    (vreset! auth (auth-headers client (fn [tok] (vreset! used-token tok))))
+                                    (let [resp (attempt)]
+                                      (if (and (:status resp) (<= 200 (:status resp) 299))
+                                        resp
+                                        ;; non-2xx :body is already a String
+                                        (decode-or-throw! codec caller-name resp))))
+                                  (when src
+                                    {:on-unauthorized #(boolean (token/invalidate! src @used-token))}))]
+                        (vreset! resp-hdrs (:headers resp))
+                        resp))
+        ;; Decoded here rather than via :decode, which sees only the data: the
+        ;; SDK's Stream.__stream__ raises on the SSE event NAME `error` and
+        ;; fills a missing data "type" from the event name.
+        decode      (map (fn [{:keys [event data]}]
+                           (let [ev (cond
+                                      ;; the SDK raises even when an error
+                                      ;; event's data is not JSON
+                                      (= "error" event) (try ((:read codec) data) (catch Exception _ nil))
+                                      (and (= "ping" event) (str/blank? data)) {}
+                                      :else ((:read codec) data))
+                                 ev (if (and (map? ev) (not (contains? ev "type")) (string? event))
+                                      (assoc ev "type" event)
+                                      ev)]
+                             (if (or (= "error" event) (error-event? ev))
+                               (throw (stream-error caller-name ev data @resp-hdrs))
+                               ev))))]
+    (stream/open-event-stream
+     {:request       (cond-> {:method method :url url}
+                       query    (assoc :query query)
+                       body-str (assoc :body body-str))
+      :send!         (fn [req] (send-http! client caller-name (assoc req :headers (merge @auth headers))))
+      :open!         open!
+      :xform         (if xform (comp decode xform) decode)
+      :on-read-error (fn [e]
+                       (ex-info (str caller-name ": connection failed mid-stream: " e)
+                                {:type :tools.agents.anthropic.error/api-connection :status nil :body nil}
+                                e))})))
+
 (defn messages-stream
   "POST request (same map as messages-create) with \"stream\" true to
    POST /v1/messages — anthropic-sdk-python's
@@ -821,52 +910,10 @@
    normally and (tools.agents.stream/outcome s) is :eof either way. Check
    `stream-complete?` on the accumulated message."
   [client request]
-  (let [caller-name "tools.agents.anthropic/messages-stream"
-        url         (api-url (:base-url client) "/v1/messages")
-        codec       (client-codec client)
-        body-str    ((:write codec) (-> (if (contains? request :stream) (dissoc request :stream) request)
-                                    (assoc "stream" true)))
-        src         (:credential-source client)
-        used-token  (volatile! nil)
-        headers     (volatile! nil)
-        resp-hdrs   (volatile! nil)
-        open!       (fn [attempt]
-                      (let [resp (request-with-retries!
-                                  (or (:max-retries client) default-max-retries)
-                                  (fn []
-                                    (vreset! headers (auth-headers client (fn [tok] (vreset! used-token tok))))
-                                    (let [resp (attempt)]
-                                      (if (and (:status resp) (<= 200 (:status resp) 299))
-                                        resp
-                                        ;; non-2xx :body is already a String
-                                        (decode-or-throw! codec caller-name resp))))
-                                  (when src
-                                    {:on-unauthorized #(boolean (token/invalidate! src @used-token))}))]
-                        (vreset! resp-hdrs (:headers resp))
-                        resp))]
-    (stream/open-event-stream
-     {:request       {:method :post :url url :body body-str}
-      :send!         (fn [req] (send-http! client caller-name (assoc req :headers @headers)))
-      :open!         open!
-      ;; Decoded here rather than via :decode, which sees only the data: the
-      ;; SDK's Stream.__stream__ raises on the SSE event NAME `error` and
-      ;; fills a missing data "type" from the event name.
-      :xform         (map (fn [{:keys [event data]}]
-                            (let [ev (if (= "error" event)
-                                       ;; the SDK raises even when an error
-                                       ;; event's data is not JSON
-                                       (try ((:read codec) data) (catch Exception _ nil))
-                                       ((:read codec) data))
-                                  ev (if (and (map? ev) (not (contains? ev "type")) (string? event))
-                                       (assoc ev "type" event)
-                                       ev)]
-                              (if (or (= "error" event) (error-event? ev))
-                                (throw (stream-error caller-name ev data @resp-hdrs))
-                                ev))))
-      :on-read-error (fn [e]
-                       (ex-info (str caller-name ": connection failed mid-stream: " e)
-                                {:type :tools.agents.anthropic.error/api-connection :status nil :body nil}
-                                e))})))
+  (open-stream! client "tools.agents.anthropic/messages-stream"
+                {:path "/v1/messages"
+                 :body (-> (if (contains? request :stream) (dissoc request :stream) request)
+                           (assoc "stream" true))}))
 
 ;; ---------------------------------------------------------------------------
 ;; Stream accumulation — pure

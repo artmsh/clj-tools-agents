@@ -2,6 +2,7 @@
   "Entry point for `clojure -M:test-anthropic` and `bb test-anthropic`."
   (:require [clojure.test :as t]
             tools.agents.anthropic-test
+            tools.agents.anthropic.agents-test
             tools.agents.anthropic.batches-test
             tools.agents.anthropic.credentials-test
             tools.agents.anthropic.live-test
@@ -12,6 +13,7 @@
 
 (def suites
   ['tools.agents.anthropic-test
+   'tools.agents.anthropic.agents-test
    'tools.agents.anthropic.batches-test
    'tools.agents.anthropic.credentials-test
    'tools.agents.anthropic.live-test

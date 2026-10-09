@@ -44,7 +44,9 @@
    The response `:body` may be a String (sent as UTF-8), a byte[], or a
    STREAMING fn (fn [send!]): status and headers go out first, each
    (send! chunk) — a String or byte[] — is written and flushed at once, and
-   the response ends cleanly (terminating chunk) when the fn returns. The fn
+   the response ends cleanly (terminating chunk) when the fn returns.
+   Requests are handled concurrently on both runtimes, so another request can
+   be answered while a streaming fn is still writing. The fn
    controls pacing itself (sleep, or deref a promise the test delivers).
    `send!` returns true when the chunk was written and false once the client
    has disconnected (JVM: the write threw IOException; bb: httpkit's
@@ -117,9 +119,15 @@
                  (let [resp-bytes (chunk-bytes (or body ""))]
                    (.sendResponseHeaders exchange status (count resp-bytes))
                    (with-open [os (.getResponseBody exchange)] (.write os resp-bytes))))))))
-       (.setExecutor server nil)
-       (.start server)
-       {:port (.getPort (.getAddress server)) :stop! (fn [] (.stop server 0))})))
+       ;; A thread per request, as httpkit gives the bb branch: the default
+       ;; (nil) executor runs every handler on the one dispatcher thread, so a
+       ;; streaming handler still writing would block the next request, and a
+       ;; test that sends an event while reading a stream could not run.
+       (let [pool (java.util.concurrent.Executors/newCachedThreadPool)]
+         (.setExecutor server pool)
+         (.start server)
+         {:port (.getPort (.getAddress server))
+          :stop! (fn [] (.stop server 0) (.shutdownNow pool))}))))
 
 (defn start-abort-server!
   "Raw-socket HTTP/1.1 server for a response that is cut off mid-stream,
