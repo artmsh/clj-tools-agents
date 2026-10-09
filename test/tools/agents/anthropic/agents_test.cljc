@@ -730,3 +730,55 @@
           (is (= :tools.agents.anthropic.error/internal-server (:type (ex-data e))))
           (is (str/starts-with? (ex-message e) "tools.agents.anthropic.agents/sessions-events-list: HTTP 500"))
           (is (true? (deref gone 5000 :timeout)) "the already-open stream was released"))))))
+
+;; ---------------------------------------------------------------------------
+;; REAL-API round trip, the live pass this namespace has not had yet:
+;; agent -> environment -> session -> stream -> message -> idle -> history ->
+;; resume -> cleanup. Skipped (one passing assertion) unless
+;; ANTHROPIC_AGENTS_LIVE=1 AND ANTHROPIC_API_KEY are set, so a key merely
+;; present in the environment never makes the regular suite hit the network.
+;; NEVER RUN when written: no key with Managed Agents access was available.
+;; COST: one short turn on ANTHROPIC_AGENTS_MODEL (default claude-haiku-5-5)
+;; plus a cloud sandbox for its duration.
+;; ---------------------------------------------------------------------------
+
+(deftest managed-agents-round-trip-against-the-real-api
+  (if-let [api-key (and (= "1" (System/getenv "ANTHROPIC_AGENTS_LIVE"))
+                        (not-empty (System/getenv "ANTHROPIC_API_KEY")))]
+    (let [client (a/client {:api-key  api-key
+                            :base-url (or (not-empty (System/getenv "ANTHROPIC_AGENTS_BASE_URL"))
+                                          a/default-base-url)})
+          model  (or (not-empty (System/getenv "ANTHROPIC_AGENTS_MODEL")) "claude-haiku-5-5")
+          agent  (ag/agents-create client {"name" "tools-agents-live-check" "model" model
+                                           "system" "Answer in one word."})
+          env    (ag/environments-create client {"name" (str "tools-agents-live-check-" (System/currentTimeMillis))
+                                                 "config" {"type" "cloud"}})
+          aid    (get agent "id")
+          eid    (get env "id")]
+      (try
+        (is (= 1 (get agent "version")))
+        (is (= aid (get (ag/agents-retrieve client aid) "id")))
+        (is (some #(= aid (get % "id")) (ag/list-all #(ag/agents-list client %) {"limit" 20})))
+        (is (= eid (get (ag/environments-retrieve client eid) "id")))
+        (let [session (ag/sessions-create client {"agent" aid "environment_id" eid})
+              sid     (get session "id")]
+          (try
+            (is (= "idle" (get session "status")) "a session without initial_events starts idle")
+            (let [s     (ag/sessions-events-stream client sid)
+                  _     (ag/send-message client sid "Reply with the single word: pong")
+                  seen  (atom [])
+                  idle  (ag/await-idle s {:on-event #(swap! seen conj %)})]
+              (is (= "end_turn" (ag/stop-reason idle)))
+              (is (str/includes? (str/lower-case (ag/events-output-text @seen)) "pong"))
+              (is (every? #(string? (get % "type")) @seen))
+              (let [{:keys [history events]} (ag/resume-stream client sid)]
+                (stream/close! events)
+                (is (= (get idle "id") (get (ag/latest-status history) "id"))
+                    "the history's latest status is the idle the stream ended on")
+                (is (str/includes? (str/lower-case (ag/events-output-text history)) "pong"))))
+            (finally
+              (is (= "session_deleted" (get (ag/sessions-delete client sid) "type"))))))
+        (finally
+          (is (some? (get (ag/agents-archive client aid) "archived_at")))
+          (is (= "environment_deleted" (get (ag/environments-delete client eid) "type"))))))
+    (is true "skipped: set ANTHROPIC_AGENTS_LIVE=1 and ANTHROPIC_API_KEY")))

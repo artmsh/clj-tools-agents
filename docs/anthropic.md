@@ -796,6 +796,13 @@ of its own) and fixed:
   (a/output-text m))                                       ; the final Message
 ```
 
+`messages-stream` is a thin caller of the public `open-stream!`, the streaming
+counterpart of `request!`: it opens any SSE endpoint under the same
+per-attempt auth headers, retry policy, 401 refresh, event decoding and error
+typing. [tools.agents.anthropic.agents](anthropic-agents.md) streams session
+events through it. `stream-event-error` is public alongside it, so a function
+reducing a plain collection of events can throw what the stream throws.
+
 **Wire.** `POST /v1/messages` with `"stream": true` added to the request (a
 caller's `:stream`/`"stream"` value is replaced), same headers as
 `messages-create` (`x-api-key`, or `Authorization: Bearer` +

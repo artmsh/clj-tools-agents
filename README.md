@@ -17,6 +17,7 @@ one `tools.agents.*` namespace root instead of two `corevector.*` ones.
 | Library | Namespace | Docs |
 |---|---|---|
 | Anthropic Messages API | `tools.agents.anthropic` (+ `.batches`, `.visualize`, `.spec`) | [docs/anthropic.md](docs/anthropic.md) |
+| Claude Managed Agents (beta) — versioned agents, environments, sessions, the session event stream | `tools.agents.anthropic.agents` | [docs/anthropic-agents.md](docs/anthropic-agents.md) |
 | OpenAI Responses & Chat Completions APIs | `tools.agents.openai` | [docs/openai.md](docs/openai.md) |
 | OpenAI Agents API (beta) — managed sessions, turns, subagents, OpenAI-hosted & self-hosted sandboxes, environment templates, vaults & credentials | `tools.agents.openai.agents` | [docs/openai-agents.md](docs/openai-agents.md) |
 | Gemini Developer API | `tools.agents.gemini` | [docs/gemini.md](docs/gemini.md) |
@@ -86,8 +87,8 @@ the maintained design and API documentation lives in `docs/`.
 
 Every client takes `:http` and `:json`. `:http` is a request fn that replaces
 `tools.agents.http/request!` for all of its network I/O: anthropic (with
-batches and the profile / workload-identity token exchanges `client`
-resolves), openai (every resource namespace, openai.agents included), gemini,
+batches, anthropic.agents and the profile / workload-identity token exchanges
+`client` resolves), openai (every resource namespace, openai.agents included), gemini,
 fusion provider specs, and `tools.agents.mcp.http/connect!`. Streaming goes
 through it too.
 
@@ -159,8 +160,8 @@ has none, and the gemini client uses the same values:
 | `:connect-timeout-ms` | 5000 | TCP/TLS connect timeout |
 | `:timeout-ms` | 600000 | non-streaming calls: deadline for the whole response; streams: deadline for the response **headers** only |
 
-Both are client options on `anthropic/client`, `openai/client` (every openai
-resource namespace and openai.agents), `gemini/client`,
+Both are client options on `anthropic/client` (and so anthropic.agents),
+`openai/client` (every openai resource namespace and openai.agents), `gemini/client`,
 `mcp.http/connect!` and fusion provider specs. nil disables either. Override
 per call with `(assoc client :timeout-ms n)`; `anthropic/request!` and
 `openai/request!` also take both keys per request.
@@ -315,7 +316,7 @@ in-process loopbacks only, no outbound network. Independent of the shell's
 environment: tests that exercise env fallback inject the lookup, so an
 exported `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`,
 `*_BASE_URL` etc. changes no outcome. Live tests run only under an explicit
-`ANTHROPIC_LIVE=1` / `OPENAI_AGENTS_LIVE=1`, never because a key is present. See each doc's Testing
+`ANTHROPIC_LIVE=1` / `ANTHROPIC_AGENTS_LIVE=1` / `OPENAI_AGENTS_LIVE=1`, never because a key is present. See each doc's Testing
 section for what each suite covers; the core suite (`tools.agents.json`, the
 shared JSON codec, `tools.agents.http`, the shared request function,
 `tools.agents.sse`, the pure SSE parser, `tools.agents.retry`, the retry loop

@@ -11,6 +11,16 @@ only place these differences are recorded; the per-client docs link here.
 that namespace's `request!` (codec, retry loop and error typing), so "as
 openai" in its column means the same code path, not a copy.
 
+`tools.agents.anthropic.agents` has no column: it is built on a
+`tools.agents.anthropic/client` value and sends everything through that
+namespace's `request!` and `open-stream!`, so the anthropic column is its
+column, row for row. What it adds is the `managed-agents-2026-04-01` flag on
+`anthropic-beta` (joined with the client's own `:betas`, see
+[anthropic-agents.md](anthropic-agents.md#credentials-and-headers)) and
+`beta=true` on every query string. How it differs from `openai.agents`, the
+other hosted harness, is a separate table:
+[Hosted agent harnesses](#hosted-agent-harnesses-openaiagents-and-anthropicagents).
+
 | contract | anthropic | openai | openai.agents | gemini |
 |---|---|---|---|---|
 | model location | request body `"model"` | request body `"model"` | request body (`sessions-create`'s `"agent"` map passes through) | **URL path**: separate `model` argument, never a request key; a bare id gets `models/` prepended, `models/…`/`tunedModels/…` used verbatim |
@@ -45,6 +55,7 @@ openai" in its column means the same code path, not a copy.
 One rule covers every `*-stream` function (`anthropic/messages-stream`,
 `openai/responses-stream`, `openai/chat-completions-stream`,
 `openai.agents/sessions-events-stream` and `sessions-create-stream`,
+`anthropic.agents/sessions-events-stream` and `resume-stream`,
 `gemini/generate-content-stream`): an error event is never handed to the
 reducer. It throws a typed `ex-info` from the reduce at the point the event
 is decoded, so every event before it has already reached the reducer and
@@ -55,7 +66,8 @@ ex-data always carries `:status` (nil, except gemini, below), `:body` (the raw
 event, nil only for anthropic's non-JSON error data). Each pure accumulator
 that can be fed a plain collection (`anthropic/accumulate-event`,
 `openai/accumulate-response-event`, `openai/accumulate-chat-completion-chunk`,
-`gemini/accumulate-chunk`, `openai.agents/await-root-turn`) throws the same
+`gemini/accumulate-chunk`, `openai.agents/await-root-turn`,
+`anthropic.agents/await-idle`) throws the same
 `:type` for the same event, with `:body` nil, so a fixture reduced without
 the transport fails identically. Over a stream, `await-root-turn`'s
 `:on-event` never sees the error event, because the stream throws first.
@@ -78,6 +90,11 @@ The rule is what all three SDKs do, read at their `main` heads:
   `BaseApiClient.request_streamed` raises `APIError.raise_error(code, ...)` on
   a chunk whose JSON starts with `{"error":`.
 
+For `anthropic.agents` the rule covers the SSE-level `error` event only. A
+`session.error` is an ordinary session event, delivered to the reducer like
+any other; `await-idle` throws for it only when its `retry_status` is
+`terminal`.
+
 MCP Streamable HTTP (`tools.agents.mcp.http`) is outside this rule: its SSE
 stream carries JSON-RPC messages, and an error there is the `"error"` member
 of the response to one request, surfaced by that request's call, not a
@@ -93,6 +110,40 @@ provider's documented error table:
 | extra ex-data | `:headers` (the 2xx response's), `:error-type` | none | `:retries-taken` |
 | message | `<fn>: stream error <error.type> <message>` | `<fn>: stream error: <message>` | `<fn>: stream error <code> <message>` |
 
+## Hosted agent harnesses: openai.agents and anthropic.agents
+
+Both namespaces drive a vendor-hosted agent loop through sessions and events,
+and several of their functions are named alike on purpose (`sessions-create`,
+`sessions-events-stream`, `send-message`), so a caller can hold both. The
+models underneath differ, and the same-named functions do not behave alike.
+The openai.agents column is verified against the live API where
+[openai-agents.md](openai-agents.md) says so; the anthropic.agents column is
+from documentation only ([anthropic-agents.md](anthropic-agents.md#not-verified-live)).
+
+| | openai.agents | anthropic.agents |
+|---|---|---|
+| unit of work | **session / turn**: a turn is a resource with its own id, status, usage and error (`sessions-turns-list`, `sessions-turns-retrieve`) | **session / event**: there is no turn resource; a turn is the span of events between a `session.status_running` and the next `session.status_idle` |
+| agent config | inline `"agent" {...}` on the session, or a saved agent by `"agent_id"`; a saved agent is updated in place | always a saved agent: `"agent"` is an id, a pinned `{"type" "agent" "id" "version"}`, or `agent_with_overrides`; every configuration change is a new **version** (`agents-versions-list`) |
+| sandbox | `"environment"` inline on the session (`none`, `openai_hosted`, `self_hosted`), optionally from a template | a separate **environment** resource created first; the session takes `"environment_id"` |
+| starting work | `sessions-create` with `"input"` starts the first turn | `sessions-create` alone leaves the session `idle`; work starts with `"initial_events"` or a `user.message` |
+| sending a message mid-turn | `send-message` **steers** the active turn | `send-message` is **queued** behind the current turn (`processed_at` nil until it is reached) |
+| stopping a turn | `cancel-turn`: the turn ends with status `cancelled`, a distinct terminal state (`:tools.agents.openai/turn-cancelled` from `await-root-turn`) | `interrupt`: queued, applied after running tool calls, and the turn ends with an ordinary idle whose stop reason is `end_turn`, indistinguishable from a finished turn |
+| what the session status says | `idle` after success and after failure alike; the session's `"error"` stays nil | `idle` after success, pause, exhausted retries, budget and refusal alike; `terminated` only for an unrecoverable error or an archive |
+| where the outcome is | on the **turn**: `"status"` `completed`/`failed`/`cancelled` and `"error"` (`latest-root-turn`), or the root `agent.session.turn.*` event | on the **idle event**: `stop_reason.type` `end_turn`/`requires_action`/`retries_exhausted`/`budget_reached`/`refusal` (`stop-reason`), read from the stream or from `latest-status` over the history |
+| where a failed run shows | turn `"status" "failed"` with `"error" {"code" "message"}`; on the stream an `error` event and `agent.session.turn.failed` | `session.error` events with a `retry_status`: `retrying` (nothing to do), `exhausted` (an idle with `retries_exhausted` follows), `terminal` (`session.status_terminated` follows) |
+| waiting helper | `await-root-turn` returns the root `turn.completed` event and **throws** for a failed or cancelled turn | `await-idle` returns the idle event for **every** stop reason and throws only for a terminal error, termination, deletion or truncation; the caller judges the stop reason |
+| pending tool calls | the session's `"required_actions"` (from `sessions-retrieve` or an `agent.session.requires_action` event), each with `turn_id` and `call_id`; the turn stays `waiting` and the wait does not end | the idle event's `stop_reason.event_ids` (`blocking-event-ids`), each the id of an `agent.custom_tool_use`/`agent.tool_use`/`agent.mcp_tool_use` event; the session goes `idle` and `await-idle` returns |
+| answering a tool call | `send-tool-result` `{:turn-id :call-id :success :output/:error}` | `send-custom-tool-result` `{:custom-tool-use-id :content :is-error}`; a permission hold is a separate `confirm-tool` `{:tool-use-id :result :deny-message}` |
+| partial answers | not documented | answering fewer than all blocking ids re-emits the idle with the remainder |
+| stream endpoint | `GET /agents/sessions/{id}/events?stream=true`, and `sessions-create-stream` to create and stream in one request | `GET /v1/sessions/{id}/events/stream`; no create-and-stream, so open the stream before sending the first event |
+| text deltas on the stream | `agent.session.turn.output_text.delta` events, no opt-in | opt-in per connection (`{"event_deltas" ["agent.message"]}` → `event_start`/`event_delta`); otherwise text arrives as whole `agent.message` events |
+| reconnect | open a new stream, then reconcile from `sessions-retrieve` and `sessions-items-list` by `item_id`; no helper | `resume-stream`: new stream, full event history, skip seen event ids; returns `{:history :events}` |
+| saved output | **items** (`sessions-items-list`, `items-output-text`), plus published artifacts | the **event history** itself (`sessions-events-list`, `events-output-text`) |
+| list paging | cursor: `"after"` = the page's `"last_id"` while `"has_more"`; environment files use a `"page"`/`"next"` token | one scheme: `"page"` = the page's `"next_page"` until it is nil (`next-page-params`, `list-all`) |
+| removing things | `agents-delete`, `sessions-delete` | agents are **archived** only (irreversible, no delete); sessions and environments have both `-archive` and `-delete`; a running session refuses both |
+| beta marker | header `OpenAI-Beta: agents=v1` | header `anthropic-beta: managed-agents-2026-04-01` and query `beta=true` |
+| coverage | all 42 method/path pairs of the reference | agents, environments, sessions and session events; threads, resources, vaults and the self-hosted work queue are not covered |
+
 Shared by all four: the default JSON codec, `tools.agents.json` (verbatim
 string/keyword map keys, no case conversion; only the error `:type` keywords
 and message prefixes are per client), the single runtime-specific leaf for network I/O
@@ -102,4 +153,5 @@ harness.
 
 Per-client background for these rows: [anthropic.md](anthropic.md#retries),
 [openai.md](openai.md#retries), [openai-agents.md](openai-agents.md#error-hierarchy),
+[anthropic-agents.md](anthropic-agents.md#error-hierarchy),
 [gemini.md](gemini.md#retries).
