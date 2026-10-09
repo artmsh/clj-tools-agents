@@ -40,6 +40,7 @@
    its `http-get!` as an argument so it is exact rather than approximate to
    test."
   (:require [tools.agents.mcp :as mcp]
+            [tools.agents.schema :as schema]
             [tools.agents.mcp.server :as server]
             [tools.agents.mcp.stdio :as stdio]
             #?@(:bb [[babashka.http-client]] :clj [])))
@@ -105,9 +106,7 @@
      :tools
      [{:name "search"
        :description "Search the web via a self-hosted SearXNG instance. Returns results as JSON."
-       :input-schema {"type" "object"
-                      "properties" {"query" {"type" "string" "description" "Search query"}}
-                      "required" ["query"]}
+       :input-schema (schema/object {:query (schema/string {"description" "Search query"})} [:query])
        :handler (fn [_ctx args] (search! fetch searxng-url (get args "query")))}]})))
 
 ;; TS original's `await server.connect(new StdioServerTransport())`.

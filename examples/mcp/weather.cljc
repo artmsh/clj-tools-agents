@@ -45,7 +45,8 @@
    metadata-scraping layer to fake one would fight this repo's
    data-transparency idiom — the same idiom that has tools.agents.anthropic
    pass `\"max_tokens\"` through verbatim rather than kebab-casing it. So the
-   schema is written out as the JSON Schema it will be sent as. Everything
+   schema is built explicitly as the JSON Schema it will be sent as, using
+   tools.agents.schema's plain constructors. Everything
    else — the tool names, the argument names, the string return, the
    `transport=\"stdio\"` entry point — is the tutorial's.
 
@@ -56,6 +57,7 @@
    forbidden `print(...)`."
   (:require [clojure.string :as str]
             [tools.agents.mcp :as mcp]
+            [tools.agents.schema :as schema]
             [tools.agents.mcp.server :as server]
             [tools.agents.mcp.stdio :as stdio]
             #?@(:bb [[babashka.http-client]] :clj [])))
@@ -141,17 +143,16 @@
      :tools
      [{:name "get_alerts"
        :description "Get weather alerts for a US state."
-       :input-schema {"type" "object"
-                      "properties" {"state" {"type" "string"
-                                             "description" "Two-letter US state code (e.g. CA, NY)"}}
-                      "required" ["state"]}
+       :input-schema (schema/object
+                      {:state (schema/string {"description" "Two-letter US state code (e.g. CA, NY)"})}
+                      [:state])
        :handler (fn [_ctx args] (get-alerts fetch (get args "state")))}
       {:name "get_forecast"
        :description "Get weather forecast for a location."
-       :input-schema {"type" "object"
-                      "properties" {"latitude" {"type" "number" "description" "Latitude of the location"}
-                                    "longitude" {"type" "number" "description" "Longitude of the location"}}
-                      "required" ["latitude" "longitude"]}
+       :input-schema (schema/object
+                      {:latitude (schema/number {"description" "Latitude of the location"})
+                       :longitude (schema/number {"description" "Longitude of the location"})}
+                      [:latitude :longitude])
        :handler (fn [_ctx args]
                   (get-forecast fetch (get args "latitude") (get args "longitude")))}]})))
 

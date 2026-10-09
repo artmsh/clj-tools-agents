@@ -16,7 +16,8 @@
    All three servers take their impure inputs — the HTTP fetch, the clock,
    the sleep, the notification sink — as arguments, so every test here is
    exact rather than approximate, and runs on both runtimes."
-  (:require [clojure.string :as str]
+  (:require [clojure.edn :as edn]
+            [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [examples.mcp.everything :as everything]
             [examples.mcp.search :as search]
@@ -47,6 +48,28 @@
                   "content" {"type" "text" "text" "sampled reply"}})
       "roots/list" (fn [_req] {"roots" [{"uri" "file:///work" "name" "work"}]})}
      :send! (fn [req] (:response (server/handle srv req)))})))
+
+(deftest constructor-migration-preserves-every-original-schema
+  ;; Captured before editing the examples, rather than reconstructed from
+  ;; the builders under test. Includes all 19 tool inputs, the output schema
+  ;; and the elicitation form, including absence of optional required keys.
+  (let [baseline (edn/read-string (slurp "test/resources/mcp/schema-baseline.edn"))
+        schemas (fn [srv]
+                  (into {} (map (fn [t] [(:name t) (select-keys t [:input-schema :output-schema])])
+                                (:tools srv))))]
+    (is (= (:everything baseline) (schemas (everything/everything-server))))
+    (is (= (:weather baseline) (schemas (weather/weather-server (constantly nil)))))
+    (is (= (:search baseline)
+           (schemas (search/search-server (constantly nil) "https://example.test"))))
+    (is (= (:elicitation baseline) everything/elicitation-schema))
+    (let [listed (client/list-tools! (connect (everything/everything-server)))
+          wire-schemas (into {} (map (fn [t]
+                                      [(get t "name")
+                                       (cond-> {:input-schema (get t "inputSchema")}
+                                         (contains? t "outputSchema")
+                                         (assoc :output-schema (get t "outputSchema")))])
+                                    (get listed "tools")))]
+      (is (= (:everything baseline) wire-schemas)))))
 
 ;; ---------------------------------------------------------------------------
 ;; examples.mcp.weather — the build-server tutorial
