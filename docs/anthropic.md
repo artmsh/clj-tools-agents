@@ -411,7 +411,8 @@ for those functions' own failures) and `ex-data` `{:type <keyword> :status
 | other non-2xx (e.g. 413, 529) | `:tools.agents.anthropic.error/api-status` |
 | no response at all (DNS/refused/TLS/timeout); a timeout adds `:timeout? true` | `:tools.agents.anthropic.error/api-connection` |
 | malformed request/response JSON | `:tools.agents.anthropic.error/json-encode` / `:tools.agents.anthropic.error/json-parse` |
-| empty or non-string message batch id (`tools.agents.anthropic.batches`, before any request) | `:tools.agents.anthropic.error/invalid-argument` |
+| empty or non-string id: a message batch id (`tools.agents.anthropic.batches`) or an agent, environment or session id (`tools.agents.anthropic.agents`), before any request | `:tools.agents.anthropic.error/invalid-argument` |
+| `tools.agents.anthropic.agents/await-idle` only, while reducing events: a terminal `session.error`; `session.status_terminated`; `session.deleted`; events ending before an idle (see [anthropic-agents.md](anthropic-agents.md#idle-is-not-success)) | `:tools.agents.anthropic.error/session-failed` / `session-terminated` / `session-deleted` / `stream-truncated` |
 | missing credentials (client construction) | `:tools.agents.anthropic.error/missing-credentials` |
 | profile name invalid; config file missing, malformed or with a cleartext `base_url`; credentials file missing, malformed, a symlink or group/other accessible; refreshed credentials not written back; bad `identity_token` source. `ex-data` `{:type :path}` | `:tools.agents.anthropic.error/profile` |
 | `:credential-source` not a `TokenSource`, or combined with `:api-key`/`:auth-token`/`:profile`; bad `workload-identity-source` options, including a cleartext non-loopback base URL | `:tools.agents.anthropic.error/invalid-credentials` |

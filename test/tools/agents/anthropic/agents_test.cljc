@@ -382,6 +382,16 @@
         (is (= "sevt_i" (get ev "id")))
         (is (= reason (ag/stop-reason ev)) "idle is returned, not judged: the caller reads the stop reason")))))
 
+(deftest await-idle-returns-an-idle-event-that-carries-no-stop-reason
+  ;; The server keeps an idle session's stream open, so an idle the client
+  ;; did not recognise would be a wait that never ends.
+  (doseq [ev [{"type" "session.status_idle" "id" "sevt_i"}
+              {"type" "session.status_idle" "id" "sevt_i" "stop_reason" nil}
+              {"type" "session.status_idle" "id" "sevt_i" "stop_reason" {}}]]
+    (let [got (ag/await-idle [running ev (agent-message "sevt_late" "never read")])]
+      (is (= "sevt_i" (get got "id")))
+      (is (nil? (ag/stop-reason got))))))
+
 (deftest await-idle-stops-reading-at-the-idle-event
   (let [seen (atom [])]
     (ag/await-idle [running (idle "sevt_i" "end_turn") (agent-message "sevt_late" "never read")]

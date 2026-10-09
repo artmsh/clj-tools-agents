@@ -690,7 +690,10 @@
          result (reduce (fn [_ event]
                           (when on-event (on-event event))
                           (when-let [e (event-failure event)] (throw e))
-                          (when (and (some? (stop-reason event)) (done? event))
+                          ;; By event type, not by stop reason: an idle
+                          ;; with no readable stop_reason must still end the
+                          ;; wait, since the server keeps the stream open.
+                          (when (and (map? event) (= "session.status_idle" (get event "type")) (done? event))
                             (reduced event)))
                         nil events)]
      (or result
