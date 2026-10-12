@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Test on every supported runtime
+    # Host runner: clojure and bb both come from the runner daemon's PATH.
+    runs-on: nixos
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show runtime versions
+        run: |
+          clojure -Sdescribe | head -3
+          bb --version
+
+      - name: Suite on JVM Clojure and Babashka
+        run: ./script/test-all.sh

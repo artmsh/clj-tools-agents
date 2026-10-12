@@ -12,6 +12,7 @@
             [tools.agents.mcp :as mcp]
             [tools.agents.mcp.http :as http]
             [tools.agents.mcp.server :as server]
+            [tools.agents.schema :as schema]
             [tools.agents.sse :as sse]))
 
 ;; ---------------------------------------------------------------------------
@@ -88,6 +89,21 @@
                  "nested" {"type" "object"
                            "properties" {"flag" {"type" "boolean" "x-mcp-header" "X-Flag"}}}
                  "plain" {"type" "string"}}})
+
+(deftest constructor-annotations-remain-statically-reachable
+  (let [built (schema/object
+               {:tenant (schema/string {"x-mcp-header" "X-Tenant"})
+                :page (schema/integer {"x-mcp-header" "X-Page"})
+                :nested (schema/object
+                         {:flag (schema/boolean {"x-mcp-header" "X-Flag"})})
+                :plain (schema/string)})]
+    (is (= annotated-schema built))
+    (is (= [] (http/validate-x-mcp-headers built)))
+    (is (= {"Mcp-Param-X-Tenant" "acme" "Mcp-Param-X-Page" "2"
+            "Mcp-Param-X-Flag" "false"}
+           (http/x-mcp-header-values built
+                                     {"tenant" "acme" "page" 2
+                                      "nested" {"flag" false}})))))
 
 (deftest a-valid-annotation-set-reports-no-problems
   (is (= [] (http/validate-x-mcp-headers annotated-schema)))

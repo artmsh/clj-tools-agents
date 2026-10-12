@@ -70,6 +70,18 @@ example, `tools.agents.openai` throws `:tools.agents.openai/json-parse-error`,
 and `tools.agents.anthropic` throws `:tools.agents.anthropic.error/json-parse`.
 A client can swap in another codec with `:json`; see the next section.
 
+## Tool schemas
+
+`tools.agents.schema` provides portable, zero-dependency constructors for
+JSON Schema: `object`, `string`, `number`, `integer`, `boolean`, `enum` and
+`array`. They return ordinary string-keyed wire maps, with explicit required
+fields and verbatim options for constraints and extensions. See
+[Schema constructors](docs/mcp.md#schema-constructors) and `examples/mcp/`
+for input/output schemas and nested `x-mcp-header` annotations.
+
+The `.spec/` directory contains generated `clojure.spec.alpha` caches;
+the maintained design and API documentation lives in `docs/`.
+
 ## Bring your own HTTP client / JSON codec
 
 Every client takes `:http` and `:json`. `:http` is a request fn that replaces

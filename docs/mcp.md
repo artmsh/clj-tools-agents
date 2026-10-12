@@ -219,8 +219,9 @@ the description and the argument descriptions from them. Clojure has no type
 hints to derive a schema from, and a metadata-scraping layer to fake one
 would fight this repo's data-transparency idiom — the same idiom that has
 `tools.agents.anthropic` pass `"max_tokens"` through verbatim rather than
-kebab-casing it. So `:input-schema` is written out as the JSON Schema it will
-be sent as. Everything else about a tool is the SDK's shape.
+kebab-casing it. So `:input-schema` is explicit JSON Schema data, either
+hand-written or built with `tools.agents.schema`'s plain constructors.
+Everything else about a tool is the SDK's shape.
 
 Registration is otherwise **declarative rather than imperative**: the Python
 SDK mutates a server object through decorators, this takes one map. Wire
@@ -228,6 +229,51 @@ values inside it are string-keyed and pass through verbatim
 (`"inputSchema"`, `"annotations"`, `"outputSchema"`); config around them is
 keyword-keyed and kebab-cased (`:input-schema`, `:mime-type`). That split is
 the same one both siblings use.
+
+#### Schema constructors
+
+`tools.agents.schema` builds the same string-keyed maps accepted by
+`:input-schema`, `:output-schema` and elicitation forms. It has no dependency
+or inference layer and runs on both JVM Clojure and Babashka:
+
+```clojure
+(require '[tools.agents.schema :as schema])
+
+(schema/object
+  {:message (schema/string {"description" "Message to echo"})
+   :nested (schema/object
+             {:tenant (schema/string {"x-mcp-header" "X-Tenant"})})}
+  [:message])
+;; => {"type" "object"
+;;     "properties" {"message" {"type" "string" "description" "Message to echo"}
+;;                   "nested" {"type" "object"
+;;                             "properties" {"tenant" {"type" "string"
+;;                                                      "x-mcp-header" "X-Tenant"}}}}
+;;     "required" ["message"]}
+```
+
+| Constructor | Arguments |
+|---|---|
+| `string`, `number`, `integer`, `boolean` | `[]` or `[opts]` |
+| `enum` | `[values]` or `[values opts]`; untyped unless opts adds `"type"` |
+| `array` | `[items]` or `[items opts]` |
+| `object` | `[]`, `[properties]`, `[properties required]`, `[properties required opts]` |
+
+Property and required names accept strings or keywords, encoded with `name`
+without changing punctuation. Child schemas pass through verbatim, so raw
+maps, `$ref`/composition schemas and boolean schemas compose with builders.
+Trailing opts merge verbatim **over** generated fields; use wire keys such
+as `"enum"`, `"default"`, `"minimum"`, `"maximum"`, `"title"`, `"description"`
+and `"x-*"`. There is no key translation or validation. For a typed enum,
+use `(schema/string {"enum" ["error" "success"]})`.
+
+Required fields are explicit: omitted or nil means no `"required"` field;
+`[]` means an empty one. Defaults do not imply optionality. For object opts
+without required fields, use `(schema/object properties nil opts)`. No
+`"additionalProperties"` policy is imposed. The examples use these builders
+for inputs, outputs and the elicitation form; their original literal values
+are pinned in the portable test suite. Nested `"x-mcp-header"` annotations
+remain reachable through the same `"properties"` chains.
 
 #### The handler context
 

@@ -52,6 +52,7 @@
    speaks stdio. `--http` serves Streamable HTTP on JVM Clojure."
   (:require [clojure.string :as str]
             [tools.agents.mcp :as mcp]
+            [tools.agents.schema :as schema]
             [tools.agents.mcp.http :as http]
             [tools.agents.mcp.server :as server]
             [tools.agents.mcp.stdio :as stdio]))
@@ -181,9 +182,9 @@
    :title "Echo Tool"
    :description "Echoes back the input string"
    :annotations read-only-annotations
-   :input-schema {"type" "object"
-                  "properties" {"message" {"type" "string" "description" "Message to echo"}}
-                  "required" ["message"]}
+   :input-schema (schema/object
+                  {:message (schema/string {"description" "Message to echo"})}
+                  [:message])
    :handler (fn [_ctx args] (str "Echo: " (get args "message")))})
 
 (defn get-sum-tool []
@@ -191,10 +192,10 @@
    :title "Get Sum Tool"
    :description "Returns the sum of two numbers"
    :annotations read-only-annotations
-   :input-schema {"type" "object"
-                  "properties" {"a" {"type" "number" "description" "First number"}
-                                "b" {"type" "number" "description" "Second number"}}
-                  "required" ["a" "b"]}
+   :input-schema (schema/object
+                  {:a (schema/number {"description" "First number"})
+                   :b (schema/number {"description" "Second number"})}
+                  [:a :b])
    :handler (fn [_ctx args]
               (let [a (get args "a") b (get args "b")]
                 (when-not (and (number? a) (number? b))
@@ -206,7 +207,7 @@
    :title "Get Tiny Image Tool"
    :description "Returns the MCP_TINY_IMAGE"
    :annotations read-only-annotations
-   :input-schema {"type" "object" "properties" {}}
+   :input-schema (schema/object)
    :handler (fn [_ctx _args]
               (mcp/tool-result
                [(mcp/text "This is a tiny image:")
@@ -218,12 +219,15 @@
    :title "Get Annotated Message Tool"
    :description "Demonstrates how annotations can be used to provide metadata about content."
    :annotations read-only-annotations
-   :input-schema {"type" "object"
-                  "properties" {"messageType" {"type" "string" "enum" ["error" "success" "debug"]
-                                               "description" "Type of message to demonstrate different annotation patterns"}
-                                "includeImage" {"type" "boolean" "default" false
-                                                "description" "Whether to include an example image"}}
-                  "required" ["messageType"]}
+   :input-schema (schema/object
+                  {:messageType
+                   (schema/string
+                    {"enum" ["error" "success" "debug"]
+                     "description" "Type of message to demonstrate different annotation patterns"})
+                   :includeImage
+                   (schema/boolean
+                    {"default" false "description" "Whether to include an example image"})}
+                  [:messageType])
    :handler
    (fn [_ctx args]
      (let [t (get args "messageType")
@@ -246,7 +250,7 @@
    :title "Get Environment Variables Tool"
    :description "Returns all environment variables from the running process as pretty-printed JSON."
    :annotations read-only-annotations
-   :input-schema {"type" "object" "properties" {}}
+   :input-schema (schema/object)
    :handler (fn [_ctx _args] (mcp/write-json (getenv-map)))})
 
 (defn get-structured-content-tool []
@@ -254,16 +258,16 @@
    :title "Get Structured Content Tool"
    :description "Returns structured content along with an output schema for client data validation"
    :annotations read-only-annotations
-   :input-schema {"type" "object"
-                  "properties" {"location" {"type" "string"
-                                            "enum" ["New York" "Chicago" "Los Angeles"]
-                                            "description" "Choose city"}}
-                  "required" ["location"]}
-   :output-schema {"type" "object"
-                   "properties" {"temperature" {"type" "number" "description" "Temperature in celsius"}
-                                 "conditions" {"type" "string" "description" "Weather conditions description"}
-                                 "humidity" {"type" "number" "description" "Humidity percentage"}}
-                   "required" ["temperature" "conditions" "humidity"]}
+   :input-schema (schema/object
+                  {:location
+                   (schema/string
+                    {"enum" ["New York" "Chicago" "Los Angeles"] "description" "Choose city"})}
+                  [:location])
+   :output-schema (schema/object
+                   {:temperature (schema/number {"description" "Temperature in celsius"})
+                    :conditions (schema/string {"description" "Weather conditions description"})
+                    :humidity (schema/number {"description" "Humidity percentage"})}
+                   [:temperature :conditions :humidity])
    :handler
    (fn [_ctx args]
      (let [weather (condp = (get args "location")
@@ -282,9 +286,13 @@
    :title "Get Resource Links Tool"
    :description "Returns up to ten resource links that reference different types of resources"
    :annotations read-only-annotations
-   :input-schema {"type" "object"
-                  "properties" {"count" {"type" "number" "minimum" 1 "maximum" 10 "default" 3
-                                         "description" "Number of resource links to return (1-10)"}}}
+   :input-schema (schema/object
+                  {:count
+                   (schema/number
+                    {"minimum" 1
+                     "maximum" 10
+                     "default" 3
+                     "description" "Number of resource links to return (1-10)"})})
    :handler
    (fn [_ctx args]
      (let [count* (or (get args "count") 3)]
@@ -308,12 +316,15 @@
    :title "Get Resource Reference Tool"
    :description "Returns a resource reference that can be used by MCP clients"
    :annotations read-only-annotations
-   :input-schema {"type" "object"
-                  "properties" {"resourceType" {"type" "string" "enum" ["text" "blob"]
-                                                "description" "Type of resource to reference"}
-                                "resourceId" {"type" "integer" "minimum" 1
-                                              "description" "ID of the resource to reference (positive integer)"}}
-                  "required" ["resourceType" "resourceId"]}
+   :input-schema (schema/object
+                  {:resourceType
+                   (schema/string
+                    {"enum" ["text" "blob"] "description" "Type of resource to reference"})
+                   :resourceId
+                   (schema/integer
+                    {"minimum" 1
+                     "description" "ID of the resource to reference (positive integer)"})}
+                  [:resourceType :resourceId])
    :handler
    (fn [_ctx args]
      (let [t (get args "resourceType")
@@ -339,11 +350,12 @@
    :title "Trigger Long Running Operation Tool"
    :description "Demonstrates a long running operation with progress updates."
    :annotations read-only-annotations
-   :input-schema {"type" "object"
-                  "properties" {"duration" {"type" "number" "default" 10
-                                            "description" "Duration of the operation in seconds"}
-                                "steps" {"type" "number" "default" 5
-                                         "description" "Number of steps in the operation"}}}
+   :input-schema (schema/object
+                  {:duration
+                   (schema/number
+                    {"default" 10 "description" "Duration of the operation in seconds"})
+                   :steps
+                   (schema/number {"default" 5 "description" "Number of steps in the operation"})})
    :handler
    (fn [ctx args]
      (let [duration (or (get args "duration") 10)
@@ -379,9 +391,10 @@
                      "Send io.modelcontextprotocol/logLevel in the request _meta to receive "
                      "them; without it the server emits none, as the specification requires.")
    :annotations read-only-annotations
-   :input-schema {"type" "object"
-                  "properties" {"logger" {"type" "string" "default" "everything"
-                                          "description" "Logger name to attach to each message"}}}
+   :input-schema (schema/object
+                  {:logger
+                   (schema/string
+                    {"default" "everything" "description" "Logger name to attach to each message"})})
    :handler
    (fn [ctx args]
      (let [logger (or (get args "logger") "everything")]
@@ -404,20 +417,34 @@
 ;; The reference server's demo form, which exercises string, boolean,
 ;; defaults, email format, number bounds and enums.
 (def elicitation-schema
-  {"type" "object"
-   "properties"
-   {"name" {"title" "String" "type" "string" "description" "Your full, legal name"}
-    "check" {"title" "Boolean" "type" "boolean" "description" "Agree to the terms and conditions"}
-    "firstLine" {"title" "String with default" "type" "string"
-                 "description" "Favorite first line of a story"
-                 "default" "It was a dark and stormy night."}
-    "email" {"title" "String with email format" "type" "string" "format" "email"
-             "description" "Your email address (will be verified, and never shared with anyone else)"}
-    "age" {"title" "Number with bounds" "type" "integer" "minimum" 0 "maximum" 130
-           "description" "Your age in years"}
-    "pet" {"title" "Enum" "type" "string" "enum" ["cat" "dog" "bird" "fish" "none"]
-           "description" "Your preferred pet"}}
-   "required" ["name" "check"]})
+  (schema/object
+   {:name (schema/string {"title" "String" "description" "Your full, legal name"})
+    :check
+    (schema/boolean
+     {"title" "Boolean" "description" "Agree to the terms and conditions"})
+    :firstLine
+    (schema/string
+     {"title" "String with default"
+      "description" "Favorite first line of a story"
+      "default" "It was a dark and stormy night."})
+    :email
+    (schema/string
+     {"title" "String with email format"
+      "format" "email"
+      "description"
+      "Your email address (will be verified, and never shared with anyone else)"})
+    :age
+    (schema/integer
+     {"title" "Number with bounds"
+      "minimum" 0
+      "maximum" 130
+      "description" "Your age in years"})
+    :pet
+    (schema/string
+     {"title" "Enum"
+      "enum" ["cat" "dog" "bird" "fish" "none"]
+      "description" "Your preferred pet"})}
+   [:name :check]))
 
 (defn trigger-elicitation-request-tool []
   {:name "trigger-elicitation-request"
@@ -427,7 +454,7 @@
                      "inputResponses and requestState to receive the outcome.")
    :annotations {"readOnlyHint" false "destructiveHint" false
                  "idempotentHint" false "openWorldHint" false}
-   :input-schema {"type" "object" "properties" {}}
+   :input-schema (schema/object)
    :handler
    (fn [ctx _args]
      ;; Up front, before any work: a server MUST NOT rely on a capability the
@@ -450,9 +477,11 @@
                      "Requires the elicitation.url client capability.")
    :annotations {"readOnlyHint" false "destructiveHint" false
                  "idempotentHint" false "openWorldHint" false}
-   :input-schema {"type" "object"
-                  "properties" {"url" {"type" "string" "default" "https://modelcontextprotocol.io"
-                                       "description" "Where to send the user"}}}
+   :input-schema (schema/object
+                  {:url
+                   (schema/string
+                    {"default" "https://modelcontextprotocol.io"
+                     "description" "Where to send the user"})})
    :handler
    (fn [ctx args]
      (mcp/require-capabilities! (:client-capabilities ctx) {"elicitation" {"url" {}}})
@@ -476,11 +505,11 @@
                      "Sampling is deprecated as of 2026-07-28 but remains functional.")
    :annotations {"readOnlyHint" false "destructiveHint" false
                  "idempotentHint" false "openWorldHint" true}
-   :input-schema {"type" "object"
-                  "properties" {"prompt" {"type" "string" "description" "The prompt to send to the LLM"}
-                                "maxTokens" {"type" "integer" "default" 100
-                                             "description" "Maximum tokens to generate"}}
-                  "required" ["prompt"]}
+   :input-schema (schema/object
+                  {:prompt (schema/string {"description" "The prompt to send to the LLM"})
+                   :maxTokens
+                   (schema/integer {"default" 100 "description" "Maximum tokens to generate"})}
+                  [:prompt])
    :handler
    (fn [ctx args]
      (mcp/require-capabilities! (:client-capabilities ctx) {"sampling" {}})
@@ -502,7 +531,7 @@
    :description (str "Returns the client's roots. Roots are deprecated as of 2026-07-28; "
                      "prefer passing directories as ordinary tool arguments.")
    :annotations read-only-annotations
-   :input-schema {"type" "object" "properties" {}}
+   :input-schema (schema/object)
    :handler
    (fn [ctx _args]
      (mcp/require-capabilities! (:client-capabilities ctx) {"roots" {}})
@@ -528,10 +557,10 @@
                      "pass it back as an ordinary argument, or read the resource by its URI.")
    :annotations {"readOnlyHint" false "destructiveHint" false
                  "idempotentHint" false "openWorldHint" false}
-   :input-schema {"type" "object"
-                  "properties" {"name" {"type" "string" "description" "Human-readable name"}
-                                "text" {"type" "string" "description" "Content to store"}}
-                  "required" ["name" "text"]}
+   :input-schema (schema/object
+                  {:name (schema/string {"description" "Human-readable name"})
+                   :text (schema/string {"description" "Content to store"})}
+                  [:name :text])
    :handler
    (fn [_ctx args]
      (let [handle (str "r" (:next-handle (swap! store update :next-handle inc)))
@@ -551,9 +580,9 @@
                      "that subscribed to its URI.")
    :annotations {"readOnlyHint" false "destructiveHint" false
                  "idempotentHint" false "openWorldHint" false}
-   :input-schema {"type" "object"
-                  "properties" {"handle" {"type" "string" "description" "Handle from register-resource"}}
-                  "required" ["handle"]}
+   :input-schema (schema/object
+                  {:handle (schema/string {"description" "Handle from register-resource"})}
+                  [:handle])
    :handler
    (fn [_ctx args]
      (let [handle (get args "handle")

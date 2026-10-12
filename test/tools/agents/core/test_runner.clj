@@ -6,6 +6,7 @@
             tools.agents.http-test
             tools.agents.json-test
             tools.agents.retry-test
+            tools.agents.schema-test
             tools.agents.sse-test
             tools.agents.stream-test
             tools.agents.token-test))
@@ -14,6 +15,7 @@
   ['tools.agents.http-test
    'tools.agents.json-test
    'tools.agents.retry-test
+   'tools.agents.schema-test
    'tools.agents.sse-test
    'tools.agents.stream-test
    'tools.agents.token-test])

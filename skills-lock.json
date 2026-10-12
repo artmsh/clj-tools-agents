@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "skills": {
+    "wrap-up": {
+      "source": "../agents-setup/skills/wrap-up",
+      "sourceType": "local",
+      "computedHash": "3a14c747a686b75ee725cb41bbe9829e41cd1d59278581c8d01c5f882b23db41"
+    }
+  }
+}
